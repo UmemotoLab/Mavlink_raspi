@@ -45,15 +45,20 @@ MARKER_CENTER_OFFSETS = {
 }
 # ───── カメラ座標系オフセット設定 ─────
 # verify_displacement.py から算出された誤差 (Motive - AR生値) を設定します
-# 補正後座標 = 生の検出座標 + オフセット
-# 単位: メートル
+# 補正後座標 = 回転オフセット @ 生の検出座標 + 並進オフセット
+# 単位: メートル / 行列
 
-# カメラから手先（ID1）へのオフセット
+# カメラ取り付け回転オフセット (3x3 行列)
+CAMERA_ROT_OFFSET = np.eye(3, dtype=np.float32)
+
+# カメラから手先（ID1）へのオフセット (回転 + 並進)
+HAND_ROT_OFFSET = np.eye(3, dtype=np.float32)
 HAND_OFFSET_CAM_X = 0.0
 HAND_OFFSET_CAM_Y = 0.0
 HAND_OFFSET_CAM_Z = 0.0
 
-# カメラから荷物中心へのオフセット
+# カメラから荷物中心へのオフセット (回転 + 並進)
+CARGO_ROT_OFFSET = np.eye(3, dtype=np.float32)
 CARGO_OFFSET_CAM_X = 0.0
 CARGO_OFFSET_CAM_Y = 0.0
 CARGO_OFFSET_CAM_Z = 0.0
@@ -66,14 +71,23 @@ if OFFSET_PARAMS_FILE.exists():
             if "optical_offset" in data:
                 CAMERA_OPTICAL_OFFSET = data["optical_offset"].astype(np.float32)
                 print(f"✓ オプティカルオフセット (camera_optical_offset.npz) のロードに成功しました: {CAMERA_OPTICAL_OFFSET}")
+            if "optical_rot_offset" in data:
+                CAMERA_ROT_OFFSET = data["optical_rot_offset"].astype(np.float32)
+                print(f"✓ カメラ回転オフセットのロードに成功しました:\n{CAMERA_ROT_OFFSET}")
             if "hand_offset" in data:
                 h_off = data["hand_offset"]
                 HAND_OFFSET_CAM_X, HAND_OFFSET_CAM_Y, HAND_OFFSET_CAM_Z = float(h_off[0]), float(h_off[1]), float(h_off[2])
-                print(f"✓ 手先カメラオフセットのロードに成功しました: [{HAND_OFFSET_CAM_X:.4f}, {HAND_OFFSET_CAM_Y:.4f}, {HAND_OFFSET_CAM_Z:.4f}]")
+                print(f"✓ 手先カメラ並進オフセットのロードに成功しました: [{HAND_OFFSET_CAM_X:.4f}, {HAND_OFFSET_CAM_Y:.4f}, {HAND_OFFSET_CAM_Z:.4f}]")
+            if "hand_rot_offset" in data:
+                HAND_ROT_OFFSET = data["hand_rot_offset"].astype(np.float32)
+                print(f"✓ 手先カメラ回転オフセットのロードに成功しました")
             if "cargo_offset" in data:
                 c_off = data["cargo_offset"]
                 CARGO_OFFSET_CAM_X, CARGO_OFFSET_CAM_Y, CARGO_OFFSET_CAM_Z = float(c_off[0]), float(c_off[1]), float(c_off[2])
-                print(f"✓ 荷物カメラオフセットのロードに成功しました: [{CARGO_OFFSET_CAM_X:.4f}, {CARGO_OFFSET_CAM_Y:.4f}, {CARGO_OFFSET_CAM_Z:.4f}]")
+                print(f"✓ 荷物カメラ並進オフセットのロードに成功しました: [{CARGO_OFFSET_CAM_X:.4f}, {CARGO_OFFSET_CAM_Y:.4f}, {CARGO_OFFSET_CAM_Z:.4f}]")
+            if "cargo_rot_offset" in data:
+                CARGO_ROT_OFFSET = data["cargo_rot_offset"].astype(np.float32)
+                print(f"✓ 荷物カメラ回転オフセットのロードに成功しました")
     except Exception as e:
         print(f"⚠ オフセットファイル {OFFSET_PARAMS_FILE.name} のロードに失敗しました ({e})。デフォルト値を使用します。")
 
@@ -304,7 +318,8 @@ def motive_udp_listener():
                         ], dtype=np.float32)
 
                     # 合成: OpenCV座標 → ENU ワールド座標 の回転行列（Motiveリアルタイム姿勢で即時変換）
-                    R_total = R_ned_to_enu @ R_body_to_ned @ R_cv_to_body
+                    # CAMERA_ROT_OFFSET: カメラ剛体と光学軸の間の取り付け回転誤差補正
+                    R_total = R_ned_to_enu @ R_body_to_ned @ R_cv_to_body @ CAMERA_ROT_OFFSET
 
                     # カメラ光学中心のワールド座標（Motiveの計測値 + オフセット補正）
                     cam_pos_enu = np.array([mx, my, mz], dtype=np.float32)
@@ -780,14 +795,14 @@ def camera_tracker_loop(m, show_window=False):
                 c_cam_raw_val = [float('nan'), float('nan'), float('nan')]
                 if center_cam is not None:
                     c_cam_raw_val = [float(center_cam[0]), float(center_cam[1]), float(center_cam[2])]
-                    # オフセット適用 (カメラから荷物中心へのオフセット)
-                    center_cam = center_cam + np.array([CARGO_OFFSET_CAM_X, CARGO_OFFSET_CAM_Y, CARGO_OFFSET_CAM_Z], dtype=np.float32)
+                    # 回転・並進オフセット適用 (カメラから荷物中心への6DOFオフセット)
+                    center_cam = CARGO_ROT_OFFSET.dot(center_cam) + np.array([CARGO_OFFSET_CAM_X, CARGO_OFFSET_CAM_Y, CARGO_OFFSET_CAM_Z], dtype=np.float32)
 
                 h_cam_raw_val = [float('nan'), float('nan'), float('nan')]
                 if id1_cam is not None:
                     h_cam_raw_val = [float(id1_cam[0]), float(id1_cam[1]), float(id1_cam[2])]
-                    # オフセット適用 (カメラから手先へのオフセット)
-                    id1_cam = id1_cam + np.array([HAND_OFFSET_CAM_X, HAND_OFFSET_CAM_Y, HAND_OFFSET_CAM_Z], dtype=np.float32)
+                    # 回転・並進オフセット適用 (カメラから手先への6DOFオフセット)
+                    id1_cam = HAND_ROT_OFFSET.dot(id1_cam) + np.array([HAND_OFFSET_CAM_X, HAND_OFFSET_CAM_Y, HAND_OFFSET_CAM_Z], dtype=np.float32)
 
                 # Motiveデータのカメラ座標系への逆投影真値の算出
                 m_cargo_cam_val = [float('nan'), float('nan'), float('nan')]

@@ -159,15 +159,80 @@ def load_and_process_csv(filepath):
     }
     return res
 
-def calibrate_optical_offset(r1, r2, offset_cargo_r1=None, offset_hand_r1=None):
+def estimate_rigid_transform_3d(src_points, dst_points):
     """
-    【方法3: 複数カメラ向きログによる CAMERA_OPTICAL_OFFSET 最適化】
-    最小二乗法を用いて、カメラ向きの異なる複数のログデータから
-    カメラ光学中心オフセット CAMERA_OPTICAL_OFFSET [X, Y, Z] を自動算出します。
+    Kabsch アルゴリズム (SVD) を用いて、3D点群間の最適な剛体変換 (回転行列 R と 並進ベクトル t) を導出します。
+    dst ≈ R @ src + t
+    
+    Args:
+        src_points: (N, 3) numpy 配列 (補正前・観測座標系)
+        dst_points: (N, 3) numpy 配列 (目標・真値座標系)
+    Returns:
+        R: (3, 3) 最適回転行列
+        t: (3,) 最適並進ベクトル
+    """
+    if len(src_points) < 3:
+        return np.eye(3, dtype=np.float64), np.zeros(3, dtype=np.float64)
+        
+    src = np.asarray(src_points, dtype=np.float64)
+    dst = np.asarray(dst_points, dtype=np.float64)
+    
+    centroid_src = np.mean(src, axis=0)
+    centroid_dst = np.mean(dst, axis=0)
+    
+    src_centered = src - centroid_src
+    dst_centered = dst - centroid_dst
+    
+    H = src_centered.T @ dst_centered
+    U, S, Vt = np.linalg.svd(H)
+    R = Vt.T @ U.T
+    
+    # 反射（det(R) == -1）の補正
+    if np.linalg.det(R) < 0:
+        Vt[2, :] *= -1
+        R = Vt.T @ U.T
+        
+    t = centroid_dst - R @ centroid_src
+    return R, t
+
+def rotation_matrix_to_euler_deg(R):
+    """3x3 回転行列からオイラー角 (Roll, Pitch, Yaw) [度] を算出 (XYZ / 航空機標準系)"""
+    sy = math.sqrt(R[0, 0] * R[0, 0] + R[1, 0] * R[1, 0])
+    singular = sy < 1e-6
+    if not singular:
+        x = math.atan2(R[2, 1], R[2, 2])
+        y = math.atan2(-R[2, 0], sy)
+        z = math.atan2(R[1, 0], R[0, 0])
+    else:
+        x = math.atan2(-R[1, 2], R[1, 1])
+        y = math.atan2(-R[2, 0], sy)
+        z = 0
+    return np.degrees([x, y, z])
+
+def rotation_matrix_to_axis_angle(R):
+    """3x3 回転行列から回転軸と回転角 [度] を算出"""
+    angle_rad = math.acos(max(-1.0, min(1.0, (np.trace(R) - 1.0) / 2.0)))
+    angle_deg = math.degrees(angle_rad)
+    if angle_rad < 1e-6:
+        axis = np.array([0.0, 0.0, 1.0])
+    else:
+        axis = np.array([
+            R[2, 1] - R[1, 2],
+            R[0, 2] - R[2, 0],
+            R[1, 0] - R[0, 1]
+        ]) / (2.0 * math.sin(angle_rad))
+    return axis, angle_deg
+
+def calibrate_optical_offset(r1, r2, offset_cargo_r1=None, offset_hand_r1=None, rot_cargo_r1=None, rot_hand_r1=None):
+    """
+    【方法3: 複数カメラ向きログによる CAMERA_OPTICAL_OFFSET (回転＋並進) 最適化】
+    最小二乗法・非線形最適化を用いて、カメラ向きの異なる複数のログデータから
+    カメラ光学中心オフセット CAMERA_OPTICAL_OFFSET [X, Y, Z] および
+    カメラ取り付け回転オフセット CAMERA_ROT_OFFSET (3x3 行列 / オイラー角) を自動算出します。
     """
     if not HAS_NUMPY:
         print("⚠ NumPy が利用できないため、CAMERA_OPTICAL_OFFSET のキャリブレーション計算をスキップします。")
-        return None
+        return None, None
         
     s1 = r1.get('calib_samples', [])
     s2 = r2.get('calib_samples', [])
@@ -175,70 +240,153 @@ def calibrate_optical_offset(r1, r2, offset_cargo_r1=None, offset_hand_r1=None):
     
     if len(all_samples) < 10:
         print("⚠ 有効なキャリブレーションサンプル数が不足しています。")
-        return None
-        
+        return None, None
+
+    # ─── 1. 並進オフセットのみの最適化 (従来のベースライン) ───
     A_rows = []
     b_rows = []
-    
     for s in all_samples:
-        R = s['R']
-        y = s['mcargo'] - s['mcam'] - R @ s['ccam']
-        A_rows.append(R)
+        R_i = s['R']
+        y = s['mcargo'] - s['mcam'] - R_i @ s['ccam']
+        A_rows.append(R_i)
         b_rows.append(y)
-        
     A = np.vstack(A_rows)
     b = np.concatenate(b_rows)
+    trans_offset_only, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+
+    # ─── 2. 回転＋並進オフセットの同時最適化 (Gauss-Newton / Levenberg-Marquardt) ───
+    # モデル: p_world = mcam + R_i @ (R_opt @ ccam + t_opt)
+    # 残差: r_i = (mcam + R_i @ (R_opt @ ccam + t_opt)) - mcargo
     
-    # 最小二乗法による大域的最適解の導出 (A * offset = b)
-    offset, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+    # 初期値: 並進は trans_offset_only, 回転は単位行列 (回転ベクトル omega = [0, 0, 0])
+    omega = np.zeros(3, dtype=np.float64)
+    t_opt = trans_offset_only.copy()
+    
+    def rodrigues_exp(w):
+        theta = np.linalg.norm(w)
+        if theta < 1e-10:
+            return np.eye(3, dtype=np.float64)
+        k = w / theta
+        K = np.array([
+            [0, -k[2], k[1]],
+            [k[2], 0, -k[0]],
+            [-k[1], k[0], 0]
+        ], dtype=np.float64)
+        return np.eye(3) + math.sin(theta)*K + (1 - math.cos(theta))*(K @ K)
+
+    # Gauss-Newton 最適化ループ (パラメータ: 6次元 [omega(3), t_opt(3)])
+    params = np.concatenate([omega, t_opt])
+    for iteration in range(30):
+        w_curr = params[:3]
+        t_curr = params[3:]
+        R_opt_curr = rodrigues_exp(w_curr)
+        
+        residuals = []
+        J_rows = []
+        
+        for s in all_samples:
+            R_i = s['R']
+            c_cam = s['ccam']
+            mcam = s['mcam']
+            mcargo = s['mcargo']
+            
+            p_pred = mcam + R_i @ (R_opt_curr @ c_cam + t_curr)
+            res = p_pred - mcargo
+            residuals.append(res)
+            
+            # ヤコビアン計算: d(p_pred)/d(omega) = -R_i @ R_opt_curr @ [c_cam]x
+            C_skew = np.array([
+                [0, -c_cam[2], c_cam[1]],
+                [c_cam[2], 0, -c_cam[0]],
+                [-c_cam[1], c_cam[0], 0]
+            ], dtype=np.float64)
+            J_omega = -R_i @ R_opt_curr @ C_skew
+            J_t = R_i
+            J_i = np.hstack([J_omega, J_t])
+            J_rows.append(J_i)
+            
+        r_vec = np.concatenate(residuals)
+        J_mat = np.vstack(J_rows)
+        
+        # パラメータ更新: delta = -(J^T J + lambda I)^-1 J^T r
+        H_mat = J_mat.T @ J_mat + 1e-4 * np.eye(6)
+        g_vec = J_mat.T @ r_vec
+        delta = np.linalg.solve(H_mat, -g_vec)
+        
+        params += delta
+        if np.linalg.norm(delta) < 1e-7:
+            break
+
+    opt_omega = params[:3]
+    opt_trans = params[3:]
+    opt_R = rodrigues_exp(opt_omega)
+    euler_deg = rotation_matrix_to_euler_deg(opt_R)
+    axis, angle_deg = rotation_matrix_to_axis_angle(opt_R)
     
     # 校正前後の誤差評価
-    errs_before = [np.linalg.norm((s['mcam'] + s['R'] @ s['ccam']) - s['mcargo']) for s in all_samples]
-    errs_after = [np.linalg.norm((s['mcam'] + s['R'] @ (s['ccam'] + offset)) - s['mcargo']) for s in all_samples]
+    errs_raw = [np.linalg.norm((s['mcam'] + s['R'] @ s['ccam']) - s['mcargo']) for s in all_samples]
+    errs_trans_only = [np.linalg.norm((s['mcam'] + s['R'] @ (s['ccam'] + trans_offset_only)) - s['mcargo']) for s in all_samples]
+    errs_full = [np.linalg.norm((s['mcam'] + s['R'] @ (opt_R @ s['ccam'] + opt_trans)) - s['mcargo']) for s in all_samples]
     
-    err1_before = [np.linalg.norm((s['mcam'] + s['R'] @ s['ccam']) - s['mcargo']) for s in s1] if s1 else []
-    err1_after = [np.linalg.norm((s['mcam'] + s['R'] @ (s['ccam'] + offset)) - s['mcargo']) for s in s1] if s1 else []
+    err1_raw = [np.linalg.norm((s['mcam'] + s['R'] @ s['ccam']) - s['mcargo']) for s in s1] if s1 else []
+    err1_full = [np.linalg.norm((s['mcam'] + s['R'] @ (opt_R @ s['ccam'] + opt_trans)) - s['mcargo']) for s in s1] if s1 else []
     
-    err2_before = [np.linalg.norm((s['mcam'] + s['R'] @ s['ccam']) - s['mcargo']) for s in s2] if s2 else []
-    err2_after = [np.linalg.norm((s['mcam'] + s['R'] @ (s['ccam'] + offset)) - s['mcargo']) for s in s2] if s2 else []
+    err2_raw = [np.linalg.norm((s['mcam'] + s['R'] @ s['ccam']) - s['mcargo']) for s in s2] if s2 else []
+    err2_full = [np.linalg.norm((s['mcam'] + s['R'] @ (opt_R @ s['ccam'] + opt_trans)) - s['mcargo']) for s in s2] if s2 else []
     
     print("\n" + "="*60)
-    print(" ■ 【方法3】CAMERA_OPTICAL_OFFSET 最小二乗自動キャリブレーション結果")
-    print("   (カメラ向きの異なるログ統合最適化: Run 1 & Run 2)")
+    print(" ■ 【方法3】CAMERA_OPTICAL_OFFSET (回転＋並進) 自動キャリブレーション結果")
+    print("   (複数ログ統合 6自由度最適化: Run 1 & Run 2)")
     print("="*60)
     print(" 【算出された最適オフセット値】")
-    print(f"  CAMERA_OPTICAL_OFFSET (m)  : [X:{offset[0]:.4f}, Y:{offset[1]:.4f}, Z:{offset[2]:.4f}]")
-    print(f"  CAMERA_OPTICAL_OFFSET (cm) : [X:{offset[0]*100:.2f} cm, Y:{offset[1]*100:.2f} cm, Z:{offset[2]*100:.2f} cm]")
+    print(f"  CAMERA_OPTICAL_OFFSET (並進 m)  : [X:{opt_trans[0]:.4f}, Y:{opt_trans[1]:.4f}, Z:{opt_trans[2]:.4f}]")
+    print(f"  CAMERA_OPTICAL_OFFSET (並進 cm) : [X:{opt_trans[0]*100:.2f} cm, Y:{opt_trans[1]*100:.2f} cm, Z:{opt_trans[2]*100:.2f} cm]")
+    print(f"  CAMERA_ROT_OFFSET     (回転 deg): [Roll:{euler_deg[0]:.2f}°, Pitch:{euler_deg[1]:.2f}°, Yaw:{euler_deg[2]:.2f}°]")
+    print(f"  総合回転角度                    : {angle_deg:.2f}° (回転軸: [{axis[0]:.3f}, {axis[1]:.3f}, {axis[2]:.3f}])")
     print("-" * 60)
-    print(" 【3D位置誤差の改善結果】")
-    print(f"  全体平均誤差  :  適用前 {np.mean(errs_before)*100:.2f} cm  -->  適用後 {np.mean(errs_after)*100:.2f} cm (改善度: {(np.mean(errs_before)-np.mean(errs_after))*100:+.2f} cm)")
+    print(" 【3D位置誤差の改善比較】")
+    print(f"  未補正 生データ平均誤差 : {np.mean(errs_raw)*100:.2f} cm")
+    print(f"  並進補正のみ 平均誤差   : {np.mean(errs_trans_only)*100:.2f} cm (改善度: {(np.mean(errs_raw)-np.mean(errs_trans_only))*100:+.2f} cm)")
+    print(f"  回転＋並進補正 平均誤差 : {np.mean(errs_full)*100:.2f} cm (改善度: {(np.mean(errs_raw)-np.mean(errs_full))*100:+.2f} cm)")
     if s1:
-        print(f"  Run 1 平均誤差 :  適用前 {np.mean(err1_before)*100:.2f} cm  -->  適用後 {np.mean(err1_after)*100:.2f} cm")
+        print(f"  Run 1 平均誤差 : 未補正 {np.mean(err1_raw)*100:.2f} cm  -->  補正後 {np.mean(err1_full)*100:.2f} cm")
     if s2:
-        print(f"  Run 2 平均誤差 :  適用前 {np.mean(err2_before)*100:.2f} cm  -->  適用後 {np.mean(err2_after)*100:.2f} cm")
+        print(f"  Run 2 平均誤差 : 未補正 {np.mean(err2_raw)*100:.2f} cm  -->  補正後 {np.mean(err2_full)*100:.2f} cm")
     print("-" * 60)
     print(" 💡 【AR-hook1_test.py への貼り付け用コード】")
-    print(f" CAMERA_OPTICAL_OFFSET = np.array([{offset[0]:.4f}, {offset[1]:.4f}, {offset[2]:.4f}], dtype=np.float32)")
+    print(f"CAMERA_OPTICAL_OFFSET = np.array([{opt_trans[0]:.4f}, {opt_trans[1]:.4f}, {opt_trans[2]:.4f}], dtype=np.float32)")
+    print(f"CAMERA_ROT_OFFSET = np.array([")
+    print(f"    [{opt_R[0,0]:.6f}, {opt_R[0,1]:.6f}, {opt_R[0,2]:.6f}],")
+    print(f"    [{opt_R[1,0]:.6f}, {opt_R[1,1]:.6f}, {opt_R[1,2]:.6f}],")
+    print(f"    [{opt_R[2,0]:.6f}, {opt_R[2,1]:.6f}, {opt_R[2,2]:.6f}]")
+    print(f"], dtype=np.float32)")
     print("="*60)
 
     # 💾 NPZファイルとして自動保存
     try:
         save_path = Path(__file__).parent / "camera_optical_offset.npz"
-        opt_arr = offset.astype(np.float32)
-        c_off = offset_cargo_r1.astype(np.float32) if 'offset_cargo_r1' in locals() else np.zeros(3, dtype=np.float32)
-        h_off = offset_hand_r1.astype(np.float32) if 'offset_hand_r1' in locals() else np.zeros(3, dtype=np.float32)
+        opt_arr = opt_trans.astype(np.float32)
+        opt_rot_arr = opt_R.astype(np.float32)
+        
+        c_off = offset_cargo_r1.astype(np.float32) if offset_cargo_r1 is not None else np.zeros(3, dtype=np.float32)
+        h_off = offset_hand_r1.astype(np.float32) if offset_hand_r1 is not None else np.zeros(3, dtype=np.float32)
+        c_rot = rot_cargo_r1.astype(np.float32) if rot_cargo_r1 is not None else np.eye(3, dtype=np.float32)
+        h_rot = rot_hand_r1.astype(np.float32) if rot_hand_r1 is not None else np.eye(3, dtype=np.float32)
         
         np.savez(
             save_path,
             optical_offset=opt_arr,
+            optical_rot_offset=opt_rot_arr,
             cargo_offset=c_off,
-            hand_offset=h_off
+            cargo_rot_offset=c_rot,
+            hand_offset=h_off,
+            hand_rot_offset=h_rot
         )
-        print(f"💾 キャリブレーションファイルを自動保存しました: {save_path}")
+        print(f"💾 キャリブレーションファイル(回転+並進)を自動保存しました: {save_path}")
     except Exception as e:
         print(f"⚠ NPZファイルの保存に失敗しました: {e}")
 
-    return offset
+    return opt_trans, opt_R
 
 def main():
     # デフォルトのファイルパス（2回分の実行ログ）
@@ -278,23 +426,30 @@ def main():
     err_uncorr = d_ar_uncorr - d_motive
     err_uncorr_len = np.linalg.norm(err_uncorr)
     
-    # 精度向上用のカメラ座標系オフセット推奨値 (Offset = Motive_Cam - AR_Cam)
-    has_cam_r1 = not np.isnan(r1['cargo_cam'][0])
-    has_cam_r2 = not np.isnan(r2['cargo_cam'][0])
+    # ─── カメラ座標系での 6自由度 (回転 R + 並進 t) 剛体変換の推定 (Kabsch/Umeyama) ───
+    has_cam_r1 = len(r1['raw_data']['cargo_cam']) >= 3
+    has_cam_r2 = len(r2['raw_data']['cargo_cam']) >= 3
+    
+    R_cargo_r1, offset_cargo_r1 = np.eye(3), np.zeros(3)
+    R_hand_r1, offset_hand_r1 = np.eye(3), np.zeros(3)
+    R_cargo_r2, offset_cargo_r2 = np.eye(3), np.zeros(3)
+    R_hand_r2, offset_hand_r2 = np.eye(3), np.zeros(3)
     
     if has_cam_r1:
-        offset_cargo_r1 = np.array(r1['motive_cargo_cam']) - np.array(r1['cargo_cam'])
-        offset_hand_r1 = np.array(r1['motive_hand_cam']) - np.array(r1['hand_cam'])
-    else:
-        offset_cargo_r1 = np.zeros(3)
-        offset_hand_r1 = np.zeros(3)
+        R_cargo_r1, offset_cargo_r1 = estimate_rigid_transform_3d(
+            r1['raw_data']['cargo_cam'], r1['raw_data']['motive_cargo_cam']
+        )
+        R_hand_r1, offset_hand_r1 = estimate_rigid_transform_3d(
+            r1['raw_data']['hand_cam'], r1['raw_data']['motive_hand_cam']
+        )
         
     if has_cam_r2:
-        offset_cargo_r2 = np.array(r2['motive_cargo_cam']) - np.array(r2['cargo_cam'])
-        offset_hand_r2 = np.array(r2['motive_hand_cam']) - np.array(r2['hand_cam'])
-    else:
-        offset_cargo_r2 = np.zeros(3)
-        offset_hand_r2 = np.zeros(3)
+        R_cargo_r2, offset_cargo_r2 = estimate_rigid_transform_3d(
+            r2['raw_data']['cargo_cam'], r2['raw_data']['motive_cargo_cam']
+        )
+        R_hand_r2, offset_hand_r2 = estimate_rigid_transform_3d(
+            r2['raw_data']['hand_cam'], r2['raw_data']['motive_hand_cam']
+        )
     
     print("\n" + "="*60)
     print(" ■ 荷物の平均絶対世界座標（ENU）の導出結果 [m]")
@@ -316,55 +471,76 @@ def main():
     print("="*60)
 
     # 【方法3: 複数カメラ向きログによる CAMERA_OPTICAL_OFFSET 最小二乗キャリブレーション】
-    calibrate_optical_offset(r1, r2, offset_cargo_r1, offset_hand_r1)
+    calibrate_optical_offset(r1, r2, offset_cargo_r1, offset_hand_r1, R_cargo_r1, R_hand_r1)
 
     if has_cam_r1 or has_cam_r2:
         print("\n" + "="*60)
-        print(" ■ 精度向上用のカメラ座標系オフセット推奨値 (Motive真値 - AR生値) [m]")
+        print(" ■ 精度向上用のカメラ座標系 6自由度オフセット推奨値 (Motive_Cam ≈ R @ AR_Cam + t)")
         print("   ※ AR-hook1_test.py の該当のカメラオフセットに設定してください")
         print("="*60)
         if has_cam_r1:
+            e_c1 = rotation_matrix_to_euler_deg(R_cargo_r1)
+            e_h1 = rotation_matrix_to_euler_deg(R_hand_r1)
             print("【Run 1 推奨値】")
-            print(f"  手先 (HAND) オフセット:  [X:{offset_hand_r1[0]:.4f}, Y:{offset_hand_r1[1]:.4f}, Z:{offset_hand_r1[2]:.4f}]")
-            print(f"  荷物 (CARGO) オフセット: [X:{offset_cargo_r1[0]:.4f}, Y:{offset_cargo_r1[1]:.4f}, Z:{offset_cargo_r1[2]:.4f}]")
+            print(f"  手先 (HAND)  並進オフセット: [X:{offset_hand_r1[0]:.4f}, Y:{offset_hand_r1[1]:.4f}, Z:{offset_hand_r1[2]:.4f}] m")
+            print(f"               回転オフセット: [Roll:{e_h1[0]:.2f}°, Pitch:{e_h1[1]:.2f}°, Yaw:{e_h1[2]:.2f}°]")
+            print(f"  荷物 (CARGO) 並進オフセット: [X:{offset_cargo_r1[0]:.4f}, Y:{offset_cargo_r1[1]:.4f}, Z:{offset_cargo_r1[2]:.4f}] m")
+            print(f"               回転オフセット: [Roll:{e_c1[0]:.2f}°, Pitch:{e_c1[1]:.2f}°, Yaw:{e_c1[2]:.2f}°]")
         else:
             print("【Run 1】カメラ座標系データなし")
             
         if has_cam_r2:
+            e_c2 = rotation_matrix_to_euler_deg(R_cargo_r2)
+            e_h2 = rotation_matrix_to_euler_deg(R_hand_r2)
             print("\n【Run 2 推奨値】")
-            print(f"  手先 (HAND) オフセット:  [X:{offset_hand_r2[0]:.4f}, Y:{offset_hand_r2[1]:.4f}, Z:{offset_hand_r2[2]:.4f}]")
-            print(f"  荷物 (CARGO) オフセット: [X:{offset_cargo_r2[0]:.4f}, Y:{offset_cargo_r2[1]:.4f}, Z:{offset_cargo_r2[2]:.4f}]")
+            print(f"  手先 (HAND)  並進オフセット: [X:{offset_hand_r2[0]:.4f}, Y:{offset_hand_r2[1]:.4f}, Z:{offset_hand_r2[2]:.4f}] m")
+            print(f"               回転オフセット: [Roll:{e_h2[0]:.2f}°, Pitch:{e_h2[1]:.2f}°, Yaw:{e_h2[2]:.2f}°]")
+            print(f"  荷物 (CARGO) 並進オフセット: [X:{offset_cargo_r2[0]:.4f}, Y:{offset_cargo_r2[1]:.4f}, Z:{offset_cargo_r2[2]:.4f}] m")
+            print(f"               回転オフセット: [Roll:{e_c2[0]:.2f}°, Pitch:{e_c2[1]:.2f}°, Yaw:{e_c2[2]:.2f}°]")
         else:
             print("\n【Run 2】カメラ座標系データなし")
         print("="*60)
 
-        # Run 1 のオフセットを Run 2 に適用した場合のシミュレーション評価
+        # Run 1 のオフセットを Run 2 に適用した場合のシミュレーション評価 (並進のみ vs 回転+並進)
         if has_cam_r1 and has_cam_r2:
             # 荷物の補正
             cargo_r2_raw = np.array(r2['raw_data']['cargo_cam'])
             cargo_r2_motive = np.array(r2['raw_data']['motive_cargo_cam'])
-            cargo_r2_corr = cargo_r2_raw + offset_cargo_r1
+            
+            # 純粋な平均並進差分による補正
+            mean_trans_cargo_r1 = np.array(r1['motive_cargo_cam']) - np.array(r1['cargo_cam'])
+            cargo_r2_trans_only = cargo_r2_raw + mean_trans_cargo_r1
+            
+            # 剛体変換 (R + t) による補正
+            cargo_r2_rigid = (R_cargo_r1 @ cargo_r2_raw.T).T + offset_cargo_r1
             
             raw_cargo_errs = np.linalg.norm(cargo_r2_raw - cargo_r2_motive, axis=1)
-            corr_cargo_errs = np.linalg.norm(cargo_r2_corr - cargo_r2_motive, axis=1)
+            trans_cargo_errs = np.linalg.norm(cargo_r2_trans_only - cargo_r2_motive, axis=1)
+            rigid_cargo_errs = np.linalg.norm(cargo_r2_rigid - cargo_r2_motive, axis=1)
             
             # 手先の補正
             hand_r2_raw = np.array(r2['raw_data']['hand_cam'])
             hand_r2_motive = np.array(r2['raw_data']['motive_hand_cam'])
-            hand_r2_corr = hand_r2_raw + offset_hand_r1
+            
+            mean_trans_hand_r1 = np.array(r1['motive_hand_cam']) - np.array(r1['hand_cam'])
+            hand_r2_trans_only = hand_r2_raw + mean_trans_hand_r1
+            hand_r2_rigid = (R_hand_r1 @ hand_r2_raw.T).T + offset_hand_r1
             
             raw_hand_errs = np.linalg.norm(hand_r2_raw - hand_r2_motive, axis=1)
-            corr_hand_errs = np.linalg.norm(hand_r2_corr - hand_r2_motive, axis=1)
+            trans_hand_errs = np.linalg.norm(hand_r2_trans_only - hand_r2_motive, axis=1)
+            rigid_hand_errs = np.linalg.norm(hand_r2_rigid - hand_r2_motive, axis=1)
             
             print("\n" + "="*60)
-            print(" ■ Run 1 のオフセットを Run 2 に適用した精度改善シミュレーション (カメラ座標系)")
+            print(" ■ Run 1 の校正値を Run 2 に適用した精度改善シミュレーション (カメラ座標系)")
             print("="*60)
             print("【荷物 (CARGO) 3D位置誤差】")
-            print(f"  オフセット適用前 平均誤差: {np.mean(raw_cargo_errs)*100:.2f} cm")
-            print(f"  オフセット適用後 平均誤差: {np.mean(corr_cargo_errs)*100:.2f} cm")
+            print(f"  未補正 生データ平均誤差 : {np.mean(raw_cargo_errs)*100:.2f} cm")
+            print(f"  並進のみ補正 平均誤差   : {np.mean(trans_cargo_errs)*100:.2f} cm")
+            print(f"  回転＋並進補正 平均誤差 : {np.mean(rigid_cargo_errs)*100:.2f} cm (改善度: {(np.mean(raw_cargo_errs)-np.mean(rigid_cargo_errs))*100:+.2f} cm)")
             print("\n【手先 (HAND) 3D位置誤差】")
-            print(f"  オフセット適用前 平均誤差: {np.mean(raw_hand_errs)*100:.2f} cm")
-            print(f"  オフセット適用後 平均誤差: {np.mean(corr_hand_errs)*100:.2f} cm")
+            print(f"  未補正 生データ平均誤差 : {np.mean(raw_hand_errs)*100:.2f} cm")
+            print(f"  並進のみ補正 平均誤差   : {np.mean(trans_hand_errs)*100:.2f} cm")
+            print(f"  回転＋並進補正 平均誤差 : {np.mean(rigid_hand_errs)*100:.2f} cm (改善度: {(np.mean(raw_hand_errs)-np.mean(rigid_hand_errs))*100:+.2f} cm)")
             print("="*60)
     else:
         print("\nℹ️ CSVファイルにカメラ座標系データが含まれていないため、個別のオフセット算出およびシミュレーションはスキップされました。")
