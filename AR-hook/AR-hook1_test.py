@@ -791,17 +791,21 @@ def camera_tracker_loop(m, show_window=False):
                 if id1_cam is not None:
                     has_id1 = True
 
-                # カメラ座標系検出値の生値を保存 (CSV記録用)
+                # カメラ座標系検出値の生値を保存 (CSV記録用および生マーカー間相対計算用)
                 c_cam_raw_val = [float('nan'), float('nan'), float('nan')]
+                raw_center_cam = None
                 if center_cam is not None:
+                    raw_center_cam = center_cam.copy()
                     c_cam_raw_val = [float(center_cam[0]), float(center_cam[1]), float(center_cam[2])]
-                    # 回転・並進オフセット適用 (カメラから荷物中心への6DOFオフセット)
+                    # 回転・並進オフセット適用 (カメラから荷物中心への6DOFオフセット, ワールド目標算出用)
                     center_cam = CARGO_ROT_OFFSET.dot(center_cam) + np.array([CARGO_OFFSET_CAM_X, CARGO_OFFSET_CAM_Y, CARGO_OFFSET_CAM_Z], dtype=np.float32)
 
                 h_cam_raw_val = [float('nan'), float('nan'), float('nan')]
+                raw_id1_cam = None
                 if id1_cam is not None:
+                    raw_id1_cam = id1_cam.copy()
                     h_cam_raw_val = [float(id1_cam[0]), float(id1_cam[1]), float(id1_cam[2])]
-                    # 回転・並進オフセット適用 (カメラから手先への6DOFオフセット)
+                    # 回転・並進オフセット適用 (カメラから手先への6DOFオフセット, ワールド目標算出用)
                     id1_cam = HAND_ROT_OFFSET.dot(id1_cam) + np.array([HAND_OFFSET_CAM_X, HAND_OFFSET_CAM_Y, HAND_OFFSET_CAM_Z], dtype=np.float32)
 
                 # Motiveデータのカメラ座標系への逆投影真値の算出
@@ -868,11 +872,13 @@ def camera_tracker_loop(m, show_window=False):
 
                     # ID1が見えていれば、中心との差分を使ってドローン目標を算出、および相対xyz座標を計算
                     if has_id1:
+                        # ドローン目標位置の差分ベクトル (ワールド座標補正適用後)
                         tvec_error = center_cam - id1_cam
-                        # 中心位置を原点とする座標系から見たID1までのxyz距離
-                        v_cam = id1_cam - center_cam
+                        
+                        # ✅ マーカー間の純粋な相対距離計算 (カメラ視点オフセットの影響を排除するため生のカメラ座標値を使用)
+                        v_cam_raw_vec = raw_id1_cam - raw_center_cam
                         R_cargo, _ = cv2.Rodrigues(rvec_cargo)
-                        v_cargo = R_cargo.T.dot(v_cam)
+                        v_cargo = R_cargo.T.dot(v_cam_raw_vec)
                         dist_x = float(v_cargo[0])
                         dist_y = float(v_cargo[1])
                         dist_z = float(v_cargo[2])
@@ -1187,26 +1193,29 @@ def save_csv():
     with open(path, 'w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow([
-            'Time', 'GPS_X', 'GPS_Y', 'GPS_Z', 'Target_X', 'Target_Y', 'Target_Z',
-            'Cargo_X', 'Cargo_Y', 'Cargo_Z', 'Cargo_Detected', 'ID1_Detected',
-            'ID1_to_Cargo_DX', 'ID1_to_Cargo_DY', 'ID1_to_Cargo_DZ',
-            'Est_Center_Cam_X', 'Est_Center_Cam_Y',
+            'Time_s', 
+            'GPS_Drone_X_m', 'GPS_Drone_Y_m', 'GPS_Drone_Z_m', 
+            'Target_Drone_X_m', 'Target_Drone_Y_m', 'Target_Drone_Z_m',
+            'Est_Cargo_X_m', 'Est_Cargo_Y_m', 'Est_Cargo_Z_m', 
+            'Cargo_Detected', 'ID1_Detected',
+            'ID1_to_Cargo_DX_m', 'ID1_to_Cargo_DY_m', 'ID1_to_Cargo_DZ_m',
+            'Cargo_Center_Pixel_Dev_X_px', 'Cargo_Center_Pixel_Dev_Y_px',
             # ✅ Motive ID1センサ（ドローン真値）
-            'Motive_Drone_X', 'Motive_Drone_Y', 'Motive_Drone_Z',
-            'Motive_Cargo_X', 'Motive_Cargo_Y', 'Motive_Cargo_Z',
-            'Motive_Rel_X', 'Motive_Rel_Y', 'Motive_Rel_Z',
-            'Motive_Roll', 'Motive_Pitch', 'Motive_Yaw',
+            'Motive_Drone_X_m', 'Motive_Drone_Y_m', 'Motive_Drone_Z_m',
+            'Motive_Cargo_X_m', 'Motive_Cargo_Y_m', 'Motive_Cargo_Z_m',
+            'Motive_Rel_X_m', 'Motive_Rel_Y_m', 'Motive_Rel_Z_m',
+            'Motive_Roll_rad', 'Motive_Pitch_rad', 'Motive_Yaw_rad',
             # ✅ カメラ Motive センサ（カメラ rigid body）
-            'Motive_Camera_X', 'Motive_Camera_Y', 'Motive_Camera_Z',
+            'Motive_Camera_X_m', 'Motive_Camera_Y_m', 'Motive_Camera_Z_m',
             'Motive_Camera_Received',
             'Coord_Source',
-            'Pixhawk_Roll', 'Pixhawk_Pitch', 'Pixhawk_Yaw',
+            'Pixhawk_Roll_rad', 'Pixhawk_Pitch_rad', 'Pixhawk_Yaw_rad',
             # ✅ カメラ座標系 生データ
-            'Cargo_Cam_X', 'Cargo_Cam_Y', 'Cargo_Cam_Z',
-            'Hand_Cam_X', 'Hand_Cam_Y', 'Hand_Cam_Z',
+            'Cargo_Cam_Raw_X_m', 'Cargo_Cam_Raw_Y_m', 'Cargo_Cam_Raw_Z_m',
+            'Hand_Cam_Raw_X_m', 'Hand_Cam_Raw_Y_m', 'Hand_Cam_Raw_Z_m',
             # ✅ カメラ座標系 Motive真値（逆投影）
-            'Motive_Cargo_Cam_X', 'Motive_Cargo_Cam_Y', 'Motive_Cargo_Cam_Z',
-            'Motive_Hand_Cam_X', 'Motive_Hand_Cam_Y', 'Motive_Hand_Cam_Z'
+            'Motive_Cargo_Cam_X_m', 'Motive_Cargo_Cam_Y_m', 'Motive_Cargo_Cam_Z_m',
+            'Motive_Hand_Cam_X_m', 'Motive_Hand_Cam_Y_m', 'Motive_Hand_Cam_Z_m'
         ])
         writer.writerows(data_records)
     print(f"\n✓ CSV保存完了: {path} ({len(data_records)} 行)")

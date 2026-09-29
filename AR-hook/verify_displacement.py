@@ -39,22 +39,28 @@ def load_and_process_csv(filepath):
     # オプティカルオフセット校正用サンプル
     calib_samples = []
     
+    def get_v(row, *keys):
+        for k in keys:
+            if k in row and row[k] != '':
+                return row[k]
+        return None
+
     with open(filepath, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         for idx, row in enumerate(reader):
             try:
                 # 荷物が検出されている行のみを処理
-                if int(row['Cargo_Detected']) != 1:
+                if int(get_v(row, 'Cargo_Detected') or 0) != 1:
                     continue
                 
                 # 世界座標系（ENU）データの取得
-                mcx = float(row['Motive_Cargo_X'])
-                mcy = float(row['Motive_Cargo_Y'])
-                mcz = float(row['Motive_Cargo_Z'])
+                mcx = float(get_v(row, 'Motive_Cargo_X_m', 'Motive_Cargo_X') or 0)
+                mcy = float(get_v(row, 'Motive_Cargo_Y_m', 'Motive_Cargo_Y') or 0)
+                mcz = float(get_v(row, 'Motive_Cargo_Z_m', 'Motive_Cargo_Z') or 0)
                 
-                ax = float(row['Cargo_X'])
-                ay = float(row['Cargo_Y'])
-                az = float(row['Cargo_Z'])
+                ax = float(get_v(row, 'Est_Cargo_X_m', 'Cargo_X') or 0)
+                ay = float(get_v(row, 'Est_Cargo_Y_m', 'Cargo_Y') or 0)
+                az = float(get_v(row, 'Est_Cargo_Z_m', 'Cargo_Z') or 0)
                 
                 # 無効な座標値（すべて0など）はスキップ
                 if mcx == 0.0 and mcy == 0.0 and mcz == 0.0:
@@ -64,22 +70,23 @@ def load_and_process_csv(filepath):
                 ar_cargo_uncorr.append([ax, ay, az])
                 
                 # カメラ座標系データの取得
-                if 'ID1_Detected' in row and int(row['ID1_Detected']) == 1:
-                    hcx = float(row['Hand_Cam_X'])
-                    hcy = float(row['Hand_Cam_Y'])
-                    hcz = float(row['Hand_Cam_Z'])
+                i_det = get_v(row, 'ID1_Detected')
+                if i_det is not None and int(i_det) == 1:
+                    hcx = float(get_v(row, 'Hand_Cam_Raw_X_m', 'Hand_Cam_X') or 'nan')
+                    hcy = float(get_v(row, 'Hand_Cam_Raw_Y_m', 'Hand_Cam_Y') or 'nan')
+                    hcz = float(get_v(row, 'Hand_Cam_Raw_Z_m', 'Hand_Cam_Z') or 'nan')
                     
-                    ccx = float(row['Cargo_Cam_X'])
-                    ccy = float(row['Cargo_Cam_Y'])
-                    ccz = float(row['Cargo_Cam_Z'])
+                    ccx = float(get_v(row, 'Cargo_Cam_Raw_X_m', 'Cargo_Cam_X') or 'nan')
+                    ccy = float(get_v(row, 'Cargo_Cam_Raw_Y_m', 'Cargo_Cam_Y') or 'nan')
+                    ccz = float(get_v(row, 'Cargo_Cam_Raw_Z_m', 'Cargo_Cam_Z') or 'nan')
                     
-                    m_ccx = float(row['Motive_Cargo_Cam_X'])
-                    m_ccy = float(row['Motive_Cargo_Cam_Y'])
-                    m_ccz = float(row['Motive_Cargo_Cam_Z'])
+                    m_ccx = float(get_v(row, 'Motive_Cargo_Cam_X_m', 'Motive_Cargo_Cam_X') or 'nan')
+                    m_ccy = float(get_v(row, 'Motive_Cargo_Cam_Y_m', 'Motive_Cargo_Cam_Y') or 'nan')
+                    m_ccz = float(get_v(row, 'Motive_Cargo_Cam_Z_m', 'Motive_Cargo_Cam_Z') or 'nan')
                     
-                    m_hcx = float(row['Motive_Hand_Cam_X'])
-                    m_hcy = float(row['Motive_Hand_Cam_Y'])
-                    m_hcz = float(row['Motive_Hand_Cam_Z'])
+                    m_hcx = float(get_v(row, 'Motive_Hand_Cam_X_m', 'Motive_Hand_Cam_X') or 'nan')
+                    m_hcy = float(get_v(row, 'Motive_Hand_Cam_Y_m', 'Motive_Hand_Cam_Y') or 'nan')
+                    m_hcz = float(get_v(row, 'Motive_Hand_Cam_Z_m', 'Motive_Hand_Cam_Z') or 'nan')
                     
                     # すべての値が正常（nanでない）なら追加
                     if not (math.isnan(hcx) or math.isnan(ccx) or math.isnan(m_ccx) or math.isnan(m_hcx)):
@@ -89,18 +96,19 @@ def load_and_process_csv(filepath):
                         motive_hand_cam.append([m_hcx, m_hcy, m_hcz])
                 
                 # CAMERA_OPTICAL_OFFSET キャリブレーション用データの収集
-                if HAS_NUMPY and 'Motive_Camera_X' in row:
-                    mcam_x = float(row['Motive_Camera_X'])
-                    mcam_y = float(row['Motive_Camera_Y'])
-                    mcam_z = float(row['Motive_Camera_Z'])
+                mcam_x_val = get_v(row, 'Motive_Camera_X_m', 'Motive_Camera_X')
+                if HAS_NUMPY and mcam_x_val is not None:
+                    mcam_x = float(mcam_x_val)
+                    mcam_y = float(get_v(row, 'Motive_Camera_Y_m', 'Motive_Camera_Y') or 0)
+                    mcam_z = float(get_v(row, 'Motive_Camera_Z_m', 'Motive_Camera_Z') or 0)
                     
-                    ccx = float(row['Cargo_Cam_X'])
-                    ccy = float(row['Cargo_Cam_Y'])
-                    ccz = float(row['Cargo_Cam_Z'])
+                    ccx = float(get_v(row, 'Cargo_Cam_Raw_X_m', 'Cargo_Cam_X') or 'nan')
+                    ccy = float(get_v(row, 'Cargo_Cam_Raw_Y_m', 'Cargo_Cam_Y') or 'nan')
+                    ccz = float(get_v(row, 'Cargo_Cam_Raw_Z_m', 'Cargo_Cam_Z') or 'nan')
                     
-                    m_ccx = float(row['Motive_Cargo_Cam_X'])
-                    m_ccy = float(row['Motive_Cargo_Cam_Y'])
-                    m_ccz = float(row['Motive_Cargo_Cam_Z'])
+                    m_ccx = float(get_v(row, 'Motive_Cargo_Cam_X_m', 'Motive_Cargo_Cam_X') or 'nan')
+                    m_ccy = float(get_v(row, 'Motive_Cargo_Cam_Y_m', 'Motive_Cargo_Cam_Y') or 'nan')
+                    m_ccz = float(get_v(row, 'Motive_Cargo_Cam_Z_m', 'Motive_Cargo_Cam_Z') or 'nan')
                     
                     if not (math.isnan(mcam_x) or math.isnan(ccx) or math.isnan(m_ccx) or mcam_x == 0.0):
                         v1_cam = np.array([ccx, ccy, ccz], dtype=np.float64)
@@ -390,8 +398,8 @@ def calibrate_optical_offset(r1, r2, offset_cargo_r1=None, offset_hand_r1=None, 
 
 def main():
     # デフォルトのファイルパス（2回分の実行ログ）
-    default_run1 = "C:/Users/kazzu/Downloads/20260731_131244_1.csv"
-    default_run2 = "C:/Users/kazzu/Downloads/20260731_131759_1.csv"
+    default_run1 = "C:/Users/Ushida/Downloads/20260930_004352_1.csv"
+    default_run2 = "C:/Users/Ushida/Downloads/20260930_005008_1.csv"
     
     run1_path = sys.argv[1] if len(sys.argv) > 1 else default_run1
     run2_path = sys.argv[2] if len(sys.argv) > 2 else default_run2

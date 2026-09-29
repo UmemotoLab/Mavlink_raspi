@@ -112,54 +112,72 @@ def main():
     mot_rel_x, mot_rel_y, mot_rel_z = [], [], []
     mot_roll, mot_pitch, mot_yaw = [], [], []
     
+    def get_v(row, *keys):
+        for k in keys:
+            if k in row and row[k] != '':
+                return row[k]
+        return None
+
     with open(csv_path, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         for row in reader:
             try:
-                times.append(float(row['Time']))
+                t_val = get_v(row, 'Time_s', 'Time')
+                if t_val is None:
+                    continue
+                times.append(float(t_val))
                 
                 # 検出フラグ
-                c_det = int(row['Cargo_Detected'])
-                i_det = int(row['ID1_Detected'])
+                c_det = int(get_v(row, 'Cargo_Detected') or 0)
+                i_det = int(get_v(row, 'ID1_Detected') or 0)
                 cargo_detected.append(c_det)
                 id1_detected.append(i_det)
                 
                 # Pixhawk & Camera (正規化済みGPS座標)
-                gps_x.append(float(row['GPS_X']))
-                gps_y.append(float(row['GPS_Y']))
-                gps_z.append(float(row['GPS_Z']))
+                gps_x.append(float(get_v(row, 'GPS_Drone_X_m', 'GPS_X') or 0))
+                gps_y.append(float(get_v(row, 'GPS_Drone_Y_m', 'GPS_Y') or 0))
+                gps_z.append(float(get_v(row, 'GPS_Drone_Z_m', 'GPS_Z') or 0))
                 
-                cargo_x.append(float(row['Cargo_X']) if row['Cargo_X'] else float('nan'))
-                cargo_y.append(float(row['Cargo_Y']) if row['Cargo_Y'] else float('nan'))
-                cargo_z.append(float(row['Cargo_Z']) if row['Cargo_Z'] else float('nan'))
+                cx = get_v(row, 'Est_Cargo_X_m', 'Cargo_X')
+                cy = get_v(row, 'Est_Cargo_Y_m', 'Cargo_Y')
+                cz = get_v(row, 'Est_Cargo_Z_m', 'Cargo_Z')
+                cargo_x.append(float(cx) if cx is not None else float('nan'))
+                cargo_y.append(float(cy) if cy is not None else float('nan'))
+                cargo_z.append(float(cz) if cz is not None else float('nan'))
                 
-                rel_dx.append(float(row['ID1_to_Cargo_DX']) if row['ID1_to_Cargo_DX'] else float('nan'))
-                rel_dy.append(float(row['ID1_to_Cargo_DY']) if row['ID1_to_Cargo_DY'] else float('nan'))
-                rel_dz.append(float(row['ID1_to_Cargo_DZ']) if row['ID1_to_Cargo_DZ'] else float('nan'))
+                rdx = get_v(row, 'ID1_to_Cargo_DX_m', 'ID1_to_Cargo_DX')
+                rdy = get_v(row, 'ID1_to_Cargo_DY_m', 'ID1_to_Cargo_DY')
+                rdz = get_v(row, 'ID1_to_Cargo_DZ_m', 'ID1_to_Cargo_DZ')
+                rel_dx.append(float(rdx) if rdx is not None else float('nan'))
+                rel_dy.append(float(rdy) if rdy is not None else float('nan'))
+                rel_dz.append(float(rdz) if rdz is not None else float('nan'))
                 
-                pix_roll.append(float(row['Pixhawk_Roll']))
-                pix_pitch.append(float(row['Pixhawk_Pitch']))
-                pix_yaw.append(float(row['Pixhawk_Yaw']))
+                pix_roll.append(float(get_v(row, 'Pixhawk_Roll_rad', 'Pixhawk_Roll') or 0))
+                pix_pitch.append(float(get_v(row, 'Pixhawk_Pitch_rad', 'Pixhawk_Pitch') or 0))
+                pix_yaw.append(float(get_v(row, 'Pixhawk_Yaw_rad', 'Pixhawk_Yaw') or 0))
                 
                 # ✅ Motive ID1センサ (ドローン真値)
-                mot_drone_x.append(float(row['Motive_Drone_X']))
-                mot_drone_y.append(float(row['Motive_Drone_Y']))
-                mot_drone_z.append(float(row['Motive_Drone_Z']))
+                mot_drone_x.append(float(get_v(row, 'Motive_Drone_X_m', 'Motive_Drone_X') or 0))
+                mot_drone_y.append(float(get_v(row, 'Motive_Drone_Y_m', 'Motive_Drone_Y') or 0))
+                mot_drone_z.append(float(get_v(row, 'Motive_Drone_Z_m', 'Motive_Drone_Z') or 0))
                 
                 # ✅ Motive 荷物マーカー (ID2-5)
-                mot_cargo_x.append(float(row['Motive_Cargo_X']))
-                mot_cargo_y.append(float(row['Motive_Cargo_Y']))
-                mot_cargo_z.append(float(row['Motive_Cargo_Z']))
+                mot_cargo_x.append(float(get_v(row, 'Motive_Cargo_X_m', 'Motive_Cargo_X') or 0))
+                mot_cargo_y.append(float(get_v(row, 'Motive_Cargo_Y_m', 'Motive_Cargo_Y') or 0))
+                mot_cargo_z.append(float(get_v(row, 'Motive_Cargo_Z_m', 'Motive_Cargo_Z') or 0))
                 
                 # ✅ Motive 荷物ローカル座標系での相対位置 (真値)
-                mot_rel_x.append(float(row['Motive_Rel_X']) if row['Motive_Rel_X'] else float('nan'))
-                mot_rel_y.append(float(row['Motive_Rel_Y']) if row['Motive_Rel_Y'] else float('nan'))
-                mot_rel_z.append(float(row['Motive_Rel_Z']) if row['Motive_Rel_Z'] else float('nan'))
+                mrx = get_v(row, 'Motive_Rel_X_m', 'Motive_Rel_X')
+                mry = get_v(row, 'Motive_Rel_Y_m', 'Motive_Rel_Y')
+                mrz = get_v(row, 'Motive_Rel_Z_m', 'Motive_Rel_Z')
+                mot_rel_x.append(float(mrx) if mrx is not None else float('nan'))
+                mot_rel_y.append(float(mry) if mry is not None else float('nan'))
+                mot_rel_z.append(float(mrz) if mrz is not None else float('nan'))
                 
                 # ✅ Motive ID1センサ姿勢 (ドローン真値)
-                mot_roll.append(float(row['Motive_Roll']))
-                mot_pitch.append(float(row['Motive_Pitch']))
-                mot_yaw.append(float(row['Motive_Yaw']))
+                mot_roll.append(float(get_v(row, 'Motive_Roll_rad', 'Motive_Roll') or 0))
+                mot_pitch.append(float(get_v(row, 'Motive_Pitch_rad', 'Motive_Pitch') or 0))
+                mot_yaw.append(float(get_v(row, 'Motive_Yaw_rad', 'Motive_Yaw') or 0))
             except (ValueError, KeyError) as e:
                 # 変換エラーや一部欠損行はスキップ
                 continue
