@@ -398,8 +398,8 @@ def calibrate_optical_offset(r1, r2, offset_cargo_r1=None, offset_hand_r1=None, 
 
 def main():
     # デフォルトのファイルパス（2回分の実行ログ）
-    default_run1 = "C:/Users/Ushida/Downloads/20260930_004352_1.csv"
-    default_run2 = "C:/Users/Ushida/Downloads/20260930_005008_1.csv"
+    default_run1 = "C:/Users/Ushida/Downloads/20260930_040021_1.csv"
+    default_run2 = "C:/Users/Ushida/Downloads/20260930_035830_1.csv"
     
     run1_path = sys.argv[1] if len(sys.argv) > 1 else default_run1
     run2_path = sys.argv[2] if len(sys.argv) > 2 else default_run2

@@ -880,11 +880,10 @@ def camera_tracker_loop(m, show_window=False):
                         R_cargo, _ = cv2.Rodrigues(rvec_cargo)
                         v_cargo = R_cargo.T.dot(v_cam_raw_vec)
                         
-                        # ✅ ArUco荷物座標系からMotive荷物リジッドボディ座標系への軸変換 (90度回転の軸整合)
-                        # ArUco -Y -> Motive X (前後方向), ArUco X -> Motive Y (左右方向)
-                        dist_x = -float(v_cargo[1])
-                        dist_y =  float(v_cargo[0])
-                        dist_z =  float(v_cargo[2])
+                        # ✅ マーカー座標系の軸定義 (X: 左右方向, Y: 上下/前後方向, Z: 高さ/奥行き方向)
+                        dist_x =  float(v_cargo[0])  # ArUco X -> X軸 (左右方向)
+                        dist_y = -float(v_cargo[1])  # ArUco -Y -> Y軸 (上下/前後方向)
+                        dist_z =  float(v_cargo[2])  # ArUco Z -> Z軸 (高さ/奥行き方向)
                     else:
                         # ID1が見えない場合は荷物中心そのものを目標にする（ただしID1目標距離は算出しない）
                         tvec_error = center_cam
