@@ -5,6 +5,13 @@
 2. パラメータ名でメッセージをフィルタリング
 3. ACK方式のタイムアウト処理
 4. 段階的な設定と検証
+
+前提（RTK運用 / 屋外）:
+- RTKモジュール(ZED-F9P)内部の設定は本スクリプトでは一切行わない。
+  ベース局/ローバーのF9P設定は別途 f9p_config_all.py で書き込む。
+  そのため GPS_AUTO_CONFIG は 0 (無効) にし、機体起動時の自動構成で
+  F9P のRTCM出力/UART/ボーレート等が上書きされないようにしている。
+- EKF3 は RTK 精度を前提としたノイズ設定（実測: 位置が 1cm 枠内に約96%）にしている。
 """
 
 from pymavlink import mavutil
@@ -52,22 +59,24 @@ params_to_set = {
     # === GPS/センサー融合設定 ===
     'EK3_SRC1_POSXY': (3, 'AP_Int8', 'GPS (水平位置)'),
     'EK3_SRC1_VELXY': (3, 'AP_Int8', 'GPS (水平速度)'),
-    'EK3_SRC1_POSZ': (1, 'AP_Int8', '高度ソース: 1=気圧センサー (通常のGPS精度では気圧を使うのが最も高度が安定します)'),
+    'EK3_SRC1_POSZ': (3, 'AP_Int8', '高度ソース: 3=GPS (RTKで垂直精度がcm級のため。GPS喪失時は気圧へ自動フォールバック)'),
     'EK3_SRC1_VELZ': (3, 'AP_Int8', 'GPS (垂直速度)'),
     'EK3_SRC1_YAW': (1, 'AP_Int8', 'ヨー角ソース: 1=コンパス (1基構成での必須設定)'),
 
     # === EKF3精度設定 ===
     'EK3_GPS_CHECK': (1, 'AP_Int8', 'GPS健全性チェック'),
-    'EK3_POS_I_GATE': (8, 'AP_Int16', '位置ゲート'),
-    'EK3_VEL_I_GATE': (8, 'AP_Int16', '速度ゲート'),
-    'EK3_HGT_I_GATE': (10, 'AP_Int16', '高度ゲート'),
+    # 注: ArduPilotの許容範囲は 100〜1000 (0.01*SD単位, 100=1.0σ)。
+    #     旧値(8/8/10)は範囲外で最小値にクランプされるため、明示的に100を設定する。
+    'EK3_POS_I_GATE': (100, 'AP_Int16', '位置ゲート (0.01*SD単位, 100=1.0σ)'),
+    'EK3_VEL_I_GATE': (100, 'AP_Int16', '速度ゲート (0.01*SD単位, 100=1.0σ)'),
+    'EK3_HGT_I_GATE': (100, 'AP_Int16', '高度ゲート (0.01*SD単位, 100=1.0σ)'),
 
     # === ノイズパラメータ ===
-    'EK3_POSNE_M_NSE': (0.5, 'AP_Float', '水平位置ノイズ [m] (単独測位のブレを許容するため0.1→0.5の標準値へ緩和)'),
-    'EK3_VELNE_M_NSE': (0.3, 'AP_Float', '水平速度ノイズ [m/s]'),
-    'EK3_VELD_M_NSE': (0.5, 'AP_Float', '垂直速度ノイズ [m/s]'),
-    'EK3_YAW_M_NSE': (0.2, 'AP_Float', 'ヨー角ノイズ [rad]'),
-    'EK3_ALT_M_NSE': (3.0, 'AP_Float', '気圧センサーノイズ [m]'),
+    'EK3_POSNE_M_NSE': (0.1, 'AP_Float', '水平位置ノイズ [m] (RTK前提: 実測1cm@96%。設定可能な最小値0.1。単独測位運用に戻す場合は0.5へ)'),
+    'EK3_VELNE_M_NSE': (0.1, 'AP_Float', '水平速度ノイズ [m/s] (RTKドップラー)'),
+    'EK3_VELD_M_NSE': (0.2, 'AP_Float', '垂直速度ノイズ [m/s] (RTKドップラー)'),
+    'EK3_YAW_M_NSE': (0.2, 'AP_Float', 'ヨー角ノイズ [rad] (コンパス1基構成のため据え置き)'),
+    'EK3_ALT_M_NSE': (3.0, 'AP_Float', '気圧センサーノイズ [m] (POSZ=GPS時はバックアップとして使用)'),
     'EK3_GYRO_P_NSE': (0.01, 'AP_Float', 'ジャイロプロセスノイズ [rad/s]'),
 
     # === コンパス設定 ===
@@ -81,16 +90,25 @@ params_to_set = {
     'EK3_SRC_OPTIONS': (1, 'AP_Int16', 'Fuse all velocity sources'),
 
     # === EKF安定化設定 ===
-    'EK3_GLITCH_RAD': (5, 'AP_Int8', 'GPS Glitch検出半径 [m]'),
+    # 注: ArduPilotの許容範囲は 10〜100[m]。旧値5は範囲外のため最小値10を設定する。
+    'EK3_GLITCH_RAD': (10, 'AP_Int8', 'GPS Glitch検出半径 [m] (許容最小値10)'),
     'EK3_CHECK_SCALE': (100, 'AP_Int16', 'EKFチェックスケール [%]'),
     'EK3_PRIMARY': (-1, 'AP_Int8', '自動切り替え無効'),
 
     # === GPS設定 ===
-    # 'GPS_TYPE': (9, 'AP_Int8', 'DroneCAN GPS'),
-    'GPS_AUTO_CONFIG': (2, 'AP_Int8', 'DroneCAN AutoConfig'),
+    # 注: RTKモジュール(F9P)内部の設定は f9p_config_all.py が担当する。
+    #     本スクリプトからは一切書き換えないため、自動構成は無効化しておく。
+    #     GPS_AUTO_CONFIG=2 (DroneCAN AutoConfig) だと起動のたびに DroneCAN GPS が
+    #     再構成され、F9P のRTCM出力/UART/ボーレート/コンステレーション等が
+    #     上書きされて RTK Fix を阻害する（ArduPilot公式ドキュメント参照）。
+    # DroneCAN GPS を確実に GPS1 として扱うための FC 側パラメータ。
+    # （F9P モジュール内部には何も書き込まないため f9p_config_all.py と競合しない）
+    # ファームが 4.6 以降で GPS1_TYPE 命名の場合は GPS1_TYPE=9 に読み替えること。
+    'GPS_TYPE': (9, 'AP_Int8', 'GPS1通信プロトコル: 9=DroneCAN GPS'),
+    'GPS_AUTO_CONFIG': (0, 'AP_Int8', '自動構成無効 (F9P設定はf9p_config_all.pyで実施)'),
     'GPS_PRIMARY': (0, 'AP_Int8', 'プライマリGPS'),
 
-    # === CAN/DroneCAN設定 ===
+    # === CAN/DroneCAN設定（FC側バスのみ。モジュール内部設定は行わない） ===
     'CAN_P1_DRIVER': (1, 'AP_Int8', 'CAN1ポート有効化'),
     'CAN_D1_PROTOCOL': (1, 'AP_Int8', 'DroneCANプロトコル'),
     'GPS_DRV_OPTIONS': (0, 'AP_Int8', 'デフォルト'),
@@ -166,7 +184,7 @@ params_to_set = {
     # 'OBS_EKF_W_INIT':   (3.7699, 'AP_Float', '初期角周波数 [rad/s] (0.60 Hz)'), # 0.69m換算
     # 'OBS_EKF_W_INIT':   (5.0000, 'AP_Float', '初期角周波数 [rad/s] (0.60 Hz)'),
     # 'OBS_EKF_W_INIT':   (2.9523, 'AP_Float', '初期角周波数 [rad/s] (0.4699 Hz)'), # L=1.04m FFT平均
-    'OBS_EKF_W_INIT':   (2.5569, 'AP_Float', '初期角周波数 [rad/s] (0.4069 Hz)'), # L=1.5m 換算
+    'OBS_EKF_W_INIT':   (3.0707, 'AP_Float', '初期角周波数 [rad/s] (0.4887 Hz)'), # L=1.04m 換算 (PENDULUM_LENGTHと一致)
     'OBS_EKF_W_MIN':    (2.1991, 'AP_Float', '最小角周波数 [rad/s] (0.35 Hz)'), # 2.00m換算
     'OBS_EKF_W_MAX':    (5.7174, 'AP_Float', '最大角周波数 [rad/s] (0.91 Hz)'), # 0.30m換算
 
