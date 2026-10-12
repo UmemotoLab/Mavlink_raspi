@@ -1,3 +1,4 @@
+
 # AR-Hook システム構成・位置計測・実験座標ガイド
 
 
@@ -51,7 +52,7 @@ OpenCVカメラ座標は `X_C=画像右、Y_C=画像下、Z_C=光軸前方`。�
 |---|---|
 | 前向き (`front`) | `X_B = Z_C`、`Y_B = X_C`、`Z_B = Y_C` |
 | 下向き (`down`) | `X_B = -Y_C`、`Y_B = X_C`、`Z_B = Z_C` |
-<img width="1280" height="720" alt="機体とカメラ座標系" src="https://github.com/user-attachments/assets/4fdfa5ba-59b5-4ea2-8e59-8b1fae03d2b5" />
+<img width="1280" height="720" alt="機体とカメラ座標系" src="https://github.com/user-attachments/assets/004abac3-87ed-4bd1-9413-bbb1de4504ac" />
 
 ```mermaid
 flowchart LR
@@ -70,6 +71,20 @@ ID 2〜5のマーカー位置は、荷物中心を原点とする平面上に置
 <img width="1280" height="720" alt="マーカー座標系" src="https://github.com/user-attachments/assets/53701f29-ea8e-4308-a639-0598292f7cf3" />
 
 このローカル図はマーカーIDの「右上・左上・左下・右下」というコード上の配置を示す。面が水平か垂直かによって、ローカルX/Y/Zとワールド東・北・上の対応は変わる。
+
+
+#### 2.3.1 荷物ローカル座標系（$X_Lc, Y_Lc, Z_Lc$）の定義
+
+荷物の3次元姿勢（剛体姿勢）を表現するための右手系直交座標系として、以下のように定義する。
+<img width="1280" height="720" alt="荷物とマーカー座標系" src="https://github.com/user-attachments/assets/bf150390-3330-4a74-b76a-396512dc926a" />
+
+
+- **原点 $(0, 0, 0)$**: 4つの頂点マーカー（ID 2〜5）が形成する正方形（一辺 $15\ \text{cm}$）の中心（荷物中心）。
+- **$X_Lc$ 軸（横方向・右）**: 荷物正面において中心から**右向き**（ID 3・ID 4 側から ID 2・ID 5 側へ向かう方向）。
+- **$Y_Lc$ 軸（縦方向・上）**: 荷物正面において中心から**上向き**（ID 4・ID 5 側から ID 3・ID 2 側へ向かう方向）。
+- **$Z_Lc$ 軸（面法線方向・手前）**: マーカー設置面から**外側手前（カメラ側）**へ突き出す法線ベクトル。右手系（$\mathbf{Z}_L = \mathbf{X}_L \times \mathbf{Y}_L$）に準拠。
+
+
 ## 3. 位置計測の処理手順
 
 ```mermaid
