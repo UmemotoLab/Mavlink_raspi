@@ -62,7 +62,7 @@ def main():
 
     print("=" * 70)
     print(f"📊 垂直実験 ワールド座標系(ENU) 誤差検証スクリプト")
-    print(f"🔍 読み込みファイル: {csv_path.name}")
+    print(f"🔍 読み込みファイル: {"C:/Users/Ushida/Downloads/20261012_132217_1.csv"}")
     print("=" * 70)
 
     times = []

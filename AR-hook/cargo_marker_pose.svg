@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 540" width="100%" height="100%">
+  <!-- Background -->
+  <rect width="960" height="540" fill="#ffffff"/>
+
+  <!-- Coordinate System (Red 3-axis arrows) -->
+  <g transform="translate(130, 230)">
+    <!-- Y_L (Up) -->
+    <line x1="0" y1="0" x2="0" y2="-65" stroke="#e60000" stroke-width="2.5"/>
+    <polygon points="0,-72 -5,-62 5,-62" fill="#e60000"/>
+    <text x="-35" y="-35" font-family="'Segoe UI', Meiryo, sans-serif" font-size="16" fill="#222">Y_L</text>
+
+    <!-- X_L (Right) -->
+    <line x1="0" y1="0" x2="65" y2="0" stroke="#e60000" stroke-width="2.5"/>
+    <polygon points="72,0 62,-5 62,5" fill="#e60000"/>
+    <text x="65" y="-12" font-family="'Segoe UI', Meiryo, sans-serif" font-size="16" fill="#222">X_L</text>
+
+    <!-- Z_L (Forward-down oblique) -->
+    <line x1="0" y1="0" x2="-22" y2="33" stroke="#e60000" stroke-width="2.5"/>
+    <polygon points="-26,39 -17,31 -25,23" fill="#e60000"/>
+    <text x="-5" y="45" font-family="'Segoe UI', Meiryo, sans-serif" font-size="16" fill="#222">Z_L</text>
+
+    <!-- Center dot -->
+    <circle cx="0" cy="0" r="2.5" fill="#e60000"/>
+  </g>
+
+  <!-- 3D Box (Cargo) -->
+  <!-- Back face & connecting lines (Wireframe) -->
+  <g stroke="#333333" stroke-width="1.2" fill="none">
+    <!-- Back rectangle -->
+    <rect x="385" y="55" width="385" height="345"/>
+    <!-- Connecting edges from front face to back face -->
+    <line x1="360" y1="90" x2="385" y2="55"/>
+    <line x1="745" y1="90" x2="770" y2="55"/>
+    <line x1="360" y1="435" x2="385" y2="400"/>
+    <line x1="745" y1="435" x2="770" y2="400"/>
+  </g>
+
+  <!-- Front face (Marker plane, gray fill) -->
+  <rect x="360" y="90" width="385" height="345" fill="#d9d9d9" stroke="#333333" stroke-width="1.5"/>
+
+  <!-- ArUco Marker ID3 (Top-Left) -->
+  <g transform="translate(390, 120)">
+    <rect x="0" y="0" width="40" height="40" fill="#000000"/>
+    <!-- Inner pattern representation -->
+    <rect x="5" y="5" width="30" height="30" fill="#ffffff"/>
+    <rect x="8" y="8" width="12" height="12" fill="#000000"/>
+    <rect x="20" y="20" width="12" height="12" fill="#000000"/>
+    <rect x="20" y="8" width="6" height="6" fill="#000000"/>
+    <rect x="8" y="20" width="6" height="6" fill="#000000"/>
+    <text x="0" y="-8" font-family="'Segoe UI', Meiryo, sans-serif" font-size="16" fill="#111">ID3</text>
+  </g>
+
+  <!-- ArUco Marker ID2 (Top-Right) -->
+  <g transform="translate(675, 120)">
+    <rect x="0" y="0" width="40" height="40" fill="#000000"/>
+    <rect x="5" y="5" width="30" height="30" fill="#ffffff"/>
+    <rect x="8" y="8" width="7" height="7" fill="#000000"/>
+    <rect x="25" y="8" width="7" height="7" fill="#000000"/>
+    <rect x="15" y="15" width="10" height="10" fill="#000000"/>
+    <rect x="8" y="25" width="12" height="7" fill="#000000"/>
+    <rect x="25" y="25" width="7" height="7" fill="#000000"/>
+    <text x="0" y="-8" font-family="'Segoe UI', Meiryo, sans-serif" font-size="16" fill="#111">ID2</text>
+  </g>
+
+  <!-- ArUco Marker ID4 (Bottom-Left) -->
+  <g transform="translate(390, 370)">
+    <rect x="0" y="0" width="40" height="40" fill="#000000"/>
+    <rect x="5" y="5" width="30" height="30" fill="#ffffff"/>
+    <rect x="8" y="8" width="14" height="7" fill="#000000"/>
+    <rect x="15" y="15" width="15" height="10" fill="#000000"/>
+    <rect x="8" y="25" width="7" height="7" fill="#000000"/>
+    <rect x="22" y="25" width="10" height="7" fill="#000000"/>
+    <text x="7" y="55" font-family="'Segoe UI', Meiryo, sans-serif" font-size="16" fill="#111">ID4</text>
+  </g>
+
+  <!-- ArUco Marker ID5 (Bottom-Right) -->
+  <g transform="translate(675, 370)">
+    <rect x="0" y="0" width="40" height="40" fill="#000000"/>
+    <rect x="5" y="5" width="30" height="30" fill="#ffffff"/>
+    <rect x="8" y="8" width="8" height="14" fill="#000000"/>
+    <rect x="20" y="8" width="12" height="7" fill="#000000"/>
+    <rect x="16" y="20" width="8" height="8" fill="#000000"/>
+    <rect x="8" y="25" width="7" height="7" fill="#000000"/>
+    <rect x="20" y="25" width="12" height="7" fill="#000000"/>
+    <text x="7" y="55" font-family="'Segoe UI', Meiryo, sans-serif" font-size="16" fill="#111">ID5</text>
+  </g>
+
+  <!-- Cargo Caption -->
+  <text x="552" y="495" font-family="'Segoe UI', Meiryo, sans-serif" font-size="18" fill="#111" text-anchor="middle">Cargo(ID2-5)</text>
+</svg>

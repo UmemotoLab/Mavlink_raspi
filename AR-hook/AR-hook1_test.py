@@ -31,7 +31,7 @@ CAMERA_RIGID_BODY_ID = 3  # カメラに取り付けたMotiveセンサのID（Mo
 # カメラ取り付け方向の設定
 # 'front' : 前向きカメラ（テスト用）  OpenCV Z(前)=body X, X(右)=body Y, Y(下)=body Z
 # 'down'  : 下向きカメラ（実機用）   OpenCV Z(下)=body Z, X(右)=body Y, Y(画像下=機体後方)=-body X
-CAMERA_MOUNT_DIRECTION = 'front'
+CAMERA_MOUNT_DIRECTION = 'down'
 # カメラ光学中心とMotiveマーカー中心のオフセット（カメラボディ座標系, メートル）
 # 実測後に更新してください（初期値はゼロベクトル）
 CAMERA_OPTICAL_OFFSET = np.array([0.0, 0.0, 0.0], dtype=np.float32)
@@ -92,7 +92,10 @@ if OFFSET_PARAMS_FILE.exists():
         print(f"⚠ オフセットファイル {OFFSET_PARAMS_FILE.name} のロードに失敗しました ({e})。デフォルト値を使用します。")
 
 # ───── 基準点設定 ─────
+# 初期値: Motive UDP から最初に受信したパケットで自動上書きされます。
+# 「原点に置く」必要はありません。北向きだけ合わせれば自動で相対座標系が構築されます。
 REF_LAT, REF_LON, REF_ALT = 36.0757800, 136.2132900, 0.0
+motive_origin_set = False   # True になったら REF_* は固定（二度と書き換えない）
 TARGET_HEIGHT_ABOVE_TAKEOFF = 1.10
 CSV_DIR = Path.home() / "LOGS_Pixhawk6c"
 CSV_DIR.mkdir(exist_ok=True)
@@ -200,6 +203,7 @@ def motive_udp_listener():
     global motive_camera_qx, motive_camera_qy, motive_camera_qz, motive_camera_qw
     global R_cam_to_world, t_cam_world
     global motive_rel_x, motive_rel_y, motive_rel_z
+    global REF_LAT, REF_LON, REF_ALT, motive_origin_set
     
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -228,6 +232,21 @@ def motive_udp_listener():
                 lat = unpacked[1] / 1e7
                 lon = unpacked[2] / 1e7
                 alt = unpacked[3] / 1000.0
+
+                # ── 動的原点の自動設定 ──────────────────────────────────────────
+                # 最初に届いた任意の rigid body の GPS 座標を ENU 原点にする。
+                # Motive マーカーを実験空間の「原点」に置く必要がなくなります。
+                # 北向きの初期姿勢だけ合わせれば軸方向は正しく保たれます。
+                if not motive_origin_set:
+                    REF_LAT = lat
+                    REF_LON = lon
+                    REF_ALT = alt
+                    motive_origin_set = True
+                    print(f"[Motive] 動的原点を設定しました: "
+                          f"lat={lat:.7f}  lon={lon:.7f}  alt={alt:.3f}m  "
+                          f"(rigid_body_id={rigid_body_id})")
+                # ───────────────────────────────────────────────────────────────
+
                 mx, my, mz = gps_to_local_xyz(lat, lon, alt)
                 
                 if rigid_body_id == 1:
