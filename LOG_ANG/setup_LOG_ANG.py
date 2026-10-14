@@ -1,0 +1,595 @@
+"""
+LOG_ANG: 高周期ANGログ設定スクリプト（読み取り・確認・適用用）
+
+由来: EKF/setup_EKF_Observer4.py のコピー。関係ない既存パラメータは保持し、
+ログ設定のみを変更する（LOG_BITMASK=655359, LOG_FILE_RATEMAX=0 の整備と読戻し/表示）。
+元の EKF/setup_EKF_Observer4.py には触らないこと。
+
+変更点（元との差分はここに限定）:
+1. LOG_BITMASK を 655358 -> 655359（bit0 Fast Attitude を追加し高周期ATTを確保）
+2. LOG_FILE_RATEMAX = 0 を追加（ログレート制限なし=高周期維持）
+3. --check モード追加（実機無接続で静的検証・表示のみ、副作用なし）
+4. LOG読戻し/表示の整備（hex/bin/bit内訳の表示）
+5. 接続・適用前の確認表示と安全上の注意（README参照）
+
+使い方（実機に触れない確認）:
+  python3 setup_LOG_ANG.py --check
+
+使い方（実機に適用する場合・要人手確認）:
+  1. README.md の安全上の注意を読む
+  2. python3 setup_LOG_ANG.py を実行し、表示される確認プロンプトに従う
+  3. 最終確認の LOG_BITMASK/LOG_FILE_RATEMAX の読戻し値を目視確認する
+
+安全: --check は接続・書込みを一切行わない。通常実行も EEPROM 保存前に
+確認表示を行い、詳細は README.md に記載。
+"""
+
+from pymavlink import mavutil
+import time
+import sys
+
+# === LOG_ANG 静的確認モード (--check): 実機無接続・副作用なし ===
+# 通常実行時の接続プロンプトより前に評価し、--check 付きならここで終了する。
+LOG_ANG_EXPECTED_BITMASK = 655359
+LOG_ANG_EXPECTED_RATEMAX = 0
+
+
+def _log_ang_decode_bitmask(value):
+    """有効ビットの一覧を返す（表示用、副作用なし）"""
+    return [i for i in range(32) if (int(value) >> i) & 1]
+
+
+def _log_ang_static_check():
+    """本ファイル内の LOG_BITMASK / LOG_FILE_RATEMAX 記述を検証・表示する"""
+    import re
+    with open(__file__, encoding="utf-8") as f:
+        text = f.read()
+    m_mask = re.search(r"'LOG_BITMASK'\s*:\s*\(\s*(\d+)", text)
+    m_rate = re.search(r"'LOG_FILE_RATEMAX'\s*:\s*\(\s*(\d+)", text)
+    mask_val = int(m_mask.group(1)) if m_mask else None
+    rate_val = int(m_rate.group(1)) if m_rate else None
+    print("LOG_ANG static check (no connection, no writes)")
+    print(f"  LOG_BITMASK: {mask_val} (expected {LOG_ANG_EXPECTED_BITMASK})")
+    if mask_val is not None:
+        print(f"    hex={hex(mask_val)} bin={bin(mask_val)} bits={_log_ang_decode_bitmask(mask_val)}")
+    print(f"  LOG_FILE_RATEMAX: {rate_val} (expected {LOG_ANG_EXPECTED_RATEMAX})")
+    ok = (mask_val == LOG_ANG_EXPECTED_BITMASK) and (rate_val == LOG_ANG_EXPECTED_RATEMAX)
+    print("  RESULT: PASS" if ok else "  RESULT: FAIL")
+    return ok
+
+
+if "--check" in sys.argv or "--diff" in sys.argv or "--dry-run" in sys.argv:
+    _ok = _log_ang_static_check()
+    print("NOTE: --check は接続・適用・保存を一切行いません。")
+    sys.exit(0 if _ok else 1)
+
+# ================================
+# 設定セクション
+# ================================
+
+# 接続設定
+if input("USB接続を行いますか (y/n): ").strip().lower() == 'y':
+    master = mavutil.mavlink_connection('/dev/ttyACM0', baud=115200)
+else:
+    master = mavutil.mavlink_connection('/dev/ttyAMA0', baud=1000000, rtscts=True)
+
+# ハートビート確認
+print("接続を待機中...")
+master.wait_heartbeat()
+print(f"接続完了 (システム: {master.target_system}, コンポーネント: {master.target_component})")
+
+# 振り子周波数の計算
+import math
+# PENDULUM_LENGTH = 2.00  # [m]  # （旧値: 2.00）→ Futaba5に合わせて変更
+PENDULUM_LENGTH = 1.04  # [m]
+def calc_pendulum_freq(length_m):
+    g = 9.80665
+    if length_m <= 0:
+        raise ValueError("振り子の長さは正の値を入力してください")
+    return (1/(2*math.pi)) * math.sqrt(g/length_m)
+
+try:
+    obs_dist_freq = round(calc_pendulum_freq(PENDULUM_LENGTH), 4)
+except Exception as e:
+    print(f"振り子長さ設定エラー: {e}。初期値=0.65を使用します。")
+    obs_dist_freq = 0.65
+
+# パラメータ設定（型情報付き）
+params_to_set = {
+    # === EKF3基本設定 ===
+    'AHRS_EKF_TYPE': (3, 'AP_Int8', 'EKFタイプ: 3=EKF3'),
+    'EK3_ENABLE': (1, 'AP_Int8', 'EKF3有効化'),
+    'EK3_IMU_MASK': (3, 'AP_Int8', 'IMUマスク'),
+
+    # === GPS/センサー融合設定 ===
+    'EK3_SRC1_POSXY': (3, 'AP_Int8', 'GPS (水平位置)'),
+    'EK3_SRC1_VELXY': (3, 'AP_Int8', 'GPS (水平速度)'),
+    'EK3_SRC1_POSZ': (3, 'AP_Int8', 'GPS (垂直位置)'),
+    'EK3_SRC1_VELZ': (3, 'AP_Int8', 'GPS (垂直速度)'),
+    'EK3_SRC1_YAW': (3, 'AP_Int8', 'GPS with compass fallback'),
+
+    # === EKF3精度設定 ===
+    'EK3_GPS_CHECK': (1, 'AP_Int8', 'GPS健全性チェック'),
+    'EK3_POS_I_GATE': (8, 'AP_Int16', '位置ゲート'),
+    'EK3_VEL_I_GATE': (8, 'AP_Int16', '速度ゲート'),
+    'EK3_HGT_I_GATE': (10, 'AP_Int16', '高度ゲート'),
+
+    # === ノイズパラメータ ===
+    'EK3_POSNE_M_NSE': (0.2, 'AP_Float', '水平位置ノイズ [m]'),
+    'EK3_VELNE_M_NSE': (0.3, 'AP_Float', '水平速度ノイズ [m/s]'),
+    'EK3_VELD_M_NSE': (0.5, 'AP_Float', '垂直速度ノイズ [m/s]'),
+    'EK3_YAW_M_NSE': (0.2, 'AP_Float', 'ヨー角ノイズ [rad]'),
+    'EK3_ALT_M_NSE': (10.0, 'AP_Float', '気圧センサーノイズ [m]'),
+    'EK3_GYRO_P_NSE': (0.02, 'AP_Float', 'ジャイロプロセスノイズ [rad/s]'),
+
+    # === コンパス設定 ===
+    'COMPASS_ENABLE': (1, 'AP_Int8', 'コンパス有効化'),
+    'COMPASS_USE': (1, 'AP_Int8', '内蔵コンパス使用'),
+    'COMPASS_USE2': (0, 'AP_Int8', '外付コンパス2無効'),
+    'COMPASS_USE3': (0, 'AP_Int8', '外付コンパス3無効'),
+    'COMPASS_AUTODEC': (1, 'AP_Int8', '自動磁気偏角有効'),
+    'COMPASS_LEARN': (1.0, 'AP_Float', 'コンパス学習有効'),
+    'EK3_MAG_CAL': (3, 'AP_Int8', '地上でheading fusion、空中で3-axis fusion'),
+    'EK3_SRC_OPTIONS': (1, 'AP_Int16', 'Fuse all velocity sources'),
+
+    # === EKF安定化設定 ===
+    'EK3_GLITCH_RAD': (5, 'AP_Int8', 'GPS Glitch検出半径 [m]'),
+    'EK3_CHECK_SCALE': (100, 'AP_Int16', 'EKFチェックスケール [%]'),
+    'EK3_PRIMARY': (-1, 'AP_Int8', '自動切り替え無効'),
+
+    # === GPS設定 ===
+    'GPS1_TYPE': (14, 'AP_Int8', 'MAVLink GPS Input'),
+    'GPS_AUTO_CONFIG': (0, 'AP_Int8', '自動設定無効'),
+    'GPS_PRIMARY': (0, 'AP_Int8', 'プライマリGPS'),
+
+    # === Guidedモード設定 ===
+    'WPNAV_SPEED_UP': (40.0, 'AP_Float', '上昇速度 [cm/s]'),  # （旧値: 20.0）→ Futaba5に合わせて変更
+    'WPNAV_SPEED_DN': (30.0, 'AP_Float', '下降速度 [cm/s]'),  # （旧値: 20.0）→ Futaba5に合わせて変更
+    'WPNAV_ACCEL_Z': (150.0, 'AP_Float', '垂直加速度 [cm/s^2]'),  # （旧値: 70.0）→ 垂直加減速の強化
+    'WPNAV_SPEED': (200.0, 'AP_Float', '水平速度 [cm/s]'),
+    'WPNAV_ACCEL': (200.0, 'AP_Float', '水平加速度 [cm/s^2]'),
+    'WPNAV_RADIUS': (0.05, 'AP_Float', '到達半径 [m]'),
+    'WPNAV_JERK': (15.0, 'AP_Float', '水平躍度 [m/s^3]'),
+    'GUID_TIMEOUT': (3.0, 'AP_Float', 'Guidedタイムアウト [s]'),
+    'GUID_OPTIONS': (0, 'AP_Float', 'Guidedオプション'),  # 0ならWPNAVを使わない。 64にすることでWPNAVを使用
+    
+    # === Loiterモード設定 ===
+    'LOIT_SPEED': (50.0, 'AP_Float', 'Loiter速度 [cm/s]'),
+    'LOIT_ACC_MAX': (50.0, 'AP_Float', 'Loiter最大加速度 [cm/s^2]'),  # （旧値: 100.0）→ Futaba5に合わせて変更
+    'LOIT_BRK_ACCEL': (50.0, 'AP_Float', 'Loiterブレーキ加速度 [cm/s^2]'),  # （旧値: 100.0）→ Futaba5に合わせて変更
+    'LOIT_BRK_DELAY': (0.3, 'AP_Float', 'Loiterブレーキ遅延 [s]'),
+    'LOIT_BRK_JERK': (300.0, 'AP_Float', 'Loiterブレーキジャーク [cm/s^3]'),
+    'LOIT_ANG_MAX': (10.0, 'AP_Float', 'Loiter最大角度 [deg]'),
+    
+    # === パイロット制御速度 ===
+    'PILOT_SPEED_UP': (250, 'AP_Int16', 'パイロット上昇速度 [cm/s]'),
+    'PILOT_SPEED_DN': (150, 'AP_Int16', 'パイロット下降速度 [cm/s]'),
+    'PILOT_ACCEL_Z': (250, 'AP_Int16', 'パイロット垂直加速度 [cm/s^2]'),
+
+    # === 垂直制御PID ===
+    'PSC_POSZ_P': (1.0, 'AP_Float', '高度位置制御P'),
+    'PSC_VELZ_P': (4.0, 'AP_Float', '垂直速度制御P'),
+    'PSC_VELZ_I': (8.0, 'AP_Float', '垂直速度制御I'),
+    'PSC_VELZ_D': (0.01, 'AP_Float', '垂直速度制御D'),
+    'PSC_ACCZ_P': (0.3, 'AP_Float', '垂直加速度制御P'),
+    'PSC_ACCZ_I': (1.0, 'AP_Float', '垂直加速度制御I'),
+
+    # === 水平制御PID ===
+    'PSC_POSXY_P': (5.0, 'AP_Float', '水平位置制御P'),  # （旧値: 1.0）→ Futaba5に合わせて変更
+    'PSC_VELXY_P': (6.0, 'AP_Float', '水平速度制御P'),  # （旧値: 2.0）→ Futaba5に合わせて変更
+    'PSC_VELXY_I': (2.5, 'AP_Float', '水平速度制御I'),  # （旧値: 1.0）→ Futaba5に合わせて変更
+    'PSC_VELXY_D': (1.0, 'AP_Float', '水平速度制御D'),  # （旧値: 0.5）→ Futaba5に合わせて変更
+
+    # === 姿勢制御PID ===
+    'ATC_RAT_RLL_P': (0.04, 'AP_Float', 'Roll P'),
+    'ATC_RAT_RLL_I': (0.05, 'AP_Float', 'Roll I'),
+    'ATC_RAT_RLL_D': (0.0012, 'AP_Float', 'Roll D'),
+    'ATC_RAT_PIT_P': (0.05, 'AP_Float', 'Pitch P'),
+    'ATC_RAT_PIT_I': (0.05, 'AP_Float', 'Pitch I'),
+    'ATC_RAT_PIT_D': (0.0012, 'AP_Float', 'Pitch D'),
+    'ATC_RAT_YAW_P': (0.2, 'AP_Float', 'Yaw P'),
+    'ATC_RAT_YAW_I': (0.02, 'AP_Float', 'Yaw I'),
+
+#   'ATC_ACC_R_MAX': (1620, 'AP_Int16', 'ロール最大角加速度 [deg/s^2]'),  # ※ ファームウェア非対応のため無効化
+#   'ATC_ACC_P_MAX': (1620, 'AP_Int16', 'ピッチ最大角加速度 [deg/s^2]'),  # ※ ファームウェア非対応のため無効化
+#   'ATC_ACC_Y_MAX': (540, 'AP_Int16', 'ヨー最大角加速度 [deg/s^2]'),  # ※ ファームウェア非対応のため無効化
+
+
+    # === AP_Observer コア制御パラメータ ===
+    'OBS_CORR_GAIN':    (0.3, 'AP_Float', '外力推定に基づく姿勢補正ゲイン'),  # （旧値: 0.1）→ Futaba5に合わせて変更（補正強すぎによる振動対策）
+    'OBS_MAX_CORR_ANG': (0.5, 'AP_Float', 'ロールおよびピッチの最大姿勢補正角 [rad]'),
+    'OBS_PRED_TIME':    (0.00, 'AP_Float', '力の予測先行時間 [秒]'),
+
+    # === EKF プロセス/観測ノイズ ===
+    'OBS_EKF_Q_D':      (9.5367432e-3, 'AP_Float', '外乱状態 d のプロセスノイズ分散'),
+    'OBS_EKF_Q_DD':     (2.3841858e-3, 'AP_Float', '外乱速度状態 d_dot のプロセスノイズ分散'),
+    'OBS_EKF_Q_C':      (4.7683716e-3, 'AP_Float', 'DCオフセット状態 c のプロセスノイズ分散'),
+    'OBS_W_FREEZE':     (0, 'AP_Int8', 'ωを初期値に固定 (0=無効, 1=有効)'),
+    'OBS_EKF_Q_W':      (0.0005, 'AP_Float', '周波数状態 omega のプロセスノイズ分散'),
+    'OBS_EKF_R_MEAS':   (46.0, 'AP_Float', 'ペイロード力の観測値に対する観測ノイズ分散'),
+
+    # === 周波数範囲設定（ひもの長さ換算：約30cm〜2m） ===
+    # 'OBS_EKF_W_INIT':   (3.7699, 'AP_Float', '初期角周波数 [rad/s] (0.60 Hz)'), # 0.69m換算
+    # 'OBS_EKF_W_INIT':   (5.0000, 'AP_Float', '初期角周波数 [rad/s] (0.60 Hz)'),
+    # 'OBS_EKF_W_INIT':   (2.9523, 'AP_Float', '初期角周波数 [rad/s] (0.4699 Hz)'), # L=1.04m FFT平均
+    'OBS_EKF_W_INIT':   (2.5569, 'AP_Float', '初期角周波数 [rad/s] (0.4069 Hz)'), # L=1.5m 換算
+    'OBS_EKF_W_MIN':    (2.1991, 'AP_Float', '最小角周波数 [rad/s] (0.35 Hz)'), # 2.00m換算
+    'OBS_EKF_W_MAX':    (5.7174, 'AP_Float', '最大角周波数 [rad/s] (0.91 Hz)'), # 0.30m換算
+
+    # === EKF ゲーティング / イノベーション制限 ===
+    'OBS_EKF_INN_MAX':  (1.0, 'AP_Float', '統合周波数更新に軸を含めるための最大絶対イノベーション [N]'),
+
+    # === 出力フェード制御（メインスイッチ・離陸トリガー・不感帯統合） ===
+    'OBS_FADE_TH':      (0.3, 'AP_Float', 'フェードタイマーをリセットするための出力フェード振幅しきい値 [N]'),
+    'OBS_FADE_DLY':     (2.0, 'AP_Float', 'フェードアウト開始前にしきい値を下回る必要がある出力フェード遅延時間 [秒]'),
+    'OBS_FADE_IN_T':    (0.1, 'AP_Float', '出力フェードイン時定数 [秒]'),
+    'OBS_FADE_OUT_T':   (1.0, 'AP_Float', '出力フェードアウト時定数 [秒]'),
+
+
+
+    # === IMUフィルタ ===
+    'INS_GYRO_FILTER': (20, 'AP_Int8', 'ジャイロフィルタ [Hz]'),
+    'INS_ACCEL_FILTER': (20, 'AP_Int8', '加速度フィルタ [Hz]'),
+
+    # === フェイルセーフ設定 ===
+    'FS_EKF_ACTION': (2, 'AP_Int8', 'EKF失敗時アクション'),
+    'FS_EKF_THRESH': (0.8, 'AP_Float', 'EKF信頼度閾値'),
+    'FS_THR_ENABLE': (3, 'AP_Int8', 'スロットルフェイルセーフ'),
+    'FS_THR_VALUE': (975, 'AP_Int16', 'フェイルセーフ検出値 [PWM]'),
+    'FS_OPTIONS': (0.0, 'AP_Float', 'フェイルセーフオプション'),
+    'FS_CRASH_CHECK': (0, 'AP_Int8', 'クラッシュ検出無効化'),
+    'FS_VIBE_ENABLE': (0, 'AP_Int8', '振動検出無効化'),
+    'FS_DR_ENABLE': (0, 'AP_Int8', 'Dead Reckoning無効化'),
+    'RTL_ALT': (50, 'AP_Int32', 'RTL高度 [cm]'),
+
+    # === シリアル設定 ===
+    'SERIAL1_PROTOCOL': (2, 'AP_Int8', 'MAVLink2プロトコル'),
+    'SERIAL1_BAUD': (1000000, 'AP_Int32', 'ボーレート [bps]'),
+    'BRD_SER1_RTSCTS': (2, 'AP_Int8', 'ハードウェアフロー制御有効'),
+    'SERIAL2_PROTOCOL': (23, 'AP_Int8', 'ELRSレシーバー'),
+
+    # === RC設定 ===
+    'RC7_OPTION': (47, 'AP_Int16', 'Observer制御ON/OFF (USER_FUNC1, 3ポジションスイッチ)'),
+    'RC8_OPTION': (48, 'AP_Int16', 'EKFリセット (USER_FUNC2, モーメンタリスイッチ)'),
+    'RC9_OPTION': (153, 'AP_Int16', 'ELRSレシーバー'),
+    'RC10_OPTION': (56, 'AP_Int16', 'RC10オプション'),
+    'RC11_OPTION': (55, 'AP_Int16', 'RC11オプション'),
+    'THR_DZ': (200, 'AP_Int16', 'スロットルデッドゾーン [PWM]'),
+    'RC_OPTIONS': (10336, 'AP_Int32', 'RCオプション'),
+    'RSSI_TYPE': (3, 'AP_Int8', 'RSSI Type (ELRS)'),
+
+    # === ログ制御設定 ===
+    'LOG_DISARMED': (0, 'AP_Int8', '非アーム時ログ無効'),
+    'LOG_FILE_DSRMROT': (1, 'AP_Int8', 'ディスアーム時ローテーション'),
+    'LOG_FILE_TIMEOUT': (5, 'AP_Int8', 'ログファイルタイムアウト [s]'),
+    'LOG_BACKEND_TYPE': (1, 'AP_Int8', 'ログバックエンド (1:ファイル)'),
+    # LOG_BITMASK: Observer/EKF解析に必要な全ログを有効化
+    #   内訳: Fast Attitude(0)+Med Attitude(1)+GPS(2)+SysPerf(3)+CtrlTuning(4)
+    #         +NavTuning(5)+RCin(6)+IMU(7)+MissionCmd(8)+BattMon(9)+RCout(10)
+    #         +OptFlow(11)+PID(12)+Compass(13)+Camera(15)+Motors(17)
+    #         +FastIMU(18)+RawIMU(19)
+    # 注: SYSTEM_TIMEはRTC経由で"RTC"メッセージとして自動ログされる（LOG_BITMASK不要）
+    # LOG_ANG変更: 655358 -> 655359（差分は bit0 Fast Attitude のみ）。
+    # 655358=0x9FFFE(bit0=0)、655359=0x9FFFF(bit0=1)。高周期ATT(ANG)確保が目的。
+    # 関係ない既存パラメータ（LOG_DISARMED/LOG_FILE_DSRMROT/LOG_FILE_TIMEOUT/
+    # LOG_BACKEND_TYPE）は元ファイルの値を保持する。
+    'LOG_BITMASK': (655359, 'AP_Int32', '高周期ANG用ログビットマスク(bit0追加)'),
+    # LOG_FILE_RATEMAX=0: ログレート制限なし（高周期維持）。デフォルト上限で
+    # ATT等が間引かれるのを防ぐ。0=制限なし。
+    'LOG_FILE_RATEMAX': (0, 'AP_Int16', 'ログレート制限なし(高周期維持)'),
+
+    # === 推力設定 ===
+    'MOT_THST_HOVER': (0.223, 'AP_Float', 'ホバリングスロットル比'),
+    'MOT_THST_EXPO': (0.0, 'AP_Float', '推力曲線指数'),
+    'MOT_HOVER_LEARN': (0, 'AP_Int8', 'ホバリング学習 (0:無効)'),
+
+    # === モーター・安全設定 ===
+    'SERVO1_FUNCTION': (0, 'AP_Int16', 'SERVO1機能'),
+    'SERVO2_FUNCTION': (0, 'AP_Int16', 'SERVO2機能'),
+    'SERVO3_FUNCTION': (0, 'AP_Int16', 'SERVO3機能'),
+    'SERVO4_FUNCTION': (0, 'AP_Int16', 'SERVO4機能'),
+    'SERVO9_FUNCTION': (33, 'AP_Int16', 'SERVO9機能'),
+    'SERVO10_FUNCTION': (34, 'AP_Int16', 'SERVO10機能'),
+    'SERVO11_FUNCTION': (35, 'AP_Int16', 'SERVO11機能'),
+    'SERVO12_FUNCTION': (36, 'AP_Int16', 'SERVO12機能'),
+    'MOT_PWM_TYPE': (4.0, 'AP_Float', 'PWMタイプ (4:DShot300)'),
+    'SERVO_DSHOT_ESC': (2, 'AP_Int8', 'DShot ESCタイプ'),
+    'SERVO_BLH_MASK': (3840, 'AP_Int32', 'BLHeliマスク'),
+    'SERVO_BLH_AUTO': (1, 'AP_Int8', 'BLHeli自動設定'),
+
+    'BRD_SAFETY_DEFLT': (0, 'AP_Int8', 'セーフティスイッチデフォルト'),
+    'BRD_SAFETYOPTION': (0, 'AP_Int16', 'セーフティオプション'),
+    'ARMING_CHECK': (80, 'AP_Int32', 'アーミングチェック'),
+    'ARMING_RUDDER': (0, 'AP_Int8', 'ラダーアーミング無効'),
+    'DISARM_DELAY': (0, 'AP_Int8', 'ディスアーム遅延 [s]'),
+    'MOT_SPIN_ARM': (0.02, 'AP_Float', 'アーム時スピン'),
+    'MOT_SPIN_MIN': (0.02, 'AP_Float', '最小スピン'),
+
+    # === バッテリー設定 ===
+    'BATT_MONITOR': (3, 'AP_Int8', 'バッテリーモニター'),
+    'BATT_ARM_VOLT': (16.0, 'AP_Float', 'アーミング電圧 [V]'),
+    'BATT_CRT_VOLT': (14.0, 'AP_Float', 'クリティカル電圧 [V]'),
+    'BATT_LOW_VOLT': (15.5, 'AP_Float', '低電圧警告 [V]'),
+    'BATT_CAPACITY': (0, 'AP_Int32', 'バッテリー容量 [mAh]'),
+    'BATT_ARM_MAH': (0, 'AP_Int32', 'アーミング容量 [mAh]'),
+    'BATT_CRT_MAH': (0, 'AP_Int32', 'クリティカル容量 [mAh]'),
+    'BATT_LOW_MAH': (0, 'AP_Int32', '低容量警告 [mAh]'),
+    'MOT_BAT_VOLT_MAX': (21.0, 'AP_Float', 'バッテリー最大電圧 [V]'),
+    'MOT_BAT_VOLT_MIN': (13.5, 'AP_Float', 'バッテリー最小電圧 [V]'),
+}
+
+# MAVLink型マッピング
+MAV_PARAM_TYPE_MAP = {
+    'AP_Int8': mavutil.mavlink.MAV_PARAM_TYPE_INT8,
+    'AP_Int16': mavutil.mavlink.MAV_PARAM_TYPE_INT16,
+    'AP_Int32': mavutil.mavlink.MAV_PARAM_TYPE_INT32,
+    'AP_Float': mavutil.mavlink.MAV_PARAM_TYPE_REAL32,
+}
+
+# ================================
+# ユーティリティ関数
+# ================================
+
+def clear_message_buffer(timeout=0.1):
+    """メッセージバッファをクリアして古いメッセージを除去"""
+    cleared_count = 0
+    while True:
+        msg = master.recv_match(blocking=False, timeout=timeout)
+        if msg is None:
+            break
+        cleared_count += 1
+    if cleared_count > 0:
+        print(f"  [バッファ] {cleared_count}個の古いメッセージをクリア")
+    return cleared_count
+
+def wait_for_param_ack(param_name, expected_value, timeout=2.0):
+    """
+    特定のパラメータのPARAM_VALUEメッセージを待機（パラメータ名でフィルタリング）
+    """
+    start_time = time.time()
+    param_name_bytes = param_name.encode('utf-8')
+
+    while time.time() - start_time < timeout:
+        msg = master.recv_match(type='PARAM_VALUE', blocking=False, timeout=0.05)
+        if msg is None:
+            continue
+
+        msg_dict = msg.to_dict()
+        msg_param_name = msg_dict.get('param_id', '').rstrip('\x00')
+
+        # パラメータ名で確認
+        if msg_param_name == param_name:
+            received_value = msg_dict.get('param_value', None)
+            return received_value, True
+
+    return None, False
+
+def set_parameter_reliable(param_name, param_value, param_type, max_retries=5):
+    """
+    改善版: パラメータを確実に設定する
+
+    手順：
+    1. バッファをクリア
+    2. パラメータ設定コマンドを送信
+    3. パラメータ名でフィルタリングして応答を受け取る
+    4. 値が一致するまでリトライ
+    """
+    mav_param_type = MAV_PARAM_TYPE_MAP.get(param_type, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+
+    for attempt in range(max_retries):
+        # バッファをクリア（前回のメッセージを除去）
+        clear_message_buffer(timeout=0.05)
+
+        # パラメータ設定コマンドを送信
+        master.mav.param_set_send(
+            master.target_system,
+            master.target_component,
+            param_name.encode('utf-8'),
+            float(param_value),
+            mav_param_type
+        )
+
+        # FC側の処理を待つ（重要: バッファオーバーフロー防止）
+        time.sleep(0.2)
+
+        # パラメータ名でフィルタリングして応答を待つ
+        received_value, received = wait_for_param_ack(param_name, param_value, timeout=1.5)
+
+        if received and received_value is not None:
+            # 値の比較（浮動小数点誤差を許容）
+            if abs(float(received_value) - float(param_value)) < 0.0001:
+                return True, received_value
+            else:
+                if attempt < max_retries - 1:
+                    print(f'    ⚠️ リトライ {attempt + 1}/{max_retries}: 設定値={param_value}, 確認値={received_value}')
+                    time.sleep(0.3)
+                else:
+                    print(f'    ❌ 最終失敗: 設定値={param_value}, 確認値={received_value}')
+                    return False, received_value
+        else:
+            if attempt < max_retries - 1:
+                print(f'    ⚠️ タイムアウト リトライ {attempt + 1}/{max_retries}')
+                time.sleep(0.3)
+            else:
+                print(f'    ❌ タイムアウト（設定失敗）')
+                return False, None
+
+    return False, None
+
+def verify_parameter(param_name, expected_value):
+    """パラメータを読み込んで値を確認"""
+    clear_message_buffer(timeout=0.05)
+
+    master.mav.param_request_read_send(
+        master.target_system,
+        master.target_component,
+        param_name.encode('utf-8'),
+        -1
+    )
+
+    time.sleep(0.15)
+    received_value, received = wait_for_param_ack(param_name, expected_value, timeout=1.5)
+
+    if received and received_value is not None:
+        return float(received_value), True
+    else:
+        return None, False
+
+# ================================
+# メイン処理（LOG_ANG: 適用前の確認表示あり）
+# ================================
+
+print("\n" + "="*60)
+print("LOG_ANG 高周期ANGログ設定を適用します（元: EKF/setup_EKF_Observer4.py）")
+print("="*60)
+print("今回変更するログ設定（関係ない既存パラメータは元の値を保持）:")
+for _k in ("LOG_BITMASK", "LOG_FILE_RATEMAX"):
+    _v = params_to_set.get(_k)
+    if _v is not None:
+        print(f"  {_k} = {_v[0]} ({_v[1]}) : {_v[2]}")
+_mask = params_to_set["LOG_BITMASK"][0]
+_rate = params_to_set["LOG_FILE_RATEMAX"][0]
+print(f"  LOG_BITMASK hex={hex(_mask)} bin={bin(_mask)} bits={_log_ang_decode_bitmask(_mask)}")
+print(f"  期待値: LOG_BITMASK={LOG_ANG_EXPECTED_BITMASK}, LOG_FILE_RATEMAX={LOG_ANG_EXPECTED_RATEMAX}")
+print("注意: 実機に接続してパラメータを書き換えます。詳細は README.md の安全上の注意を参照。")
+if input("適用を続けますか (y/n): ").strip().lower() != "y":
+    print("中止しました（何も適用していません）。確認のみの場合は --check を使用。")
+    sys.exit(0)
+
+failed_params = {}
+total = len(params_to_set)
+success_count = 0
+
+for idx, (param_name, (param_value, param_type, param_comment)) in enumerate(params_to_set.items(), 1):
+    print(f"\n[{idx}/{total}] {param_name}")
+    print(f"  設定値: {param_value}")
+
+    success, received_value = set_parameter_reliable(param_name, param_value, param_type)
+
+    if success:
+        print(f"  ✅ 確認値: {received_value}")
+        success_count += 1
+    else:
+        print(f"  ❌ 設定失敗")
+        failed_params[param_name] = (param_value, param_type, param_comment)
+
+print("\n" + "="*60)
+print(f"初期設定完了: {success_count}/{total} 成功")
+print("="*60)
+
+# FC側の処理完了を待つ
+print("\nFC側の処理完了を待機中...")
+time.sleep(3)
+
+# EEPROM保存
+print("\n設定をEEPROMに保存中...")
+master.mav.command_long_send(
+    master.target_system,
+    master.target_component,
+    mavutil.mavlink.MAV_CMD_PREFLIGHT_STORAGE,
+    0,
+    1,  # Write parameters
+    0, 0, 0, 0, 0, 0
+)
+
+ack = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=10)
+eeprom_saved = False
+
+if ack and ack.command == mavutil.mavlink.MAV_CMD_PREFLIGHT_STORAGE:
+    if ack.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+        print("✅ EEPROMへの保存成功")
+        eeprom_saved = True
+    elif ack.result == 2:  # DENIED
+        print("❌ EEPROMへの保存が拒否されました")
+        print("   ※ 機体をディスアームして再度実行してください")
+    else:
+        print(f"⚠️ 予期しない結果: {ack.result}")
+else:
+    print("⚠️ ACKを受信できませんでした")
+
+time.sleep(2)
+
+# 不一致パラメータの確認と再設定
+if failed_params:
+    print("\n" + "="*60)
+    print(f"⚠️ {len(failed_params)}個のパラメータが不一致です。再設定を試みます...")
+    print("="*60)
+
+    for param_name, (param_value, param_type, param_comment) in failed_params.items():
+        print(f"\n再設定: {param_name}")
+        success, received_value = set_parameter_reliable(param_name, param_value, param_type, max_retries=3)
+
+        if success:
+            print(f"  ✅ 再設定成功: {received_value}")
+        else:
+            print(f"  ❌ 再設定失敗: {received_value}")
+
+    # 再保存
+    print("\n再度EEPROMに保存中...")
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        mavutil.mavlink.MAV_CMD_PREFLIGHT_STORAGE,
+        0,
+        1,
+        0, 0, 0, 0, 0, 0
+    )
+
+    ack = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
+    if ack and ack.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+        print("✅ 再保存成功")
+    else:
+        print("⚠️ 再保存でエラーが発生")
+
+# 最終確認
+print("\n" + "="*60)
+print("最終確認を実施中...")
+print("="*60)
+
+final_failed = []
+final_success = 0
+
+for param_name, (param_value, param_type, param_comment) in params_to_set.items():
+    received_value, verified = verify_parameter(param_name, param_value)
+
+    if verified and received_value is not None:
+        if abs(float(received_value) - float(param_value)) < 0.0001:
+            if param_name in ("LOG_BITMASK", "LOG_FILE_RATEMAX"):
+                _extra = ""
+                if param_name == "LOG_BITMASK":
+                    _iv = int(float(received_value))
+                    _extra = f" hex={hex(_iv)} bin={bin(_iv)} bits={_log_ang_decode_bitmask(_iv)}"
+                print(f"✅ {param_name} = {received_value}{_extra}")
+            else:
+                print(f"✅ {param_name} = {received_value}")
+            final_success += 1
+        else:
+            print(f"❌ {param_name} = {received_value} (期待値: {param_value})")
+            final_failed.append(param_name)
+    else:
+        print(f"❌ {param_name} (データ取得失敗)")
+        final_failed.append(param_name)
+
+print("\n" + "="*60)
+print(f"最終結果: {final_success}/{total} 成功")
+if final_failed:
+    print(f"失敗: {len(final_failed)}個")
+    for name in final_failed[:10]:  # 最初の10個を表示
+        print(f"  - {name}")
+# LOG_ANG 読戻しサマリ（表示整備）: 目視確認用に期待値と並べて出す。
+print("--- LOG_ANG 読戻しサマリ ---")
+print(f"期待 LOG_BITMASK={LOG_ANG_EXPECTED_BITMASK} (hex={hex(LOG_ANG_EXPECTED_BITMASK)})")
+print(f"期待 LOG_FILE_RATEMAX={LOG_ANG_EXPECTED_RATEMAX}")
+print("読戻し値は上の一覧の LOG_BITMASK / LOG_FILE_RATEMAX 行を確認すること。")
+print("="*60)
+
+if final_failed:
+    print(f"\n❌ {len(final_failed)}個のパラメータが正しく設定できませんでした")
+else:
+    if eeprom_saved:
+        print("\n✅ 全てのパラメータが正しく設定され、EEPROMに保存されました！")
+        print("   （LOG_ANG: EKF/setup_EKF_Observer4.py 由来、ログ設定のみ変更）")
+    else:
+        print("\n⚠️ パラメータはRAM内に設定されていますが、EEPROMへの保存に失敗しました")
+
+print("\n完了")
