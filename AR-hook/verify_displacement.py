@@ -23,8 +23,16 @@ try:
 except ImportError:
     HAS_MATPLOTLIB = False
 
+CAMERA_ROTATION_COLUMNS = tuple(
+    f'Motive_Camera_R{row}{column}'
+    for row in range(3)
+    for column in range(3)
+)
+MIN_CALIBRATION_ROTATION_SPREAD_DEG = 5.0
+
+
 def load_and_process_csv(filepath):
-    """CSVを読み込み、Motive荷物座標、AR荷物座標、およびカメラ座標系での各座標を返す"""
+    """現行ログと旧ログを読み込み、世界座標・カメラ座標の比較データを返す。"""
     print(f"📖 ファイル読み込み中: {os.path.basename(filepath)}")
     
     motive_cargo = []
@@ -38,99 +46,126 @@ def load_and_process_csv(filepath):
     
     # オプティカルオフセット校正用サンプル
     calib_samples = []
-    
+
     def get_v(row, *keys):
         for k in keys:
-            if k in row and row[k] != '':
+            if k in row and row[k] not in ('', None):
                 return row[k]
         return None
 
-    with open(filepath, 'r', encoding='utf-8') as f:
+    def vector(row, prefix, suffix='_m'):
+        values = [get_v(row, *((
+            f'{prefix}_{axis}{suffix}',
+            f'{prefix}_{axis}',
+        ))) for axis in ('X', 'Y', 'Z')]
+        if any(value is None for value in values):
+            return None
+        try:
+            result = [float(value) for value in values]
+        except (TypeError, ValueError):
+            return None
+        return result if all(math.isfinite(value) for value in result) else None
+
+    def mean_vector(values):
+        if not values:
+            return [float('nan')] * 3
+        if HAS_NUMPY:
+            return np.mean(values, axis=0)
+        return [sum(axis) / len(values) for axis in zip(*values)]
+
+    with open(filepath, 'r', encoding='utf-8-sig', newline='') as f:
         reader = csv.DictReader(f)
-        for idx, row in enumerate(reader):
+        fieldnames = set(reader.fieldnames or ())
+        has_rotation_matrix = set(CAMERA_ROTATION_COLUMNS).issubset(fieldnames)
+        has_camera_received_flag = 'Motive_Camera_Received' in fieldnames
+        has_motive_cargo_cam = all(
+            f'Motive_Cargo_Cam_{axis}_m' in fieldnames for axis in ('X', 'Y', 'Z')
+        )
+
+        for row in reader:
             try:
                 # 荷物が検出されている行のみを処理
                 if int(get_v(row, 'Cargo_Detected') or 0) != 1:
                     continue
                 
-                # 世界座標系（ENU）データの取得
-                mcx = float(get_v(row, 'Motive_Cargo_X_m', 'Motive_Cargo_X') or 0)
-                mcy = float(get_v(row, 'Motive_Cargo_Y_m', 'Motive_Cargo_Y') or 0)
-                mcz = float(get_v(row, 'Motive_Cargo_Z_m', 'Motive_Cargo_Z') or 0)
-                
-                ax = float(get_v(row, 'Est_Cargo_X_m', 'Cargo_X') or 0)
-                ay = float(get_v(row, 'Est_Cargo_Y_m', 'Cargo_Y') or 0)
-                az = float(get_v(row, 'Est_Cargo_Z_m', 'Cargo_Z') or 0)
-                
-                # 無効な座標値（すべて0など）はスキップ
-                if mcx == 0.0 and mcy == 0.0 and mcz == 0.0:
+                motive_world = vector(row, 'Motive_Cargo')
+                ar_world = vector(row, 'Est_Cargo')
+                motive_cam = vector(row, 'Motive_Cargo_Cam')
+                if motive_world is None or ar_world is None:
                     continue
-                
-                motive_cargo.append([mcx, mcy, mcz])
-                ar_cargo_uncorr.append([ax, ay, az])
+
+                # 現行ログはカメラ逆投影値が有効なことを確認して初期値0と区別する。
+                if has_motive_cargo_cam and motive_cam is None:
+                    continue
+                if not has_motive_cargo_cam and motive_world == [0.0, 0.0, 0.0]:
+                    continue
+
+                motive_cargo.append(motive_world)
+                ar_cargo_uncorr.append(ar_world)
                 
                 # カメラ座標系データの取得
                 i_det = get_v(row, 'ID1_Detected')
                 if i_det is not None and int(i_det) == 1:
-                    hcx = float(get_v(row, 'Hand_Cam_Raw_X_m', 'Hand_Cam_X') or 'nan')
-                    hcy = float(get_v(row, 'Hand_Cam_Raw_Y_m', 'Hand_Cam_Y') or 'nan')
-                    hcz = float(get_v(row, 'Hand_Cam_Raw_Z_m', 'Hand_Cam_Z') or 'nan')
-                    
-                    ccx = float(get_v(row, 'Cargo_Cam_Raw_X_m', 'Cargo_Cam_X') or 'nan')
-                    ccy = float(get_v(row, 'Cargo_Cam_Raw_Y_m', 'Cargo_Cam_Y') or 'nan')
-                    ccz = float(get_v(row, 'Cargo_Cam_Raw_Z_m', 'Cargo_Cam_Z') or 'nan')
-                    
-                    m_ccx = float(get_v(row, 'Motive_Cargo_Cam_X_m', 'Motive_Cargo_Cam_X') or 'nan')
-                    m_ccy = float(get_v(row, 'Motive_Cargo_Cam_Y_m', 'Motive_Cargo_Cam_Y') or 'nan')
-                    m_ccz = float(get_v(row, 'Motive_Cargo_Cam_Z_m', 'Motive_Cargo_Cam_Z') or 'nan')
-                    
-                    m_hcx = float(get_v(row, 'Motive_Hand_Cam_X_m', 'Motive_Hand_Cam_X') or 'nan')
-                    m_hcy = float(get_v(row, 'Motive_Hand_Cam_Y_m', 'Motive_Hand_Cam_Y') or 'nan')
-                    m_hcz = float(get_v(row, 'Motive_Hand_Cam_Z_m', 'Motive_Hand_Cam_Z') or 'nan')
-                    
-                    # すべての値が正常（nanでない）なら追加
-                    if not (math.isnan(hcx) or math.isnan(ccx) or math.isnan(m_ccx) or math.isnan(m_hcx)):
-                        cargo_cam.append([ccx, ccy, ccz])
-                        hand_cam.append([hcx, hcy, hcz])
-                        motive_cargo_cam.append([m_ccx, m_ccy, m_ccz])
-                        motive_hand_cam.append([m_hcx, m_hcy, m_hcz])
+                    raw_hand = vector(row, 'Hand_Cam_Raw')
+                    raw_cargo = vector(row, 'Cargo_Cam_Raw')
+                    motive_hand = vector(row, 'Motive_Hand_Cam')
+                    if raw_hand and raw_cargo and motive_cam and motive_hand:
+                        cargo_cam.append(raw_cargo)
+                        hand_cam.append(raw_hand)
+                        motive_cargo_cam.append(motive_cam)
+                        motive_hand_cam.append(motive_hand)
                 
-                # CAMERA_OPTICAL_OFFSET キャリブレーション用データの収集
-                mcam_x_val = get_v(row, 'Motive_Camera_X_m', 'Motive_Camera_X')
-                if HAS_NUMPY and mcam_x_val is not None:
-                    mcam_x = float(mcam_x_val)
-                    mcam_y = float(get_v(row, 'Motive_Camera_Y_m', 'Motive_Camera_Y') or 0)
-                    mcam_z = float(get_v(row, 'Motive_Camera_Z_m', 'Motive_Camera_Z') or 0)
-                    
-                    ccx = float(get_v(row, 'Cargo_Cam_Raw_X_m', 'Cargo_Cam_X') or 'nan')
-                    ccy = float(get_v(row, 'Cargo_Cam_Raw_Y_m', 'Cargo_Cam_Y') or 'nan')
-                    ccz = float(get_v(row, 'Cargo_Cam_Raw_Z_m', 'Cargo_Cam_Z') or 'nan')
-                    
-                    m_ccx = float(get_v(row, 'Motive_Cargo_Cam_X_m', 'Motive_Cargo_Cam_X') or 'nan')
-                    m_ccy = float(get_v(row, 'Motive_Cargo_Cam_Y_m', 'Motive_Cargo_Cam_Y') or 'nan')
-                    m_ccz = float(get_v(row, 'Motive_Cargo_Cam_Z_m', 'Motive_Cargo_Cam_Z') or 'nan')
-                    
-                    if not (math.isnan(mcam_x) or math.isnan(ccx) or math.isnan(m_ccx) or mcam_x == 0.0):
-                        v1_cam = np.array([ccx, ccy, ccz], dtype=np.float64)
-                        v1_w = np.array([ax - mcam_x, ay - mcam_y, az - mcam_z], dtype=np.float64)
-                        
-                        v2_cam = np.array([m_ccx, m_ccy, m_ccz], dtype=np.float64)
-                        v2_w = np.array([mcx - mcam_x, mcy - mcam_y, mcz - mcam_z], dtype=np.float64)
-                        
-                        # SVD による回転行列 R の復元 (Camera -> World)
+                # 現行ログの回転行列は、すでにMotiveカメラ姿勢と補正値を適用済み。
+                camera_received = (
+                    get_v(row, 'Motive_Camera_Received') == '1'
+                    if has_camera_received_flag else True
+                )
+                camera_world = vector(row, 'Motive_Camera')
+                raw_cargo = vector(row, 'Cargo_Cam_Raw')
+                if (
+                    HAS_NUMPY
+                    and camera_received
+                    and camera_world is not None
+                    and raw_cargo is not None
+                    and has_rotation_matrix
+                ):
+                    rotation_values = []
+                    for column in CAMERA_ROTATION_COLUMNS:
+                        value = get_v(row, column)
+                        rotation_values.append(float(value) if value is not None else float('nan'))
+                    if all(math.isfinite(value) for value in rotation_values):
+                        R_mat = np.asarray(rotation_values, dtype=np.float64).reshape(3, 3)
+                        calib_samples.append({
+                            'R': R_mat,
+                            'mcam': np.asarray(camera_world, dtype=np.float64),
+                            'mcargo': np.asarray(motive_world, dtype=np.float64),
+                            'ccam': np.asarray(raw_cargo, dtype=np.float64)
+                        })
+                elif HAS_NUMPY and not has_rotation_matrix:
+                    # 旧ログ互換: 旧方式ではカメラ姿勢行列が保存されていない。
+                    motive_camera = vector(row, 'Motive_Camera')
+                    motive_cargo_vector = vector(row, 'Motive_Cargo_Cam')
+                    if (
+                        camera_received
+                        and motive_camera is not None
+                        and raw_cargo is not None
+                        and motive_cargo_vector is not None
+                    ):
+                        v1_cam = np.asarray(raw_cargo, dtype=np.float64)
+                        v1_world = np.asarray(ar_world, dtype=np.float64) - motive_camera
+                        v2_cam = np.asarray(motive_cargo_vector, dtype=np.float64)
+                        v2_world = np.asarray(motive_world, dtype=np.float64) - motive_camera
                         A_mat = np.column_stack([v1_cam, v2_cam])
-                        B_mat = np.column_stack([v1_w, v2_w])
-                        H = A_mat @ B_mat.T
-                        U, S, Vt = np.linalg.svd(H)
+                        B_mat = np.column_stack([v1_world, v2_world])
+                        U, _, Vt = np.linalg.svd(A_mat @ B_mat.T)
                         R_mat = Vt.T @ U.T
                         if np.linalg.det(R_mat) < 0:
                             Vt[2, :] *= -1
                             R_mat = Vt.T @ U.T
-                            
                         calib_samples.append({
                             'R': R_mat,
-                            'mcam': np.array([mcam_x, mcam_y, mcam_z], dtype=np.float64),
-                            'mcargo': np.array([mcx, mcy, mcz], dtype=np.float64),
+                            'mcam': np.asarray(motive_camera, dtype=np.float64),
+                            'mcargo': np.asarray(motive_world, dtype=np.float64),
                             'ccam': v1_cam
                         })
                         
@@ -146,13 +181,13 @@ def load_and_process_csv(filepath):
     
     # 平均値の算出
     res = {
-        'cargo_motive': np.mean(motive_cargo, axis=0) if HAS_NUMPY else [sum(x)/len(x) for x in zip(*motive_cargo)],
-        'cargo_ar_uncorr': np.mean(ar_cargo_uncorr, axis=0) if HAS_NUMPY else [sum(x)/len(x) for x in zip(*ar_cargo_uncorr)],
+        'cargo_motive': mean_vector(motive_cargo),
+        'cargo_ar_uncorr': mean_vector(ar_cargo_uncorr),
         
-        'cargo_cam': np.mean(cargo_cam, axis=0) if HAS_NUMPY and len(cargo_cam) > 0 else ([sum(x)/len(x) for x in zip(*cargo_cam)] if len(cargo_cam) > 0 else [float('nan')]*3),
-        'hand_cam': np.mean(hand_cam, axis=0) if HAS_NUMPY and len(hand_cam) > 0 else ([sum(x)/len(x) for x in zip(*hand_cam)] if len(hand_cam) > 0 else [float('nan')]*3),
-        'motive_cargo_cam': np.mean(motive_cargo_cam, axis=0) if HAS_NUMPY and len(motive_cargo_cam) > 0 else ([sum(x)/len(x) for x in zip(*motive_cargo_cam)] if len(motive_cargo_cam) > 0 else [float('nan')]*3),
-        'motive_hand_cam': np.mean(motive_hand_cam, axis=0) if HAS_NUMPY and len(motive_hand_cam) > 0 else ([sum(x)/len(x) for x in zip(*motive_hand_cam)] if len(motive_hand_cam) > 0 else [float('nan')]*3),
+        'cargo_cam': mean_vector(cargo_cam),
+        'hand_cam': mean_vector(hand_cam),
+        'motive_cargo_cam': mean_vector(motive_cargo_cam),
+        'motive_hand_cam': mean_vector(motive_hand_cam),
         
         'calib_samples': calib_samples,
         
@@ -233,10 +268,7 @@ def rotation_matrix_to_axis_angle(R):
 
 def calibrate_optical_offset(r1, r2, offset_cargo_r1=None, offset_hand_r1=None, rot_cargo_r1=None, rot_hand_r1=None):
     """
-    【方法3: 複数カメラ向きログによる CAMERA_OPTICAL_OFFSET (回転＋並進) 最適化】
-    最小二乗法・非線形最適化を用いて、カメラ向きの異なる複数のログデータから
-    カメラ光学中心オフセット CAMERA_OPTICAL_OFFSET [X, Y, Z] および
-    カメラ取り付け回転オフセット CAMERA_ROT_OFFSET (3x3 行列 / オイラー角) を自動算出します。
+    現在適用中の姿勢・位置補正に対する残差を最適化し、補正値を保存する。
     """
     if not HAS_NUMPY:
         print("⚠ NumPy が利用できないため、CAMERA_OPTICAL_OFFSET のキャリブレーション計算をスキップします。")
@@ -249,6 +281,44 @@ def calibrate_optical_offset(r1, r2, offset_cargo_r1=None, offset_hand_r1=None, 
     if len(all_samples) < 10:
         print("⚠ 有効なキャリブレーションサンプル数が不足しています。")
         return None, None
+
+    reference_rotation = all_samples[0]['R']
+    rotation_spread_deg = max(
+        math.degrees(math.acos(max(-1.0, min(
+            1.0,
+            (np.trace(reference_rotation.T @ sample['R']) - 1.0) / 2.0
+        ))))
+        for sample in all_samples
+    )
+    if rotation_spread_deg < MIN_CALIBRATION_ROTATION_SPREAD_DEG:
+        print(
+            "⚠ カメラ姿勢の変化が不足しているため、6自由度光学オフセット校正と"
+            "NPZ保存を中止します。"
+        )
+        print(
+            f"   姿勢変化: {rotation_spread_deg:.2f}° / "
+            f"必要な変化: {MIN_CALIBRATION_ROTATION_SPREAD_DEG:.1f}°以上"
+        )
+        print("   カメラを複数方向に向けたログを取得してから再実行してください。")
+        return None, None
+
+    save_path = Path(__file__).parent / "camera_optical_offset.npz"
+    current_offset = np.zeros(3, dtype=np.float64)
+    current_rotation = np.eye(3, dtype=np.float64)
+    if save_path.exists():
+        try:
+            with np.load(save_path) as saved:
+                if 'optical_offset' in saved:
+                    current_offset = np.asarray(saved['optical_offset'], dtype=np.float64)
+                if 'optical_rot_offset' in saved:
+                    current_rotation = np.asarray(saved['optical_rot_offset'], dtype=np.float64)
+            if current_offset.shape != (3,) or current_rotation.shape != (3, 3):
+                raise ValueError("camera_optical_offset.npz の配列形状が不正です")
+            if not np.all(np.isfinite(current_offset)) or not np.all(np.isfinite(current_rotation)):
+                raise ValueError("camera_optical_offset.npz に有限値でない値があります")
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"⚠ 現在のカメラ補正値を読み込めないため、校正を中止します: {exc}")
+            return None, None
 
     # ─── 1. 並進オフセットのみの最適化 (従来のベースライン) ───
     A_rows = []
@@ -330,7 +400,12 @@ def calibrate_optical_offset(r1, r2, offset_cargo_r1=None, offset_hand_r1=None, 
     opt_R = rodrigues_exp(opt_omega)
     euler_deg = rotation_matrix_to_euler_deg(opt_R)
     axis, angle_deg = rotation_matrix_to_axis_angle(opt_R)
-    
+
+    # The logged camera pose already includes the current NPZ correction.
+    # Convert the fitted residual into values that can replace that correction.
+    calibrated_offset = opt_R.T @ (current_offset + opt_trans)
+    calibrated_rotation = current_rotation @ opt_R
+
     # 校正前後の誤差評価
     errs_raw = [np.linalg.norm((s['mcam'] + s['R'] @ s['ccam']) - s['mcargo']) for s in all_samples]
     errs_trans_only = [np.linalg.norm((s['mcam'] + s['R'] @ (s['ccam'] + trans_offset_only)) - s['mcargo']) for s in all_samples]
@@ -345,8 +420,9 @@ def calibrate_optical_offset(r1, r2, offset_cargo_r1=None, offset_hand_r1=None, 
     print("\n" + "="*60)
     print(" ■ 【方法3】CAMERA_OPTICAL_OFFSET (回転＋並進) 自動キャリブレーション結果")
     print("   (複数ログ統合 6自由度最適化: Run 1 & Run 2)")
+    print("   ※ CSV記録済みのカメラ回転行列を使用。既存補正に対する残差を合成します。")
     print("="*60)
-    print(" 【算出された最適オフセット値】")
+    print(" 【今回推定した既存補正への残差】")
     print(f"  CAMERA_OPTICAL_OFFSET (並進 m)  : [X:{opt_trans[0]:.4f}, Y:{opt_trans[1]:.4f}, Z:{opt_trans[2]:.4f}]")
     print(f"  CAMERA_OPTICAL_OFFSET (並進 cm) : [X:{opt_trans[0]*100:.2f} cm, Y:{opt_trans[1]*100:.2f} cm, Z:{opt_trans[2]*100:.2f} cm]")
     print(f"  CAMERA_ROT_OFFSET     (回転 deg): [Roll:{euler_deg[0]:.2f}°, Pitch:{euler_deg[1]:.2f}°, Yaw:{euler_deg[2]:.2f}°]")
@@ -361,20 +437,19 @@ def calibrate_optical_offset(r1, r2, offset_cargo_r1=None, offset_hand_r1=None, 
     if s2:
         print(f"  Run 2 平均誤差 : 未補正 {np.mean(err2_raw)*100:.2f} cm  -->  補正後 {np.mean(err2_full)*100:.2f} cm")
     print("-" * 60)
-    print(" 💡 【AR-hook1_test.py への貼り付け用コード】")
-    print(f"CAMERA_OPTICAL_OFFSET = np.array([{opt_trans[0]:.4f}, {opt_trans[1]:.4f}, {opt_trans[2]:.4f}], dtype=np.float32)")
-    print(f"CAMERA_ROT_OFFSET = np.array([")
-    print(f"    [{opt_R[0,0]:.6f}, {opt_R[0,1]:.6f}, {opt_R[0,2]:.6f}],")
-    print(f"    [{opt_R[1,0]:.6f}, {opt_R[1,1]:.6f}, {opt_R[1,2]:.6f}],")
-    print(f"    [{opt_R[2,0]:.6f}, {opt_R[2,1]:.6f}, {opt_R[2,2]:.6f}]")
+    print(" 💡 【置き換え後の合成済み補正値】")
+    print(f"CAMERA_OPTICAL_OFFSET = np.array([{calibrated_offset[0]:.4f}, {calibrated_offset[1]:.4f}, {calibrated_offset[2]:.4f}], dtype=np.float32)")
+    print("CAMERA_ROT_OFFSET = np.array([")
+    print(f"    [{calibrated_rotation[0,0]:.6f}, {calibrated_rotation[0,1]:.6f}, {calibrated_rotation[0,2]:.6f}],")
+    print(f"    [{calibrated_rotation[1,0]:.6f}, {calibrated_rotation[1,1]:.6f}, {calibrated_rotation[1,2]:.6f}],")
+    print(f"    [{calibrated_rotation[2,0]:.6f}, {calibrated_rotation[2,1]:.6f}, {calibrated_rotation[2,2]:.6f}]")
     print(f"], dtype=np.float32)")
     print("="*60)
 
     # 💾 NPZファイルとして自動保存
     try:
-        save_path = Path(__file__).parent / "camera_optical_offset.npz"
-        opt_arr = opt_trans.astype(np.float32)
-        opt_rot_arr = opt_R.astype(np.float32)
+        opt_arr = calibrated_offset.astype(np.float32)
+        opt_rot_arr = calibrated_rotation.astype(np.float32)
         
         c_off = offset_cargo_r1.astype(np.float32) if offset_cargo_r1 is not None else np.zeros(3, dtype=np.float32)
         h_off = offset_hand_r1.astype(np.float32) if offset_hand_r1 is not None else np.zeros(3, dtype=np.float32)
@@ -413,6 +488,10 @@ def main():
     print("=" * 60)
     print(" 2回分のCSVログの比較による荷物の変位導出解析 & オプティカルオフセット校正")
     print("=" * 60)
+    print(
+        "⚠ Motive_Cargo_X/Y/Z_m のRun間変位は、両ログで動的ENU原点が共通の場合のみ"
+        "直接比較できます。現行CSVには原点識別情報がありません。"
+    )
     
     r1 = load_and_process_csv(run1_path)
     r2 = load_and_process_csv(run2_path)
@@ -604,4 +683,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
