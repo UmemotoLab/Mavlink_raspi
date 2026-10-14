@@ -139,6 +139,10 @@ motive_hand_cam = [float('nan'), float('nan'), float('nan')]
 # ───── 新規追加: Motive UDP受信スレッド ─────
 import socket, struct
 MOTIVE_FORMAT = '<BiiiHffffd'  # 39バイト
+MOTIVE_GPS_FORMAT = '<BiiiHd'  # 23バイト
+MOTIVE_POSE_PORT = 15770
+MOTIVE_POSE_MAGIC = b'RBPS'
+MOTIVE_POSE_FORMAT = '<4sBiii4fd'
 # ✅ Drone Motive Position & Attitude (ID1マーカー + センサ)
 motive_drone_x = 0.0
 motive_drone_y = 0.0
@@ -158,6 +162,7 @@ motive_cargo_qy = 0.0
 motive_cargo_qz = 0.0
 motive_cargo_qw = 1.0
 motive_cargo_received = False
+motive_cargo_pos_received = False
 
 # ✅ Camera Motive Position & Orientation (カメラ rigid body, ID=CAMERA_RIGID_BODY_ID)
 motive_camera_x = 0.0
@@ -168,6 +173,7 @@ motive_camera_qy = 0.0
 motive_camera_qz = 0.0
 motive_camera_qw = 1.0
 motive_camera_received = False
+motive_camera_pose_time_s = 0.0
 
 # カメラ座標系 → ENU ワールド座標系の合成回転行列と並進ベクトル
 # motive_udp_listener() がリアルタイムに更新する
@@ -193,11 +199,75 @@ def quaternion_to_rotation_matrix(qx, qy, qz, qw):
         [2*(qx*qz - qw*qy),         2*(qy*qz + qw*qx),       1 - 2*(qx**2 + qy**2)]
     ], dtype=np.float32)
 
+def _camera_rotation_from_motive(qx, qy, qz, qw):
+    quat_norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    if not math.isfinite(quat_norm) or quat_norm == 0:
+        raise ValueError("カメラ姿勢クォータニオンが不正です")
+    qx, qy, qz, qw = (
+        component / quat_norm for component in (qx, qy, qz, qw)
+    )
+    R_body_to_ned = quaternion_to_rotation_matrix(qx, qz, -qy, qw)
+    R_ned_to_enu = np.array([
+        [0.0, 1.0,  0.0],
+        [1.0, 0.0,  0.0],
+        [0.0, 0.0, -1.0]
+    ], dtype=np.float32)
+    if CAMERA_MOUNT_DIRECTION == 'front':
+        R_cv_to_body = np.array([
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0]
+        ], dtype=np.float32)
+    else:
+        R_cv_to_body = np.array([
+            [0.0, -1.0, 0.0],
+            [1.0,  0.0, 0.0],
+            [0.0,  0.0, 1.0]
+        ], dtype=np.float32)
+    return R_ned_to_enu @ R_body_to_ned @ R_cv_to_body @ CAMERA_ROT_OFFSET
+
+def _set_motive_origin_if_needed(lat, lon, alt, rigid_body_id):
+    global REF_LAT, REF_LON, REF_ALT, motive_origin_set
+    with io_lock:
+        if motive_origin_set:
+            return
+        REF_LAT = lat
+        REF_LON = lon
+        REF_ALT = alt
+        motive_origin_set = True
+    print(f"[Motive] 動的原点を設定しました: "
+          f"lat={lat:.7f}  lon={lon:.7f}  alt={alt:.3f}m  "
+          f"(rigid_body_id={rigid_body_id})")
+
+def _apply_motive_camera_pose(position_enu, qx, qy, qz, qw, timestamp):
+    global motive_camera_x, motive_camera_y, motive_camera_z
+    global motive_camera_qx, motive_camera_qy, motive_camera_qz, motive_camera_qw
+    global motive_camera_pose_time_s, motive_camera_received
+    global R_cam_to_world, t_cam_world
+    R_total = _camera_rotation_from_motive(qx, qy, qz, qw)
+    cam_pos_corrected = (
+        np.asarray(position_enu, dtype=np.float32)
+        + R_total @ CAMERA_OPTICAL_OFFSET
+    )
+    with io_lock:
+        motive_camera_x = float(cam_pos_corrected[0])
+        motive_camera_y = float(cam_pos_corrected[1])
+        motive_camera_z = float(cam_pos_corrected[2])
+        motive_camera_qx = qx
+        motive_camera_qy = qy
+        motive_camera_qz = qz
+        motive_camera_qw = qw
+        motive_camera_pose_time_s = timestamp
+        R_cam_to_world = R_total.copy()
+        t_cam_world = cam_pos_corrected.copy()
+        motive_camera_received = True
+
 def motive_udp_listener():
     global motive_drone_x, motive_drone_y, motive_drone_z
     global motive_roll_rad, motive_pitch_rad, motive_yaw_rad
     global motive_attitude_received, motive_drone_pos_received
-    global motive_cargo_x, motive_cargo_y, motive_cargo_z, motive_cargo_received
+    global motive_cargo_x, motive_cargo_y, motive_cargo_z
+    global motive_cargo_received, motive_cargo_pos_received
     global motive_cargo_qx, motive_cargo_qy, motive_cargo_qz, motive_cargo_qw
     global motive_camera_x, motive_camera_y, motive_camera_z, motive_camera_received
     global motive_camera_qx, motive_camera_qy, motive_camera_qz, motive_camera_qw
@@ -224,6 +294,30 @@ def motive_udp_listener():
     while running:
         try:
             data, addr = sock.recvfrom(1024)
+            if len(data) == struct.calcsize(MOTIVE_GPS_FORMAT):
+                rigid_body_id, lat_e7, lon_e7, alt_mm, _, _ = struct.unpack(
+                    MOTIVE_GPS_FORMAT, data
+                )
+                if rigid_body_id not in (1, 2):
+                    print(
+                        f"[Motive UDP] 未対応のGPS剛体IDを受信しました: "
+                        f"{rigid_body_id}"
+                    )
+                    continue
+                lat = lat_e7 / 1e7
+                lon = lon_e7 / 1e7
+                alt = alt_mm / 1000.0
+                _set_motive_origin_if_needed(lat, lon, alt, rigid_body_id)
+                position = gps_to_local_xyz(lat, lon, alt)
+                with io_lock:
+                    if rigid_body_id == 1:
+                        motive_drone_x, motive_drone_y, motive_drone_z = position
+                        motive_drone_pos_received = True
+                    else:
+                        motive_cargo_x, motive_cargo_y, motive_cargo_z = position
+                        motive_cargo_pos_received = True
+                continue
+
             if len(data) >= 39:
                 unpacked = struct.unpack(MOTIVE_FORMAT, data[:39])
                 rigid_body_id = unpacked[0]
@@ -237,14 +331,7 @@ def motive_udp_listener():
                 # 最初に届いた任意の rigid body の GPS 座標を ENU 原点にする。
                 # Motive マーカーを実験空間の「原点」に置く必要がなくなります。
                 # 北向きの初期姿勢だけ合わせれば軸方向は正しく保たれます。
-                if not motive_origin_set:
-                    REF_LAT = lat
-                    REF_LON = lon
-                    REF_ALT = alt
-                    motive_origin_set = True
-                    print(f"[Motive] 動的原点を設定しました: "
-                          f"lat={lat:.7f}  lon={lon:.7f}  alt={alt:.3f}m  "
-                          f"(rigid_body_id={rigid_body_id})")
+                _set_motive_origin_if_needed(lat, lon, alt, rigid_body_id)
                 # ───────────────────────────────────────────────────────────────
 
                 mx, my, mz = gps_to_local_xyz(lat, lon, alt)
@@ -295,68 +382,21 @@ def motive_udp_listener():
                         motive_cargo_qz = motive_cqz
                         motive_cargo_qw = motive_cqw
                         motive_cargo_received = True
+                        motive_cargo_pos_received = True
 
                 elif rigid_body_id == CAMERA_RIGID_BODY_ID:
-                    # ✅ カメラ rigid body = カメラの位置・姿勢（直接計測）
                     cam_qx_raw = unpacked[5]
                     cam_qy_raw = unpacked[6]
                     cam_qz_raw = unpacked[7]
                     cam_qw_raw = unpacked[8]
-
-                    # Motive (X=North, Y=Up, Z=East, 左手系) → NED 右手系クォータニオンへ変換
-                    ned_cam_qx = cam_qx_raw
-                    ned_cam_qy = cam_qz_raw
-                    ned_cam_qz = -cam_qy_raw
-                    ned_cam_qw = cam_qw_raw
-
-                    # NED クォータニオン → 回転行列（カメラボディ → NED）
-                    R_body_to_ned = quaternion_to_rotation_matrix(ned_cam_qx, ned_cam_qy, ned_cam_qz, ned_cam_qw)
-
-                    # NED → ENU 変換行列 (固定)
-                    # NED(X=N,Y=E,Z=D) -> ENU(X=E,Y=N,Z=U)
-                    R_ned_to_enu = np.array([
-                        [0.0, 1.0,  0.0],
-                        [1.0, 0.0,  0.0],
-                        [0.0, 0.0, -1.0]
-                    ], dtype=np.float32)
-
-                    # ─── OpenCV カメラ座標系 (X=右,Y=下,Z=前) → カメラボディ NED 座標系 への軸変換 ───
-                    if CAMERA_MOUNT_DIRECTION == 'front':
-                        # 前向きカメラ: cam_Z(光軸=前)→body_X(North), cam_X(右)→body_Y(East), cam_Y(下)→body_Z(Down)
-                        R_cv_to_body = np.array([
-                            [0.0, 0.0, 1.0],
-                            [1.0, 0.0, 0.0],
-                            [0.0, 1.0, 0.0]
-                        ], dtype=np.float32)
-                    else:  # 'down'
-                        # 下向きカメラ: cam_Z(光軸=下)→body_Z(Down), cam_X(右)→body_Y(East), cam_Y(画像下=機体後方)→-body_X
-                        R_cv_to_body = np.array([
-                            [ 0.0, -1.0, 0.0],
-                            [ 1.0,  0.0, 0.0],
-                            [ 0.0,  0.0, 1.0]
-                        ], dtype=np.float32)
-
-                    # 合成: OpenCV座標 → ENU ワールド座標 の回転行列（Motiveリアルタイム姿勢で即時変換）
-                    # CAMERA_ROT_OFFSET: カメラ剛体と光学軸の間の取り付け回転誤差補正
-                    R_total = R_ned_to_enu @ R_body_to_ned @ R_cv_to_body @ CAMERA_ROT_OFFSET
-
-                    # カメラ光学中心のワールド座標（Motiveの計測値 + オフセット補正）
-                    cam_pos_enu = np.array([mx, my, mz], dtype=np.float32)
-                    # オフセット補正: マーカー中心 → 光学中心
-                    cam_pos_corrected = cam_pos_enu + R_total @ CAMERA_OPTICAL_OFFSET
-
-                    with io_lock:
-                        motive_camera_x = float(cam_pos_corrected[0])
-                        motive_camera_y = float(cam_pos_corrected[1])
-                        motive_camera_z = float(cam_pos_corrected[2])
-                        motive_camera_qx = cam_qx_raw
-                        motive_camera_qy = cam_qy_raw
-                        motive_camera_qz = cam_qz_raw
-                        motive_camera_qw = cam_qw_raw
-                        # カメラ座標系 → ENU ワールド座標系の変換行列・並進ベクトルを更新
-                        R_cam_to_world = R_total.copy()
-                        t_cam_world    = cam_pos_corrected.copy()
-                        motive_camera_received = True
+                    _apply_motive_camera_pose(
+                        (mx, my, mz),
+                        cam_qx_raw,
+                        cam_qy_raw,
+                        cam_qz_raw,
+                        cam_qw_raw,
+                        unpacked[9],
+                    )
                 
                 # ドローンと荷物の両方の座標が揃っていれば、荷物ローカル座標系における相対位置（真値）を計算
                 with io_lock:
@@ -397,6 +437,83 @@ def motive_udp_listener():
             
     sock.close()
     print("[Motive UDP] Receiver thread stopped")
+
+def motive_rigid_body_pose_udp_listener():
+    global motive_drone_x, motive_drone_y, motive_drone_z
+    global motive_drone_pos_received
+    global motive_cargo_x, motive_cargo_y, motive_cargo_z
+    global motive_cargo_qx, motive_cargo_qy, motive_cargo_qz, motive_cargo_qw
+    global motive_cargo_received, motive_cargo_pos_received
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(('0.0.0.0', MOTIVE_POSE_PORT))
+    except OSError as exc:
+        print(f"[Motive Pose UDP] Bind failed on {MOTIVE_POSE_PORT}: {exc}")
+        sock.close()
+        return
+
+    sock.settimeout(0.5)
+    print(
+        f"[Motive Pose UDP] Receiver thread started on port {MOTIVE_POSE_PORT}"
+    )
+    packet_size = struct.calcsize(MOTIVE_POSE_FORMAT)
+    while running:
+        try:
+            data, _ = sock.recvfrom(1024)
+        except socket.timeout:
+            continue
+        except OSError as exc:
+            if running:
+                print(f"[Motive Pose UDP] Receive failed: {exc}")
+            break
+
+        if len(data) != packet_size:
+            print(
+                f"[Motive Pose UDP] Invalid packet size: "
+                f"{len(data)} (expected {packet_size})"
+            )
+            continue
+        try:
+            magic, rigid_body_id, lat_e7, lon_e7, alt_mm, qx, qy, qz, qw, timestamp = (
+                struct.unpack(MOTIVE_POSE_FORMAT, data)
+            )
+            if magic != MOTIVE_POSE_MAGIC:
+                raise ValueError("パケット識別子が一致しません")
+            if rigid_body_id not in (1, 2, CAMERA_RIGID_BODY_ID):
+                raise ValueError(f"未対応の剛体IDです: {rigid_body_id}")
+            if not all(math.isfinite(value) for value in (qx, qy, qz, qw, timestamp)):
+                raise ValueError("姿勢または時刻に有限値でない値があります")
+            quat_norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+            if not math.isfinite(quat_norm) or quat_norm == 0:
+                raise ValueError("カメラ姿勢クォータニオンが不正です")
+            lat = lat_e7 / 1e7
+            lon = lon_e7 / 1e7
+            alt = alt_mm / 1000.0
+            _set_motive_origin_if_needed(lat, lon, alt, rigid_body_id)
+            position_enu = gps_to_local_xyz(lat, lon, alt)
+            if rigid_body_id == 1:
+                with io_lock:
+                    motive_drone_x, motive_drone_y, motive_drone_z = position_enu
+                    motive_drone_pos_received = True
+            elif rigid_body_id == 2:
+                with io_lock:
+                    motive_cargo_x, motive_cargo_y, motive_cargo_z = position_enu
+                    motive_cargo_qx = qx
+                    motive_cargo_qy = qy
+                    motive_cargo_qz = qz
+                    motive_cargo_qw = qw
+                    motive_cargo_received = True
+                    motive_cargo_pos_received = True
+            else:
+                _apply_motive_camera_pose(
+                    position_enu, qx, qy, qz, qw, timestamp
+                )
+        except (struct.error, ValueError, OverflowError) as exc:
+            print(f"[Motive Pose UDP] Invalid packet: {exc}")
+
+    sock.close()
+    print("[Motive Pose UDP] Receiver thread stopped")
 
 # ───── キー入力処理 ─────
 def get_key():
@@ -834,7 +951,7 @@ def camera_tracker_loop(m, show_window=False):
                     if motive_camera_received:
                         R_inv = R_cam_to_world.T
                         t_cam = t_cam_world
-                        if motive_cargo_received:
+                        if motive_cargo_pos_received:
                             c_world = np.array([motive_cargo_x, motive_cargo_y, motive_cargo_z], dtype=np.float32)
                             c_cam = R_inv.dot(c_world - t_cam)
                             m_cargo_cam_val = [float(c_cam[0]), float(c_cam[1]), float(c_cam[2])]
@@ -1162,6 +1279,14 @@ def record_data():
             m_cam_y = motive_camera_y
             m_cam_z = motive_camera_z
             m_cam_rcv = 1 if motive_camera_received else 0
+            m_cam_quaternion = (
+                motive_camera_qx,
+                motive_camera_qy,
+                motive_camera_qz,
+                motive_camera_qw,
+            )
+            m_cam_pose_time = motive_camera_pose_time_s
+            m_cam_rotation = R_cam_to_world.flatten().tolist()
             coord_src = _coord_source_log
             
             # Pixhawk姿勢データのログ取得
@@ -1195,6 +1320,9 @@ def record_data():
             # ✅ カメラ Motive データ
             m_cam_x, m_cam_y, m_cam_z,
             m_cam_rcv,
+            *m_cam_quaternion,
+            m_cam_pose_time,
+            *m_cam_rotation,
             coord_src,
             # Pixhawk姿勢 カラム
             p_roll, p_pitch, p_yaw,
@@ -1229,6 +1357,12 @@ def save_csv():
             # ✅ カメラ Motive センサ（カメラ rigid body）
             'Motive_Camera_X_m', 'Motive_Camera_Y_m', 'Motive_Camera_Z_m',
             'Motive_Camera_Received',
+            'Motive_Camera_QX', 'Motive_Camera_QY',
+            'Motive_Camera_QZ', 'Motive_Camera_QW',
+            'Motive_Camera_Pose_Time_s',
+            'Motive_Camera_R00', 'Motive_Camera_R01', 'Motive_Camera_R02',
+            'Motive_Camera_R10', 'Motive_Camera_R11', 'Motive_Camera_R12',
+            'Motive_Camera_R20', 'Motive_Camera_R21', 'Motive_Camera_R22',
             'Coord_Source',
             'Pixhawk_Roll_rad', 'Pixhawk_Pitch_rad', 'Pixhawk_Yaw_rad',
             # ✅ カメラ座標系 生データ
@@ -1270,6 +1404,9 @@ def main():
         threading.Thread(target=monitor_vehicle, args=(mav,), daemon=True).start()
         threading.Thread(target=record_data, daemon=True).start()
         threading.Thread(target=motive_udp_listener, daemon=True).start()
+        threading.Thread(
+            target=motive_rigid_body_pose_udp_listener, daemon=True
+        ).start()
 
         # 起動時にカメラ映像表示の有無を選択
         choice = input_with_timeout("カメラ映像を表示しますか？ 1:表示 2:非表示 (デフォルト2): ", timeout=15, default='2')

@@ -187,7 +187,7 @@ $$
 
 ## 7. CSV ログフォーマット仕様
 
-`AR-hook1_test.py` が `~/LOGS_Pixhawk6c/YYYYMMDD_HHMMSS_1.csv` に出力する 38 列のログ構成:
+`AR-hook1_test.py` が `~/LOGS_Pixhawk6c/YYYYMMDD_HHMMSS_1.csv` に出力する 63 列のログ構成:
 
 | 列番号 | カラム名 | 単位 | 説明 |
 |---|---|---|---|
@@ -205,12 +205,17 @@ $$
 | 27-29 | `Motive_Roll/Pitch/Yaw` | rad | Motive ドローン姿勢真値 |
 | 30-32 | `Motive_Camera_X/Y/Z` | m | Motive カメラ剛体位置真値 (ID3) |
 | 33 | `Motive_Camera_Received` | 0/1 | Motive カメラ剛体データ受信フラグ |
-| 34 | `Coord_Source` | string | 座標変換ソース (`Motive-Camera` / `IMU-Fallback` / `ArduPilot-Mag`) |
-| 35-37 | `Pixhawk_Roll/Pitch/Yaw` | rad | Pixhawk IMU 姿勢推定値 |
-| 38-40 | `Cargo_Cam_X/Y/Z` | m | カメラ座標系における荷物生値 |
-| 41-43 | `Hand_Cam_X/Y/Z` | m | カメラ座標系における手先 ID1 生値 |
-| 44-46 | `Motive_Cargo_Cam_X/Y/Z` | m | Motive 荷物真値のカメラ座標系逆投影値 |
-| 47-49 | `Motive_Hand_Cam_X/Y/Z` | m | Motive 手先真値のカメラ座標系逆投影値 |
+| 34-37 | `Motive_Camera_QX/QY/QZ/QW` | - | Motiveカメラ剛体の生クォータニオン |
+| 38 | `Motive_Camera_Pose_Time_s` | s | 姿勢パケットの送信時刻 |
+| 39-47 | `Motive_Camera_R00`–`R22` | - | カメラ座標からENUへの適用済み回転行列（行優先） |
+| 48 | `Coord_Source` | string | 座標変換ソース (`Motive-Camera` / `IMU-Fallback` / `ArduPilot-Mag`) |
+| 49-51 | `Pixhawk_Roll/Pitch/Yaw` | rad | Pixhawk IMU 姿勢推定値 |
+| 52-54 | `Cargo_Cam_X/Y/Z` | m | カメラ座標系における荷物生値 |
+| 55-57 | `Hand_Cam_X/Y/Z` | m | カメラ座標系における手先 ID1 生値 |
+| 58-60 | `Motive_Cargo_Cam_X/Y/Z` | m | Motive 荷物真値のカメラ座標系逆投影値 |
+| 61-63 | `Motive_Hand_Cam_X/Y/Z` | m | Motive 手先真値のカメラ座標系逆投影値 |
+
+Motive SDKはID1・ID2・カメラID3の位置・クォータニオンを専用UDPポート15770で全設定済みPiへ配信する。比較スクリプトは各行の適用済み回転行列を使ってカメラ相対XYZをENU（東・北・上）へ変換する。
 
 ---
 

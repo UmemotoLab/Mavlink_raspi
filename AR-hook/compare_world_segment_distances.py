@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Compare AR and Motive world-space segment lengths from experiment CSV logs.
+"""Compare AR and Motive segment lengths and XYZ components from experiment logs.
 
-The logs store hand and cargo positions relative to the camera, not the camera
-rotation matrix. Euclidean segment lengths are unchanged by the rigid
-camera-to-world rotation, so the distances computed here are the corresponding
-world-space distances without needing to reconstruct absolute world XYZ.
+New logs store the camera-to-ENU rotation matrix and are compared in ENU.
+Older logs without that matrix retain camera-frame XYZ output.
 """
 import argparse
 import csv
@@ -41,6 +39,12 @@ REQUIRED_COLUMNS = (
     "Motive_Cargo_Cam_Z_m",
 )
 
+CAMERA_ROTATION_COLUMNS = tuple(
+    f"Motive_Camera_R{row}{column}"
+    for row in range(3)
+    for column in range(3)
+)
+
 
 def _vector(row, prefix):
     values = tuple(float(row[f"{prefix}_{axis}_m"]) for axis in ("X", "Y", "Z"))
@@ -53,6 +57,17 @@ def _distance(a, b=(0.0, 0.0, 0.0)):
     return math.sqrt(sum((a[i] - b[i]) ** 2 for i in range(3)))
 
 
+def _difference(a, b):
+    return tuple(a[i] - b[i] for i in range(3))
+
+
+def _rotate(rotation, vector):
+    return tuple(
+        sum(rotation[row * 3 + column] * vector[column] for column in range(3))
+        for row in range(3)
+    )
+
+
 def load_samples(path):
     """Load rows where AR and Motive both have hand and cargo detections."""
     samples = []
@@ -63,6 +78,9 @@ def load_samples(path):
         missing = sorted(set(REQUIRED_COLUMNS) - set(reader.fieldnames or ()))
         if missing:
             raise ValueError(f"{path}: 必須列がありません: {', '.join(missing)}")
+        has_world_rotation = set(CAMERA_ROTATION_COLUMNS).issubset(
+            reader.fieldnames or ()
+        )
 
         for line_number, row in enumerate(reader, start=2):
             if row.get("Cargo_Detected") != "1" or row.get("ID1_Detected") != "1":
@@ -76,22 +94,44 @@ def load_samples(path):
                 ar_cargo = _vector(row, "Cargo_Cam_Raw")
                 motive_hand = _vector(row, "Motive_Hand_Cam")
                 motive_cargo = _vector(row, "Motive_Cargo_Cam")
+                if has_world_rotation:
+                    if row.get("Motive_Camera_Received") != "1":
+                        raise ValueError("カメラ姿勢を受信していません")
+                    rotation = tuple(
+                        float(row[column]) for column in CAMERA_ROTATION_COLUMNS
+                    )
+                    if not all(math.isfinite(value) for value in rotation):
+                        raise ValueError("カメラ回転行列に有限値でない値があります")
             except (TypeError, ValueError):
                 invalid += 1
                 continue
 
-            distances = {
-                "camera_to_hand": (_distance(ar_hand), _distance(motive_hand)),
+            components = {
+                "camera_to_hand": (ar_hand, motive_hand),
                 "hand_to_cargo": (
-                    _distance(ar_cargo, ar_hand),
-                    _distance(motive_cargo, motive_hand),
+                    _difference(ar_cargo, ar_hand),
+                    _difference(motive_cargo, motive_hand),
                 ),
-                "cargo_to_camera": (_distance(ar_cargo), _distance(motive_cargo)),
+                "cargo_to_camera": (
+                    tuple(-value for value in ar_cargo),
+                    tuple(-value for value in motive_cargo),
+                ),
             }
+            distances = {
+                key: (_distance(ar_vector), _distance(motive_vector))
+                for key, (ar_vector, motive_vector) in components.items()
+            }
+            if has_world_rotation:
+                components = {
+                    key: (_rotate(rotation, ar_vector), _rotate(rotation, motive_vector))
+                    for key, (ar_vector, motive_vector) in components.items()
+                }
             samples.append({
                 "time_s": timestamp,
                 "line": line_number,
                 "distances": distances,
+                "components": components,
+                "coordinate_frame": "ENU" if has_world_rotation else "Camera",
             })
 
     return samples, not_detected, invalid
@@ -111,21 +151,32 @@ def write_detail_csv(output_path, results):
     with output_path.open("w", newline="", encoding="utf-8-sig") as csv_file:
         writer = csv.writer(csv_file)
         writer.writerow([
-            "Source_CSV", "Time_s", "Source_Line", "Segment",
+            "Source_CSV", "Time_s", "Source_Line", "Segment", "Coordinate_Frame",
             "AR_Distance_m", "Motive_Distance_m", "Error_AR_minus_Motive_m",
+            "AR_Delta_X_m", "AR_Delta_Y_m", "AR_Delta_Z_m",
+            "Motive_Delta_X_m", "Motive_Delta_Y_m", "Motive_Delta_Z_m",
+            "Error_Delta_X_m", "Error_Delta_Y_m", "Error_Delta_Z_m",
         ])
         for result in results:
             for sample in result["samples"]:
                 for key, label in SEGMENTS:
                     ar_distance, motive_distance = sample["distances"][key]
+                    ar_components, motive_components = sample["components"][key]
                     writer.writerow([
                         result["path"].name,
                         f"{sample['time_s']:.6f}",
                         sample["line"],
                         label,
+                        sample["coordinate_frame"],
                         f"{ar_distance:.6f}",
                         f"{motive_distance:.6f}",
                         f"{ar_distance - motive_distance:.6f}",
+                        *(f"{value:.6f}" for value in ar_components),
+                        *(f"{value:.6f}" for value in motive_components),
+                        *(
+                            f"{ar_components[i] - motive_components[i]:.6f}"
+                            for i in range(3)
+                        ),
                     ])
 
 
@@ -169,9 +220,34 @@ def main():
             f"未検出で除外: {result['not_detected']} / "
             f"検出フラグあり・座標不正で除外: {result['invalid']}"
         )
+        coordinate_frame = result["samples"][0]["coordinate_frame"]
+        if coordinate_frame == "ENU":
+            print("XYZ成分はMotiveカメラ姿勢と取り付け補正を適用したENU（東・北・上）です。")
+            component_label = "ENU世界座標系"
+        else:
+            print("XYZ成分はカメラ座標系です（CSVに適用済みカメラ回転行列がありません）。")
+            component_label = "カメラ座標系"
         for key, label in SEGMENTS:
             ar_values = [sample["distances"][key][0] for sample in result["samples"]]
             motive_values = [sample["distances"][key][1] for sample in result["samples"]]
+            ar_components = [
+                sample["components"][key][0] for sample in result["samples"]
+            ]
+            motive_components = [
+                sample["components"][key][1] for sample in result["samples"]
+            ]
+            mean_ar_components = tuple(
+                statistics.mean(vector[i] for vector in ar_components)
+                for i in range(3)
+            )
+            mean_motive_components = tuple(
+                statistics.mean(vector[i] for vector in motive_components)
+                for i in range(3)
+            )
+            mean_component_errors = tuple(
+                mean_ar_components[i] - mean_motive_components[i]
+                for i in range(3)
+            )
             errors = [ar - motive for ar, motive in zip(ar_values, motive_values)]
             stats = _stats(errors)
             print(
@@ -179,6 +255,19 @@ def main():
                 f"Motive平均={statistics.mean(motive_values):.4f} m, "
                 f"Bias={stats['bias']:+.4f} m, MAE={stats['mae']:.4f} m, "
                 f"RMSE={stats['rmse']:.4f} m, SD={stats['std']:.4f} m"
+            )
+            print(
+                f"    {component_label}XYZ変位の平均 "
+                f"AR=({mean_ar_components[0]:+.4f}, "
+                f"{mean_ar_components[1]:+.4f}, "
+                f"{mean_ar_components[2]:+.4f}) m, "
+                f"Motive=({mean_motive_components[0]:+.4f}, "
+                f"{mean_motive_components[1]:+.4f}, "
+                f"{mean_motive_components[2]:+.4f}) m, "
+                f"誤差=({mean_component_errors[0]:+.4f}, "
+                f"{mean_component_errors[1]:+.4f}, "
+                f"{mean_component_errors[2]:+.4f}) m "
+                "(X, Y, Z)"
             )
 
     if args.output:
