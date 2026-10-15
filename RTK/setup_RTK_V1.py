@@ -103,9 +103,13 @@ params_to_set = {
     #     上書きされて RTK Fix を阻害する（ArduPilot公式ドキュメント参照）。
     # DroneCAN GPS を確実に GPS1 として扱うための FC 側パラメータ。
     # （F9P モジュール内部には何も書き込まないため f9p_config_all.py と競合しない）
-    # ファームが 4.6 以降で GPS1_TYPE 命名の場合は GPS1_TYPE=9 に読み替えること。
-    'GPS_TYPE': (9, 'AP_Int8', 'GPS1通信プロトコル: 9=DroneCAN GPS'),
-    'GPS_AUTO_CONFIG': (0, 'AP_Int8', '自動構成無効 (F9P設定はf9p_config_all.pyで実施)'),
+    # 対象ファーム 4.6 以降の GPS1_TYPE 命名に合わせる。
+    # 実機に存在しない旧名 GPS_TYPE は書き込まない。
+    # F9P 側は f9p_config_all_V2.py (DGNSSMODE=3/GLO_ENA=1) が正典。V1 (DGNSSMODE=0) は不変。
+    'GPS1_TYPE': (9, 'AP_Int8', 'GPS1通信プロトコル: 9=DroneCAN GPS (4.6以降命名)'),
+    'GPS1_CAN_NODEID': (125, 'AP_Int8', 'DroneCAN GPS ノードID'),
+    'GPS1_GNSS_MODE': (127, 'AP_Int8', 'GPS1 GNSSモード bitmask (127=全コンステレーション)'),
+    'GPS_AUTO_CONFIG': (0, 'AP_Int8', '自動構成無効 (F9P設定はf9p_config_all_V2.pyで実施)'),
     'GPS_PRIMARY': (0, 'AP_Int8', 'プライマリGPS'),
 
     # === CAN/DroneCAN設定（FC側バスのみ。モジュール内部設定は行わない） ===
@@ -216,7 +220,7 @@ params_to_set = {
 
     # === シリアル設定 ===
     'SERIAL1_PROTOCOL': (2, 'AP_Int8', 'MAVLink2プロトコル'),
-    'SERIAL1_BAUD': (1000000, 'AP_Int32', 'ボーレート [bps]'),
+    'SERIAL1_BAUD': (921600, 'AP_Int32', 'ボーレート [bps] (確定値921600)'),
     'BRD_SER1_RTSCTS': (2, 'AP_Int8', 'ハードウェアフロー制御有効'),
     'SERIAL2_PROTOCOL': (23, 'AP_Int8', 'ELRSレシーバー'),
 
