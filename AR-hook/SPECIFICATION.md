@@ -216,6 +216,18 @@ $$
 
 Motive SDKはID1・ID2・カメラID3の位置・クォータニオンを専用UDPポート15770で全設定済みPiへ配信する。比較スクリプトは各行の適用済み回転行列を使ってカメラ相対XYZをNED（北・東・下）へ変換する。
 
+### 7.1 手先座標の時系列グラフ
+
+以下のスクリプトはCSVの `Time_s` を実行開始からの経過秒に変換し、各軸を個別のグラフに出力します。実行時にはCSVファイルを指定してください。
+
+```bash
+python3 plot_hand_motive.py <CSV_PATH>
+python3 plot_hand_ar_camera.py <CSV_PATH>
+python3 plot_hand_ar_world.py <CSV_PATH>
+```
+
+PNGは入力CSVと同じフォルダーに保存され、既定ではグラフ画面も表示されます。画面を表示せず保存だけ行う場合は `--no-show` を付けます。Motive版は手先位置（NED）に加えてRoll/Pitch/Yaw（度）のグラフも保存します。ARカメラ座標版は `Hand_Cam_Raw_X/Y/Z_m`、ARからW座標への変換版は保存済みカメラ姿勢行列を適用したNED位置を描画します。現行CSVにAR推定の手先姿勢角は記録されていないため、AR 2種類のスクリプトは位置グラフのみを作成します。Matplotlibが必要です。
+
 ---
 
 ## 8. システム使用手順・運用マニュアル
