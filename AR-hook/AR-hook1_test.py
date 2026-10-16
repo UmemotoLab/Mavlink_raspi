@@ -175,7 +175,7 @@ motive_camera_qw = 1.0
 motive_camera_received = False
 motive_camera_pose_time_s = 0.0
 
-# カメラ座標系 → ENU ワールド座標系の合成回転行列と並進ベクトル
+# カメラ座標系 → NED ワールド座標系の合成回転行列と並進ベクトル
 # motive_udp_listener() がリアルタイムに更新する
 R_cam_to_world = np.eye(3, dtype=np.float32)   # 初期値: 単位行列
 t_cam_world    = np.zeros(3, dtype=np.float32)  # 初期値: 原点
@@ -207,11 +207,6 @@ def _camera_rotation_from_motive(qx, qy, qz, qw):
         component / quat_norm for component in (qx, qy, qz, qw)
     )
     R_body_to_ned = quaternion_to_rotation_matrix(qx, qz, -qy, qw)
-    R_ned_to_enu = np.array([
-        [0.0, 1.0,  0.0],
-        [1.0, 0.0,  0.0],
-        [0.0, 0.0, -1.0]
-    ], dtype=np.float32)
     if CAMERA_MOUNT_DIRECTION == 'front':
         R_cv_to_body = np.array([
             [0.0, 0.0, 1.0],
@@ -224,7 +219,7 @@ def _camera_rotation_from_motive(qx, qy, qz, qw):
             [1.0,  0.0, 0.0],
             [0.0,  0.0, 1.0]
         ], dtype=np.float32)
-    return R_ned_to_enu @ R_body_to_ned @ R_cv_to_body @ CAMERA_ROT_OFFSET
+    return R_body_to_ned @ R_cv_to_body @ CAMERA_ROT_OFFSET
 
 def _set_motive_origin_if_needed(lat, lon, alt, rigid_body_id):
     global REF_LAT, REF_LON, REF_ALT, motive_origin_set
@@ -239,14 +234,14 @@ def _set_motive_origin_if_needed(lat, lon, alt, rigid_body_id):
           f"lat={lat:.7f}  lon={lon:.7f}  alt={alt:.3f}m  "
           f"(rigid_body_id={rigid_body_id})")
 
-def _apply_motive_camera_pose(position_enu, qx, qy, qz, qw, timestamp):
+def _apply_motive_camera_pose(position_ned, qx, qy, qz, qw, timestamp):
     global motive_camera_x, motive_camera_y, motive_camera_z
     global motive_camera_qx, motive_camera_qy, motive_camera_qz, motive_camera_qw
     global motive_camera_pose_time_s, motive_camera_received
     global R_cam_to_world, t_cam_world
     R_total = _camera_rotation_from_motive(qx, qy, qz, qw)
     cam_pos_corrected = (
-        np.asarray(position_enu, dtype=np.float32)
+        np.asarray(position_ned, dtype=np.float32)
         + R_total @ CAMERA_OPTICAL_OFFSET
     )
     with io_lock:
@@ -322,13 +317,13 @@ def motive_udp_listener():
                 unpacked = struct.unpack(MOTIVE_FORMAT, data[:39])
                 rigid_body_id = unpacked[0]
                 
-                # GPSからローカルENU座標に変換
+                # GPSからローカルNED座標に変換
                 lat = unpacked[1] / 1e7
                 lon = unpacked[2] / 1e7
                 alt = unpacked[3] / 1000.0
 
                 # ── 動的原点の自動設定 ──────────────────────────────────────────
-                # 最初に届いた任意の rigid body の GPS 座標を ENU 原点にする。
+                # 最初に届いた任意の rigid body の GPS 座標を NED 原点にする。
                 # Motive マーカーを実験空間の「原点」に置く必要がなくなります。
                 # 北向きの初期姿勢だけ合わせれば軸方向は正しく保たれます。
                 _set_motive_origin_if_needed(lat, lon, alt, rigid_body_id)
@@ -401,14 +396,12 @@ def motive_udp_listener():
                 # ドローンと荷物の両方の座標が揃っていれば、荷物ローカル座標系における相対位置（真値）を計算
                 with io_lock:
                     if motive_drone_pos_received and motive_cargo_received:
-                        # 荷物から見たドローンへの相対位置（ローカルENU座標系での差分）
+                        # 荷物から見たドローンへの相対位置（ローカルNED座標系での差分）
                         dp_world = np.array([motive_drone_x - motive_cargo_x,
                                              motive_drone_y - motive_cargo_y,
                                              motive_drone_z - motive_cargo_z])
-                        # ENU (East, North, Up) から SED (South, West, Down) に変換
-                        # (北向きから南向きに180度回転)
-                        # dp_sed = R_z(pi) * dp_ned = [-dp_ned_x, -dp_ned_y, dp_ned_z]
-                        dp_sed = np.array([-dp_world[1], -dp_world[0], -dp_world[2]])
+                        # NEDからSED (South, West, Down) に変換
+                        dp_sed = np.array([-dp_world[0], -dp_world[1], dp_world[2]])
                         
                         # 荷物の姿勢をNEDクオータニオンに変換
                         nc_qx = motive_cargo_qx
@@ -491,14 +484,14 @@ def motive_rigid_body_pose_udp_listener():
             lon = lon_e7 / 1e7
             alt = alt_mm / 1000.0
             _set_motive_origin_if_needed(lat, lon, alt, rigid_body_id)
-            position_enu = gps_to_local_xyz(lat, lon, alt)
+            position_ned = gps_to_local_xyz(lat, lon, alt)
             if rigid_body_id == 1:
                 with io_lock:
-                    motive_drone_x, motive_drone_y, motive_drone_z = position_enu
+                    motive_drone_x, motive_drone_y, motive_drone_z = position_ned
                     motive_drone_pos_received = True
             elif rigid_body_id == 2:
                 with io_lock:
-                    motive_cargo_x, motive_cargo_y, motive_cargo_z = position_enu
+                    motive_cargo_x, motive_cargo_y, motive_cargo_z = position_ned
                     motive_cargo_qx = qx
                     motive_cargo_qy = qy
                     motive_cargo_qz = qz
@@ -507,7 +500,7 @@ def motive_rigid_body_pose_udp_listener():
                     motive_cargo_pos_received = True
             else:
                 _apply_motive_camera_pose(
-                    position_enu, qx, qy, qz, qw, timestamp
+                    position_ned, qx, qy, qz, qw, timestamp
                 )
         except (struct.error, ValueError, OverflowError) as exc:
             print(f"[Motive Pose UDP] Invalid packet: {exc}")
@@ -596,22 +589,22 @@ def get_initial_yaw(m):
     return 180.0
 # ───── 座標変換 ─────
 def gps_to_local_xyz(lat, lon, alt):
-    dx = (lon - REF_LON) * 111319.5 * math.cos(math.radians(REF_LAT))
-    dy = (lat - REF_LAT) * 111319.5
-    dz = alt - REF_ALT
-    return dx, dy, dz
+    north = (lat - REF_LAT) * 111319.5
+    east = (lon - REF_LON) * 111319.5 * math.cos(math.radians(REF_LAT))
+    down = REF_ALT - alt
+    return north, east, down
 def local_xyz_to_gps(x, y, z):
-    lat = REF_LAT + y / 111319.5
-    lon = REF_LON + x / (111319.5 * math.cos(math.radians(REF_LAT)))
-    alt = REF_ALT + z
+    lat = REF_LAT + x / 111319.5
+    lon = REF_LON + y / (111319.5 * math.cos(math.radians(REF_LAT)))
+    alt = REF_ALT - z
     return lat, lon, alt
-# ───── カメラ座標系から世界絶対座標系（東・北・上）への座標変換 ─────
+# ───── カメラ座標系から世界座標系（北・東・下）への座標変換 ─────
 _debug_cargo_log_time = 0.0  # デバッグログ用タイムスタンプ
 
 def camera_to_world_xyz_motive(tvec, debug=False):
     """
     【推奨】Motive で計測したカメラ位置・姿勢を用いて
-    OpenCV カメラ座標系のベクトルを ENU ワールド座標に変換する。
+    OpenCV カメラ座標系のベクトルを NED ワールド座標に変換する。
 
     R_cam_to_world と t_cam_world は motive_udp_listener() がリアルタイムに更新する。
     Motive カメラデータが未受信の場合は None を返す（フォールバック用）。
@@ -620,7 +613,7 @@ def camera_to_world_xyz_motive(tvec, debug=False):
         tvec : カメラ座標系での3Dベクトル (numpy配列 or リスト, shape=(3,))
         debug: True のとき中間値をコンソール出力（傾き補正の検証用）
     Returns:
-        (world_x, world_y, world_z) in ENU [m], または None（未受信時）
+        (north, east, down) in NED [m], または None（未受信時）
 
     【世界座標が変わる場合のチェック項目】
       Motiveから毎フレーム取得するカメラ姿勢データ（クォータニオン）から直接リアルタイム変換しています。
@@ -647,8 +640,8 @@ def camera_to_world_xyz_motive(tvec, debug=False):
             _debug_cargo_log_time = now
             print(f"[CamDebug] tvec_cam=[{tvec_arr[0]:.3f},{tvec_arr[1]:.3f},{tvec_arr[2]:.3f}] "
                   f"R_rot=[{R_rot[0]:.3f},{R_rot[1]:.3f},{R_rot[2]:.3f}] "
-                  f"cam_pos=[{t[0]:.3f},{t[1]:.3f},{t[2]:.3f}] "
-                  f"p_world=[{p_world[0]:.3f},{p_world[1]:.3f},{p_world[2]:.3f}]")
+                  f"cam_pos_NED=[{t[0]:.3f},{t[1]:.3f},{t[2]:.3f}] "
+                  f"p_world_NED=[{p_world[0]:.3f},{p_world[1]:.3f},{p_world[2]:.3f}]")
 
     return float(p_world[0]), float(p_world[1]), float(p_world[2])
 
@@ -656,7 +649,7 @@ def camera_to_world_xyz(tvec, roll_rad, pitch_rad, yaw_rad, gps_drone):
     """
     【前向きテスト用】
     前向きカメラ座標系の相対ベクトル [x_cam, y_cam, z_cam] を、
-    機体姿勢（Roll, Pitch, Yaw）の3D回転行列を用いて世界絶対座標系（East-North-Up）の目標値に変換します。
+    機体姿勢（Roll, Pitch, Yaw）の3D回転行列を用いて世界座標系（North-East-Down）の目標値に変換します。
     """
     # 1. カメラ座標系 -> 機体ボディ座標系（FRD: Front-Right-Down）へのマウントマッピング修正
     # 前向きカメラの場合：
@@ -680,14 +673,9 @@ def camera_to_world_xyz(tvec, roll_rad, pitch_rad, yaw_rad, gps_drone):
     # 機体ボディ座標から地球座標（NED）に変換
     p_ned = R_body_to_ned.dot(p_body)
     
-    # 3. NED（北・東・下）から ENU（東・北・上）へ変換
-    dx_enu = p_ned[1]  # East = Y_NED
-    dy_enu = p_ned[0]  # North = X_NED
-    dz_enu = -p_ned[2] # Up = -Z_NED
-    
-    target_x = gps_drone['x'] + dx_enu
-    target_y = gps_drone['y'] + dy_enu
-    target_z = gps_drone['z'] + dz_enu
+    target_x = gps_drone['x'] + p_ned[0]
+    target_y = gps_drone['y'] + p_ned[1]
+    target_z = gps_drone['z'] + p_ned[2]
     
     return target_x, target_y, target_z
 # ───── ポーズ推定関数 ─────
@@ -788,10 +776,10 @@ def monitor_vehicle(m):
             
             with io_lock:
                 gps_now.update({'x': x, 'y': y, 'z': z})
-            if takeoff_sent and not takeoff_reached and z >= TAKEOFF_ALT * 0.9:
+            if takeoff_sent and not takeoff_reached and z <= -TAKEOFF_ALT * 0.9:
                 takeoff_reached = True
                 with io_lock:
-                    target['z'] = TAKEOFF_ALT
+                    target['z'] = -TAKEOFF_ALT
                     initial_target_set = True
                 print(f"✓ 離陸高度到達: {target['z']:.2f}m")
         time.sleep(1 / SEND_HZ)
@@ -1049,10 +1037,8 @@ def camera_tracker_loop(m, show_window=False):
                         _coord_source_log = coord_source  # ✅ 座標変換ソースをCSV記録用に保存
                         target['x'] = target_x
                         target['y'] = target_y
-                        # 前向きテスト用：高さ(Z)方向もマーカーの高さに追随
+                        # NEDのDown(Z)方向もマーカー位置に追随
                         target['z'] = target_z
-                        # （従来の下向きカメラのように一定高度を維持する場合は以下を有効化してください）
-                        # target['z'] = TARGET_HEIGHT_ABOVE_TAKEOFF
                         
                         cargo_center_world['x'] = cargo_x
                         cargo_center_world['y'] = cargo_y
@@ -1088,11 +1074,33 @@ def camera_tracker_loop(m, show_window=False):
                         last_text = "(using last center)" if used_last_center else ""
                         
                         dist_id1_text = f"X:{dist_x:.3f}, Y:{dist_y:.3f}, Z:{dist_z:.3f}" if has_id1 else "N/A"
+                        with io_lock:
+                            motive_cargo = (
+                                motive_cargo_x, motive_cargo_y, motive_cargo_z
+                            )
+                            motive_cargo_available = motive_cargo_pos_received
+                            motive_drone = (
+                                motive_drone_x, motive_drone_y, motive_drone_z
+                            )
+                            motive_drone_available = motive_drone_pos_received
+                        motive_cargo_text = (
+                            f"N:{motive_cargo[0]:.2f}, E:{motive_cargo[1]:.2f}, "
+                            f"D:{motive_cargo[2]:.2f}"
+                            if motive_cargo_available else "N/A"
+                        )
+                        motive_drone_text = (
+                            f"N:{motive_drone[0]:.2f}, E:{motive_drone[1]:.2f}, "
+                            f"D:{motive_drone[2]:.2f}"
+                            if motive_drone_available else "N/A"
+                        )
                         print(f"[Tracker] 検出IDs: {ids_text} {id1_text} {last_text} | "
                                f"座標ソース: {coord_source} | "
                                f"推定中心(px): [X:{cargo_center_cam_x:.1f}, Y:{cargo_center_cam_y:.1f}] | "
                                f"ID1-中心目標距離(xyz): [{dist_id1_text}] | "
-                               f"目標座標 [X:{target_x:.2f}, Y:{target_y:.2f}, Z:{target['z']:.2f}]")
+                               f"W座標 NED[m] Motive荷物[{motive_cargo_text}] "
+                               f"Motive機体[{motive_drone_text}] | "
+                               f"AR荷物[N:{cargo_x:.2f}, E:{cargo_y:.2f}, D:{cargo_z:.2f}] | "
+                               f"AR目標[N:{target_x:.2f}, E:{target_y:.2f}, D:{target_z:.2f}]")
                         last_print_time = time.time()
                 else:
                     # 荷物が検出されていない場合
@@ -1222,18 +1230,18 @@ def control_loop(m):
             key, moved, echo = get_key(), False, None
             if key == 'q': running = False; break
             elif key in 'umhlwzadt':
-                if key == 'u': target['y'] -= STEP; echo = "u South"
-                elif key == 'm': target['y'] += STEP; echo = "m North"
-                elif key == 'h': target['x'] += STEP; echo = "h East"
-                elif key == 'l': target['x'] -= STEP; echo = "l West"
-                elif key == 'w' and initial_target_set: target['z'] += STEP; echo = "w Up"
-                elif key == 'z' and initial_target_set and target['z'] - STEP >= 0.05: target['z'] -= STEP; echo = "z Down"
+                if key == 'u': target['x'] -= STEP; echo = "u South"
+                elif key == 'm': target['x'] += STEP; echo = "m North"
+                elif key == 'h': target['y'] += STEP; echo = "h East"
+                elif key == 'l': target['y'] -= STEP; echo = "l West"
+                elif key == 'w' and initial_target_set: target['z'] -= STEP; echo = "w Up"
+                elif key == 'z' and initial_target_set and target['z'] + STEP <= -0.05: target['z'] += STEP; echo = "z Down"
                 elif key == 'a': yaw_t_deg = (yaw_t_deg - 5) % 360; echo = "a Yaw-5"
                 elif key == 'd': yaw_t_deg = (yaw_t_deg + 5) % 360; echo = "d Yaw+5"
                 elif key == 't' and initial_target_set:
                     target['x'], target['y'], target['z'] = gps_to_local_xyz(36.0757693, 136.2132945, REF_ALT)
-                    target['z'] = TARGET_HEIGHT_ABOVE_TAKEOFF
-                    echo = f"t → X={target['x']:.2f} Y={target['y']:.2f} Z={target['z']:.2f}"
+                    target['z'] = -TARGET_HEIGHT_ABOVE_TAKEOFF
+                    echo = f"t → N={target['x']:.2f} E={target['y']:.2f} D={target['z']:.2f}"
                 if echo: moved = True; print(f"KEY: {echo}")
                 if moved:
                     lat, lon, alt = local_xyz_to_gps(target['x'], target['y'], target['z'])

@@ -489,7 +489,7 @@ def main():
     print(" 2回分のCSVログの比較による荷物の変位導出解析 & オプティカルオフセット校正")
     print("=" * 60)
     print(
-        "⚠ Motive_Cargo_X/Y/Z_m のRun間変位は、両ログで動的ENU原点が共通の場合のみ"
+        "⚠ Motive_Cargo_X/Y/Z_m のRun間変位は、両ログで動的NED原点が共通の場合のみ"
         "直接比較できます。現行CSVには原点識別情報がありません。"
     )
     
@@ -539,7 +539,7 @@ def main():
         )
     
     print("\n" + "="*60)
-    print(" ■ 荷物の平均絶対世界座標（ENU）の導出結果 [m]")
+    print(" ■ 荷物の平均絶対世界座標（NED）の導出結果 [m]")
     print("="*60)
     print("【Run 1】")
     print(f"  Motive 真値座標   : [X:{r1['cargo_motive'][0]:.4f}, Y:{r1['cargo_motive'][1]:.4f}, Z:{r1['cargo_motive'][2]:.4f}]")
@@ -668,8 +668,8 @@ def main():
                    angles='xy', scale_units='xy', scale=1, color='blue', width=0.008, 
                    label=f'AR Raw Vector ({d_ar_uncorr_len*100:.2f} cm)')
         
-        plt.xlabel('X (East) Position [m]', fontsize=11)
-        plt.ylabel('Y (North) Position [m]', fontsize=11)
+        plt.xlabel('X (North) Position [m]', fontsize=11)
+        plt.ylabel('Y (East) Position [m]', fontsize=11)
         plt.title('Cargo Horizontal Position and Displacement Comparison\n(Motive Ground Truth vs Raw AR Camera)', fontsize=13, fontweight='bold')
         plt.grid(True, linestyle='--', alpha=0.5)
         plt.legend(loc='lower left', fontsize=9)

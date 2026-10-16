@@ -51,8 +51,7 @@ AR-hook/
 | 座標系 | 説明 | 原点 | 軸定義 |
 |---|---|---|---|
 | **GPS / グローバル座標系** | 緯度・経度・高度 (WGS84) | 基準点 (`REF_LAT`, `REF_LON`, `REF_ALT`) | 度 (deg), メートル (m) |
-| **ローカルワールド座標系 (ENU)** | 東・北・上 (East-North-Up) | GPS 基準点をローカル原点に投影 | X(東), Y(北), Z(上) |
-| **Motive NED 座標系** | 北・東・下 (North-East-Down) | Motive キャリブレーション原点 | X(北), Y(東), Z(下) |
+| **ローカルワールド座標系 (NED)** | 北・東・下 (North-East-Down) | GPS 基準点またはMotive動的原点 | X(北), Y(東), Z(下) |
 | **機体ボディ座標系 (FRD)** | 機体前・右・下 (Front-Right-Down) | ドローン重心 | X(前), Y(右), Z(下) |
 | **OpenCV カメラ座標系** | カメラ光学視点 | カメラ光学中心 | X(右), Y(下), Z(光軸前) |
 | **荷物ローカル座標系** | 荷物中心基準 | 荷物中心 | X(右), Y(上), Z(垂直上) |
@@ -63,15 +62,15 @@ REF_LAT = 36.0757800   # 基準緯度 (deg)
 REF_LON = 136.2132900  # 基準経度 (deg)
 REF_ALT = 0.0          # 基準高度 (m)
 ```
-- **GPS → ローカル ENU 変換**:
+- **GPS → ローカル NED 変換**:
   $$
-  X_{ENU} = (\text{lon} - \text{REF\_LON}) \times 111319.5 \times \cos(\text{REF\_LAT})
-  $$
-  $$
-  Y_{ENU} = (\text{lat} - \text{REF\_LAT}) \times 111319.5
+  X_{NED} = (\text{lat} - \text{REF\_LAT}) \times 111319.5
   $$
   $$
-  Z_{ENU} = \text{alt} - \text{REF\_ALT}
+  Y_{NED} = (\text{lon} - \text{REF\_LON}) \times 111319.5 \times \cos(\text{REF\_LAT})
+  $$
+  $$
+  Z_{NED} = \text{REF\_ALT} - \text{alt}
   $$
 
 ---
@@ -100,7 +99,7 @@ REF_ALT = 0.0          # 基準高度 (m)
 | 27-30 | `float32` | `f` | Quaternion W ($q_w$) | Motive 姿勢クォータニオン |
 | 31-38 | `float64` | `d` | Unix Timestamp | 秒 (Motive 送信時刻) |
 
-### 4.3 Motive クォータニオンから NED / ENU への変換
+### 4.3 Motive クォータニオンから NED への変換
 Motive（左手系: $X=\text{北}, Y=\text{上}, Z=\text{東}$）から航空工学標準 NED（右手系: $X=\text{北}, Y=\text{東}, Z=\text{下}$）への変換:
 $$
 q_{ned} = [q_x,\ q_z,\ -q_y,\ q_w]
@@ -170,7 +169,7 @@ $$
 
 ### 6.2 座標変換パイプライン（Motive カメラ剛体 ID=3 優先）
 $$
-R_{total} = R_{ned \to enu} \cdot R_{body \to ned} \cdot R_{cv \to body} \cdot R_{camera\_rot\_offset}
+R_{total} = R_{body \to ned} \cdot R_{cv \to body} \cdot R_{camera\_rot\_offset}
 $$
 $$
 P_{world} = R_{total} \cdot (P_{cam} + \text{CAMERA\_OPTICAL\_OFFSET}) + T_{cam\_world}
@@ -187,27 +186,27 @@ $$
 
 ## 7. CSV ログフォーマット仕様
 
-`AR-hook1_test.py` が `~/LOGS_Pixhawk6c/YYYYMMDD_HHMMSS_1.csv` に出力する 63 列のログ構成:
+`AR-hook1_test.py` が `~/LOGS_Pixhawk6c/YYYYMMDD_HHMMSS_1.csv` に出力する 63 列のログ構成です。ワールド座標を記録するX/Y/Z列はN/E/D（北・東・下）の順です。
 
 | 列番号 | カラム名 | 単位 | 説明 |
 |---|---|---|---|
 | 1 | `Time` | s | Unix タイムスタンプ |
-| 2-4 | `GPS_X`, `GPS_Y`, `GPS_Z` | m | ドローン現在位置 (Pixhawk ENU) |
-| 5-7 | `Target_X`, `Target_Y`, `Target_Z` | m | ドローン誘導目標位置 (ENU) |
-| 8-10 | `Cargo_X`, `Cargo_Y`, `Cargo_Z` | m | 荷物中心推定ワールド座標 (ENU) |
+| 2-4 | `GPS_X`, `GPS_Y`, `GPS_Z` | m | ドローン現在位置 (NED: 北・東・下) |
+| 5-7 | `Target_X`, `Target_Y`, `Target_Z` | m | ドローン誘導目標位置 (NED) |
+| 8-10 | `Cargo_X`, `Cargo_Y`, `Cargo_Z` | m | 荷物中心推定ワールド座標 (NED) |
 | 11 | `Cargo_Detected` | 0/1 | 荷物検出フラグ |
 | 12 | `ID1_Detected` | 0/1 | 手先 ID1 マーカー検出フラグ |
 | 13-15 | `ID1_to_Cargo_DX/DY/DZ` | m | 荷物中心基準の手先 ID1 相対距離 |
 | 16-17 | `Est_Center_Cam_X/Y` | px | 荷物中心の画像中心からのピクセル偏差 |
-| 18-20 | `Motive_Drone_X/Y/Z` | m | Motive ドローン真値座標 (ID1) |
-| 21-23 | `Motive_Cargo_X/Y/Z` | m | Motive 荷物真値座標 (ID2-5) |
+| 18-20 | `Motive_Drone_X/Y/Z` | m | Motive ドローン真値座標 (ID1、NED) |
+| 21-23 | `Motive_Cargo_X/Y/Z` | m | Motive 荷物真値座標 (ID2-5、NED) |
 | 24-26 | `Motive_Rel_X/Y/Z` | m | 荷物座標系における相対位置真値 |
 | 27-29 | `Motive_Roll/Pitch/Yaw` | rad | Motive ドローン姿勢真値 |
-| 30-32 | `Motive_Camera_X/Y/Z` | m | Motive カメラ剛体位置真値 (ID3) |
+| 30-32 | `Motive_Camera_X/Y/Z` | m | Motive カメラ剛体位置真値 (ID3、NED) |
 | 33 | `Motive_Camera_Received` | 0/1 | Motive カメラ剛体データ受信フラグ |
 | 34-37 | `Motive_Camera_QX/QY/QZ/QW` | - | Motiveカメラ剛体の生クォータニオン |
 | 38 | `Motive_Camera_Pose_Time_s` | s | 姿勢パケットの送信時刻 |
-| 39-47 | `Motive_Camera_R00`–`R22` | - | カメラ座標からENUへの適用済み回転行列（行優先） |
+| 39-47 | `Motive_Camera_R00`–`R22` | - | カメラ座標からNEDへの適用済み回転行列（行優先） |
 | 48 | `Coord_Source` | string | 座標変換ソース (`Motive-Camera` / `IMU-Fallback` / `ArduPilot-Mag`) |
 | 49-51 | `Pixhawk_Roll/Pitch/Yaw` | rad | Pixhawk IMU 姿勢推定値 |
 | 52-54 | `Cargo_Cam_X/Y/Z` | m | カメラ座標系における荷物生値 |
@@ -215,7 +214,7 @@ $$
 | 58-60 | `Motive_Cargo_Cam_X/Y/Z` | m | Motive 荷物真値のカメラ座標系逆投影値 |
 | 61-63 | `Motive_Hand_Cam_X/Y/Z` | m | Motive 手先真値のカメラ座標系逆投影値 |
 
-Motive SDKはID1・ID2・カメラID3の位置・クォータニオンを専用UDPポート15770で全設定済みPiへ配信する。比較スクリプトは各行の適用済み回転行列を使ってカメラ相対XYZをENU（東・北・上）へ変換する。
+Motive SDKはID1・ID2・カメラID3の位置・クォータニオンを専用UDPポート15770で全設定済みPiへ配信する。比較スクリプトは各行の適用済み回転行列を使ってカメラ相対XYZをNED（北・東・下）へ変換する。
 
 ---
 
@@ -278,7 +277,7 @@ python3 camera-cal.py
 ---
 
 ### 8.5 ステップ 4: オプティカルオフセット校正 (`verify_displacement.py`)
-現行63列ログを2本読み込み、検出フラグ・有限なカメラ座標・受信済みのMotiveカメラ姿勢行列を使って解析します。Motive荷物位置がENU原点の `(0, 0, 0)` でも、Motiveカメラ座標への逆投影値が有効なら有効なサンプルとして扱います。旧ログでは姿勢行列がない場合に限り、旧方式の回転推定へフォールバックします。
+現行63列ログを2本読み込み、検出フラグ・有限なカメラ座標・受信済みのMotiveカメラ姿勢行列を使って解析します。Motive荷物位置がNED原点の `(0, 0, 0)` でも、Motiveカメラ座標への逆投影値が有効なら有効なサンプルとして扱います。旧ログでは姿勢行列がない場合に限り、旧方式の回転推定へフォールバックします。
 
 ```bash
 python3 verify_displacement.py <RUN1_LOG.csv> <RUN2_LOG.csv>
@@ -286,7 +285,7 @@ python3 verify_displacement.py <RUN1_LOG.csv> <RUN2_LOG.csv>
 - 各ログの `Motive_Camera_X/Y/Z_m` と `Motive_Camera_R00`–`R22` を使って、Motive荷物位置とARカメラ座標の残差を最適化します。記録済みカメラ姿勢行列は、CSV作成時点で適用済みのMotive姿勢・カメラ回転補正を含みます。
 - 既存の `camera_optical_offset.npz` がある場合、推定結果は現在値への残差として合成して保存します。出力の貼り付け用パラメーターも合成済みの置き換え値です。
 - カメラ姿勢の変化が5°未満の場合は6自由度補正を一意に推定できないため、校正とNPZ保存を中止します。異なる向きのデータを含むログを取得してください。
-- `Motive_Cargo_X/Y/Z_m` はログごとに設定された動的ENU原点に依存します。異なる起動時のログ間で世界座標の変位を比較するには、両ログの原点が共通であることを別途確認してください。
+- `Motive_Cargo_X/Y/Z_m` はログごとに設定された動的NED原点に依存します。異なる起動時のログ間で世界座標の変位を比較するには、両ログの原点が共通であることを別途確認してください。
 
 ---
 
@@ -323,7 +322,7 @@ python3 AR-hook1_test.py
                             │
                             ▼
 ┌────────────────────────────────────────────────────────┐
-│ 3. 離陸高度到達 (z ≥ 0.45m)                             │
+│ 3. 離陸高度到達 (z ≤ -0.45m)                            │
 │    - 自動追跡モードへ移行                              │
 │    - ArUco マーカー検出による目標値自動生成 (10Hz)     │
 │    - 荷物中心と手先マーカーの相対誘導                  │
@@ -341,9 +340,9 @@ python3 AR-hook1_test.py
 #### キーボード操作一覧:
 | キー | 機能 | 動作詳細 |
 |---|---|---|
-| `u` / `m` | Y 軸（南北）移動 | `u` = 南へ $-0.1\ \text{m}$, `m` = 北へ $+0.1\ \text{m}$ |
-| `h` / `l` | X 軸（東西）移動 | `h` = 東へ $+0.1\ \text{m}$, `l` = 西へ $-0.1\ \text{m}$ |
-| `w` / `z` | Z 軸（高度）昇降 | `w` = 上昇 $+0.1\ \text{m}$, `z` = 下降 $-0.1\ \text{m}$ |
+| `u` / `m` | X 軸（南北）移動 | `u` = 南へ $-0.1\ \text{m}$, `m` = 北へ $+0.1\ \text{m}$ |
+| `h` / `l` | Y 軸（東西）移動 | `h` = 東へ $+0.1\ \text{m}$, `l` = 西へ $-0.1\ \text{m}$ |
+| `w` / `z` | Z 軸（高度）昇降 | `w` = 上昇 $-0.1\ \text{m}$, `z` = 下降 $+0.1\ \text{m}$ |
 | `a` / `d` | ヨー角回転 | `a` = 反時計回り $-5^\circ$, `d` = 時計回り $+5^\circ$ |
 | `t` | 原点復帰 | 基準座標・目標高度へリセット |
 | `q` | 終了 | 制御停止、カメラ解放、CSV ログ保存 |

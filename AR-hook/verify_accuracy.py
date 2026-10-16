@@ -204,16 +204,16 @@ def main():
     
     print(f"GPS座標範囲:")
     if gps_x_valid:
-        print(f"  X (East):  [{min(gps_x_valid):8.2f}, {max(gps_x_valid):8.2f}] m")
+        print(f"  X (North): [{min(gps_x_valid):8.2f}, {max(gps_x_valid):8.2f}] m")
     if gps_y_valid:
-        print(f"  Y (North): [{min(gps_y_valid):8.2f}, {max(gps_y_valid):8.2f}] m")
+        print(f"  Y (East):  [{min(gps_y_valid):8.2f}, {max(gps_y_valid):8.2f}] m")
     if gps_z_valid:
-        print(f"  Z (Up):    [{min(gps_z_valid):8.2f}, {max(gps_z_valid):8.2f}] m")
+        print(f"  Z (Down):  [{min(gps_z_valid):8.2f}, {max(gps_z_valid):8.2f}] m")
     
     print(f"\nMotive ID1センサ（ドローン真値）座標範囲:")
-    print(f"  X (East):  [{min(mot_drone_x):8.2f}, {max(mot_drone_x):8.2f}] m")
-    print(f"  Y (North): [{min(mot_drone_y):8.2f}, {max(mot_drone_y):8.2f}] m")
-    print(f"  Z (Up):    [{min(mot_drone_z):8.2f}, {max(mot_drone_z):8.2f}] m")
+    print(f"  X (North): [{min(mot_drone_x):8.2f}, {max(mot_drone_x):8.2f}] m")
+    print(f"  Y (East):  [{min(mot_drone_y):8.2f}, {max(mot_drone_y):8.2f}] m")
+    print(f"  Z (Down):  [{min(mot_drone_z):8.2f}, {max(mot_drone_z):8.2f}] m")
     
     cargo_det_rate = sum(cargo_detected) / len(cargo_detected) * 100 if cargo_detected else 0
     id1_det_rate = sum(id1_detected) / len(id1_detected) * 100 if id1_detected else 0
@@ -296,9 +296,9 @@ def main():
     print("="*70)
     print(f"■ ✅ ドローン絶対位置誤差 (Pixhawk GPS - Motive ID1 Sensor) [m]")
     print(f"  基準: Motive ID1センサ（ドローン真値）")
-    print(f"  X (East)  - MAE: {drone_x_mae:7.4f}, RMSE: {drone_x_rmse:7.4f}, SD: {drone_x_std:7.4f}")
-    print(f"  Y (North) - MAE: {drone_y_mae:7.4f}, RMSE: {drone_y_rmse:7.4f}, SD: {drone_y_std:7.4f}")
-    print(f"  Z (Up)    - MAE: {drone_z_mae:7.4f}, RMSE: {drone_z_rmse:7.4f}, SD: {drone_z_std:7.4f}")
+    print(f"  X (North) - MAE: {drone_x_mae:7.4f}, RMSE: {drone_x_rmse:7.4f}, SD: {drone_x_std:7.4f}")
+    print(f"  Y (East)  - MAE: {drone_y_mae:7.4f}, RMSE: {drone_y_rmse:7.4f}, SD: {drone_y_std:7.4f}")
+    print(f"  Z (Down)  - MAE: {drone_z_mae:7.4f}, RMSE: {drone_z_rmse:7.4f}, SD: {drone_z_std:7.4f}")
     print(f"  3D Total  - MAE: {drone_3d_mae:7.4f}, RMSE: {drone_3d_rmse:7.4f}, SD: {drone_3d_std:7.4f}")
     print("-" * 70)
     print(f"■ ✅ カメラ相対距離誤差 (ArUco Camera - Motive ID1 True Value) [m]")
@@ -331,10 +331,10 @@ def main():
         mot_drone_y_plot = [mot_drone_y[i] for i in indices_valid]
         
         # 1. ドローン位置の比較 (X, Y - 正規化後)
-        axs[0].plot(time_sec_valid, gps_x_plot, 'r--', label='Pixhawk GPS X (East)', alpha=0.8, linewidth=1.5)
-        axs[0].plot(time_sec_valid, mot_drone_x_plot, 'r-', label='Motive ID1 X (East) [True]', alpha=0.8, linewidth=2)
-        axs[0].plot(time_sec_valid, gps_y_plot, 'b--', label='Pixhawk GPS Y (North)', alpha=0.8, linewidth=1.5)
-        axs[0].plot(time_sec_valid, mot_drone_y_plot, 'b-', label='Motive ID1 Y (North) [True]', alpha=0.8, linewidth=2)
+        axs[0].plot(time_sec_valid, gps_x_plot, 'r--', label='Pixhawk GPS X (North)', alpha=0.8, linewidth=1.5)
+        axs[0].plot(time_sec_valid, mot_drone_x_plot, 'r-', label='Motive ID1 X (North) [True]', alpha=0.8, linewidth=2)
+        axs[0].plot(time_sec_valid, gps_y_plot, 'b--', label='Pixhawk GPS Y (East)', alpha=0.8, linewidth=1.5)
+        axs[0].plot(time_sec_valid, mot_drone_y_plot, 'b-', label='Motive ID1 Y (East) [True]', alpha=0.8, linewidth=2)
         axs[0].set_ylabel('Position [m]', fontsize=11)
         axs[0].set_title('✅ Drone Absolute Position (Pixhawk GPS vs Motive ID1 Sensor)', fontsize=12, fontweight='bold')
         axs[0].grid(True, alpha=0.3)

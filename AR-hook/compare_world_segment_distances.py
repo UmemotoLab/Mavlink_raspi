@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """Compare AR and Motive segment lengths and XYZ components from experiment logs.
 
-New logs store the camera-to-ENU rotation matrix and are compared in ENU.
+Current logs store the camera-to-NED rotation matrix and are compared in NED.
 Older logs without that matrix retain camera-frame XYZ output.
 """
 import argparse
@@ -131,7 +131,7 @@ def load_samples(path):
                 "line": line_number,
                 "distances": distances,
                 "components": components,
-                "coordinate_frame": "ENU" if has_world_rotation else "Camera",
+                "coordinate_frame": "NED" if has_world_rotation else "Camera",
             })
 
     return samples, not_detected, invalid
@@ -221,9 +221,9 @@ def main():
             f"検出フラグあり・座標不正で除外: {result['invalid']}"
         )
         coordinate_frame = result["samples"][0]["coordinate_frame"]
-        if coordinate_frame == "ENU":
-            print("XYZ成分はMotiveカメラ姿勢と取り付け補正を適用したENU（東・北・上）です。")
-            component_label = "ENU世界座標系"
+        if coordinate_frame == "NED":
+            print("XYZ成分はMotiveカメラ姿勢と取り付け補正を適用したNED（北・東・下）です。")
+            component_label = "NED世界座標系"
         else:
             print("XYZ成分はカメラ座標系です（CSVに適用済みカメラ回転行列がありません）。")
             component_label = "カメラ座標系"
