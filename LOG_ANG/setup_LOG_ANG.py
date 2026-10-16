@@ -20,8 +20,11 @@ LOG_ANG: 高周期ANGログ設定スクリプト（読み取り・確認・適�
   2. python3 setup_LOG_ANG.py を実行し、表示される確認プロンプトに従う
   3. 最終確認の LOG_BITMASK/LOG_FILE_RATEMAX の読戻し値を目視確認する
 
-安全: --check は接続・書込みを一切行わない。通常実行も EEPROM 保存前に
+安全: --check は接続・書込みを一切行わない。通常実行も適用前に
 確認表示を行い、詳細は README.md に記載。
+保存: ArduPilot標準のPARAM_SET自動保存に任せ、明示の保存コマンドは
+送信しない。設定後は保存待機＋読み戻しで確認するが、電源再投入後の
+永続化を本スクリプトが保証するものではない。
 """
 
 from pymavlink import mavutil
@@ -477,37 +480,10 @@ print("\n" + "="*60)
 print(f"初期設定完了: {success_count}/{total} 成功")
 print("="*60)
 
-# FC側の処理完了を待つ
-print("\nFC側の処理完了を待機中...")
+# ArduPilot標準: PARAM_SETはFC側で自動保存されるため、明示の保存コマンドは送信しない。
+# フラッシュ書き込み完了を待ってから読み戻しで確認する。
+print("\nFC側の自動保存完了を待機中...")
 time.sleep(3)
-
-# EEPROM保存
-print("\n設定をEEPROMに保存中...")
-master.mav.command_long_send(
-    master.target_system,
-    master.target_component,
-    mavutil.mavlink.MAV_CMD_PREFLIGHT_STORAGE,
-    0,
-    1,  # Write parameters
-    0, 0, 0, 0, 0, 0
-)
-
-ack = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=10)
-eeprom_saved = False
-
-if ack and ack.command == mavutil.mavlink.MAV_CMD_PREFLIGHT_STORAGE:
-    if ack.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
-        print("✅ EEPROMへの保存成功")
-        eeprom_saved = True
-    elif ack.result == 2:  # DENIED
-        print("❌ EEPROMへの保存が拒否されました")
-        print("   ※ 機体をディスアームして再度実行してください")
-    else:
-        print(f"⚠️ 予期しない結果: {ack.result}")
-else:
-    print("⚠️ ACKを受信できませんでした")
-
-time.sleep(2)
 
 # 不一致パラメータの確認と再設定
 if failed_params:
@@ -524,22 +500,9 @@ if failed_params:
         else:
             print(f"  ❌ 再設定失敗: {received_value}")
 
-    # 再保存
-    print("\n再度EEPROMに保存中...")
-    master.mav.command_long_send(
-        master.target_system,
-        master.target_component,
-        mavutil.mavlink.MAV_CMD_PREFLIGHT_STORAGE,
-        0,
-        1,
-        0, 0, 0, 0, 0, 0
-    )
-
-    ack = master.recv_match(type='COMMAND_ACK', blocking=True, timeout=5)
-    if ack and ack.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
-        print("✅ 再保存成功")
-    else:
-        print("⚠️ 再保存でエラーが発生")
+    # 再設定分があれば自動保存の完了を待ってから最終確認へ進む。
+    print("\n再設定分の自動保存完了を待機中...")
+    time.sleep(2)
 
 # 最終確認
 print("\n" + "="*60)
@@ -585,11 +548,11 @@ print("="*60)
 
 if final_failed:
     print(f"\n❌ {len(final_failed)}個のパラメータが正しく設定できませんでした")
+    print("   （読み戻し不一致のため、自動保存の成否は未確認。必要なら再実行すること）")
 else:
-    if eeprom_saved:
-        print("\n✅ 全てのパラメータが正しく設定され、EEPROMに保存されました！")
-        print("   （LOG_ANG: EKF/setup_EKF_Observer4.py 由来、ログ設定のみ変更）")
-    else:
-        print("\n⚠️ パラメータはRAM内に設定されていますが、EEPROMへの保存に失敗しました")
+    print("\n✅ 全てのパラメータが読み戻しで一致を確認しました")
+    print("   （LOG_ANG: EKF/setup_EKF_Observer4.py 由来、ログ設定のみ変更）")
+    print("   ※ 確認したのは現在のFC設定値との一致であり、電源再投入後の永続化を保証するものではない。")
+    print("   ※ 永続化を確認する場合は再起動後に読戻しを行うこと。")
 
 print("\n完了")
