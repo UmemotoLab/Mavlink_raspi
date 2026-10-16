@@ -1,7 +1,14 @@
-# EKF Observer4 パラメータ メモリバンク
+# EKF Observer パラメータ メモリバンク
 
-> **最終更新**: 2026-06-09  
-> **管理対象**: `EKF/setup_EKF_Observer4.py`
+> **最終更新**: 2026-10-17  
+> **管理対象**: `EKF/setup_EKF_Observer5.py`
+
+> **移行メモ (2026-10-17)**: `ekf-V2` ファームウェア更新に伴い、旧名 26 件の置換・
+> SI 単位化・スケール変更を行った `EKF/setup_EKF_Observer5.py` が現行の設定スクリプトです。
+> 旧 `EKF/setup_EKF_Observer4.py` は `EKF/archive/` へ移動済みで、本ファイルの
+> 「安定版コミット情報」以降の記述は Observer4 時点 (2026-06-09) の履歴的記録です。
+> 現行のパラメータ生成規則は `EKF/PARAMETER_GENERATION_RULES.md`、RTK 運用時の
+> 対になるプロファイルは `RTK/setup_RTK_V2.py` を参照してください。
 
 ---
 
@@ -109,7 +116,7 @@ EK3_POSNE_M_NSE=0.1 → GPSを信用しすぎて即追従
 
 ## 4. 結論・教訓
 
-### Observer4 パラメータ変更時の鉄則
+### Observer パラメータ変更時の鉄則（Observer4 で確立、Observer5 も同じ）
 
 | # | ルール | 理由 |
 |---|--------|------|
