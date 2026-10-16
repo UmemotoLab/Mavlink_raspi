@@ -8,6 +8,10 @@ Observer5: 現行ファーム向け EKF Observer パラメータ設定スクリ�
 単発読み直しをやめて PARAM_REQUEST_LIST のキャッシュ照合 + 総時間上限で
 高速に検証する（--check 既定）。実書き込みは --write のみで、--check は
 読み取り専用。PARAM_SET時にFCが自動保存するため明示保存コマンドは送らない。電源再投入後の保持は未検証。
+完全プロファイル: RTK/setup_RTK_V2.py とキー集合一致の157項目。値差分は
+GPS/CAN/コンパス方位の9項目のみで、交互実行時は本スクリプトとRTK V2を
+入れ替えるだけで切替えできる（GPS1_TYPE 14、GPS2_TYPE 0、CAN無効、
+GPS_INJECT_TO 0、SERIAL1_BAUD 1000000）。
 """
 
 from pymavlink import mavutil
@@ -103,10 +107,24 @@ params_to_set = {
     'EK3_CHECK_SCALE': (100, 'AP_Int16', 'EKFチェックスケール [%]'),
     'EK3_PRIMARY': (-1, 'AP_Int8', '自動切り替え無効'),
 
-    # === GPS設定 ===
-    'GPS1_TYPE': (14, 'AP_Int8', 'MAVLink GPS Input'),
+    # === GPS/CAN設定（Observer運用: MAVLink GPS入力。CAN無効、注入なし） ===
+    # 完全プロファイル: RTK V2とキー集合一致。値差分9項目のうちGPS/CAN側5項目は
+    # GPS1_TYPE / GPS1_CAN_NODEID / GPS_INJECT_TO / CAN_P1_DRIVER / CAN_D1_PROTOCOL。
+    # 残り4項目の差分はコンパス方位（COMPASS_USE / COMPASS_USE2 / COMPASS_LEARN /
+    # EK3_SRC1_YAW）。それ以外のキーはRTK V2と値・型が同一。
+    'GPS1_TYPE': (14, 'AP_Int8', 'MAVLink GPS Input（Observer運用）'),
+    'GPS2_TYPE': (0, 'AP_Int8', 'GPS2無効（両プロファイル共通）'),
+    'GPS1_CAN_NODEID': (0, 'AP_Int8', 'DroneCAN不使用のため0（基準ファイル値0; RTK値は125）'),
     'GPS_AUTO_CONFIG': (0, 'AP_Int8', '自動設定無効'),
+    'GPS_SAVE_CFG': (0, 'AP_Int8', 'GPSへのCFG保存無効（F9Pへ書かない; 基準ファイル値2から安全側へ変更）'),
+    'GPS1_GNSS_MODE': (0, 'AP_Int8', 'GPS1 GNSSモード既定（基準ファイル値0）'),
+    'GPS_INJECT_TO': (0, 'AP_Int8', 'RTCM注入受付なし（Observer運用; RTK値は127）'),
     'GPS_PRIMARY': (0, 'AP_Int8', 'プライマリGPS'),
+    'GPS_AUTO_SWITCH': (0, 'AP_Int8', 'GPS自動切替無効（両プロファイル共通）'),
+    'GPS_DRV_OPTIONS': (0, 'AP_Int8', 'デフォルト（両プロファイル共通）'),
+    # === CAN設定（FC側バスのみ。Observer運用では無効） ===
+    'CAN_P1_DRIVER': (0, 'AP_Int8', 'CAN1ポート無効（Observer運用; RTK値は1）'),
+    'CAN_D1_PROTOCOL': (0, 'AP_Int8', 'DroneCAN無効（Observer運用; RTK値は1）'),
 
     # === Guidedモード設定 ===
     'WP_SPD_UP': (0.4, 'AP_Float', '上昇速度 [m/s]（旧WPNAV_SPEED_UP 40.0cm/s相当）'),

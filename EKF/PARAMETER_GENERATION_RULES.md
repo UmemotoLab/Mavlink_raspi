@@ -12,10 +12,14 @@ Observer5 の対応ファームウェアは `ekf-V2` である。以下を同一
 | ファームウェア取得元 | `Ardupilot-UmemotoLab-ekf-V2` リポジトリ |
 | ブランチ / コミット | `master` / `801e6ef9ec85f785ce279f413a7313988ba9d8a8` |
 | 基準パラメータファイル | `/home/taki/Downloads/Full-Params_ekf_V2.param`（1064 項目） |
-| 対象スクリプト | `EKF/setup_EKF_Observer5.py`（148 項目を書き込む） |
+| 対象スクリプト | `EKF/setup_EKF_Observer5.py`（157 項目を書き込む） |
 | 検証スクリプト | `EKF/test_observer5_params.py`（ハードウェア不要） |
 
-基準パラメータファイルは `ekf-V2` 搭載機から読み出したものである。Observer5 の 148 項目は全てこのファイルに存在し、値の不一致は 0 件である。この照合は `EKF/test_observer5_params.py::test_values_match_v2` が実行する。
+基準パラメータファイルは `ekf-V2` 搭載機から読み出したものである。Observer5 の 157 項目は全てこのファイルに存在する。値の照合は `EKF/test_observer5_params.py::test_values_match_v2` が実行する。ただし完全プロファイル化に伴う意図的乖離 4 項目（`GPS_SAVE_CFG` 2→0、`GPS_INJECT_TO` 127→0、`CAN_P1_DRIVER` 1→0、`CAN_D1_PROTOCOL` 1→0）は基準ファイル値と一致しない。いずれも Observer 運用（MAVLink GPS 入力、CAN 無効、注入なし、F9P へ書かない）に合わせた安全側の選択であり、`test_observer5_params.py::test_observer_profile_values` が Observer 側の値を固定する。
+
+## 完全プロファイル（RTK V2 との交互実行）
+
+Observer5 は `RTK/setup_RTK_V2.py` とキー集合一致の 157 項目である。値差分は GPS/CAN/コンパス方位の 9 項目（`GPS1_TYPE` / `GPS1_CAN_NODEID` / `GPS_INJECT_TO` / `CAN_P1_DRIVER` / `CAN_D1_PROTOCOL` / `COMPASS_USE` / `COMPASS_USE2` / `COMPASS_LEARN` / `EK3_SRC1_YAW`）のみで、それ以外のキーは値・型が同一である。交互実行時は両スクリプトを入れ替えるだけで切替えできる。Observer 側は `GPS1_TYPE` 14 / `GPS2_TYPE` 0 / CAN 無効 / `GPS_INJECT_TO` 0 / `SERIAL1_BAUD` 1000000、RTK 側は `GPS1_TYPE` 9 / `GPS2_TYPE` 0 / CAN1 / `GPS_INJECT_TO` 127 / `SERIAL1_BAUD` 1000000 で、両方とも `SERIAL1_BAUD` は 1000000 である。RTK 側の方位設定は `RTK/setup_RTK_V1.py` の外付コンパス 2 構成（`EK3_SRC1_YAW` 1、`COMPASS_USE` 0、`COMPASS_USE2` 1、`COMPASS_LEARN` 0）を採用する。キー集合一致と差分限定は `EKF/test_observer5_params.py::test_complete_profile_keys_match_rtk_v2` が実行する。
 
 `ekf`（V1）との互換性、および他のファームウェアとの互換性は検証していない。V1 のパラメータファイルで Observer5 を実行した場合の一致は保証しない。
 
@@ -149,11 +153,11 @@ $$f = \frac{1}{2\pi}\sqrt{\frac{g}{L}}, \qquad \omega = 2\pi f$$
 
 ### 書き込み対象外の項目
 
-基準パラメータファイルの 1064 項目のうち 916 項目は Observer5 が書き込まない。これらはファームウェア既定値または別途設定した値を保持する。該当例は `EK3_ALT_SOURCE`, `LOIT_OPTIONS`, `PSC_D_JERK`, `WP_YAW_BEHAVIOR` である。書き込み対象外の項目は `--check` の一致判定および不一致判定の対象にならない。
+基準パラメータファイルの 1064 項目のうち 907 項目は Observer5 が書き込まない。これらはファームウェア既定値または別途設定した値を保持する。該当例は `EK3_ALT_SOURCE`, `LOIT_OPTIONS`, `PSC_D_JERK`, `WP_YAW_BEHAVIOR` である。書き込み対象外の項目は `--check` の一致判定および不一致判定の対象にならない。
 
 ## 採用パラメータ一覧
 
-採用した 148 項目を機能別に示す。型の内訳は `AP_Float` 73 件、`AP_Int8` 42 件、`AP_Int16` 24 件、`AP_Int32` 9 件である。
+採用した 157 項目を機能別に示す。型の内訳は `AP_Float` 73 件、`AP_Int8` 51 件、`AP_Int16` 24 件、`AP_Int32` 9 件である。
 
 ### EKF3基本設定（3件）
 
@@ -214,13 +218,24 @@ $$f = \frac{1}{2\pi}\sqrt{\frac{g}{L}}, \qquad \omega = 2\pi f$$
 | `EK3_CHECK_SCALE` | `100` | `AP_Int16` |
 | `EK3_PRIMARY` | `-1` | `AP_Int8` |
 
-### GPS設定（3件）
+### GPS/CAN設定（12件）
 
 | パラメータ | 値 | 型 |
 |---|---|---|
 | `GPS1_TYPE` | `14` | `AP_Int8` |
+| `GPS2_TYPE` | `0` | `AP_Int8` |
+| `GPS1_CAN_NODEID` | `0` | `AP_Int8` |
 | `GPS_AUTO_CONFIG` | `0` | `AP_Int8` |
+| `GPS_SAVE_CFG` | `0` | `AP_Int8` |
+| `GPS1_GNSS_MODE` | `0` | `AP_Int8` |
+| `GPS_INJECT_TO` | `0` | `AP_Int8` |
 | `GPS_PRIMARY` | `0` | `AP_Int8` |
+| `GPS_AUTO_SWITCH` | `0` | `AP_Int8` |
+| `GPS_DRV_OPTIONS` | `0` | `AP_Int8` |
+| `CAN_P1_DRIVER` | `0` | `AP_Int8` |
+| `CAN_D1_PROTOCOL` | `0` | `AP_Int8` |
+
+Observer 運用では `GPS1_TYPE` 14（MAVLink GPS 入力）、`GPS2_TYPE` 0、`GPS1_CAN_NODEID` 0（基準ファイル値 0）、`GPS_INJECT_TO` 0（注入なし）、CAN 無効（`CAN_P1_DRIVER` 0 / `CAN_D1_PROTOCOL` 0）とする。`GPS_SAVE_CFG` は基準ファイル値 2 に対し安全側の 0 を採用する（F9P へ書かない）。
 
 ### Guidedモード設定（9件）
 
@@ -439,7 +454,7 @@ $$f = \frac{1}{2\pi}\sqrt{\frac{g}{L}}, \qquad \omega = 2\pi f$$
 
 1. 機体を USB またはラズパイ UART で接続する。
 2. 読み取り専用で現状を照合する。`python setup_EKF_Observer5.py --check` を実行する。引数なしでも `--check` と同じ動作になる。
-3. 照合結果を確認する。全 148 項目が一致すると終了コード 0 で終わる。値不一致または不在があると該当項目を表示して終了コード 1 で終わる。
+3. 照合結果を確認する。全 157 項目が一致すると終了コード 0 で終わる。値不一致または不在があると該当項目を表示して終了コード 1 で終わる。
 4. 書き込む場合は `python setup_EKF_Observer5.py --write` を実行する。書き込みは 1 項目ごとに `PARAM_SET` を送り、`PARAM_VALUE` の読戻し値を比較して最大 5 回まで再試行する。
 5. 書き込み後に不一致が残った項目は、`max_retries=3` で再設定する。
 6. 最後に `PARAM_REQUEST_LIST` によるキャッシュ照合で全項目を再確認する。
@@ -469,7 +484,7 @@ $$f = \frac{1}{2\pi}\sqrt{\frac{g}{L}}, \qquad \omega = 2\pi f$$
 
 1. `PARAM_SET` 後の自動保存は ArduPilot の仕様であり、Observer5 はスクリプトから保存コマンドを送らない。
 2. 電源再投入後の値保持は未検証である。スクリプトの成功メッセージもこの点を明記する。
-3. 再投入後の保持を確認する手順は、再投入後に `python setup_EKF_Observer5.py --check` を実行し、全 148 項目の一致を確認する方法である。この確認結果は未取得である。
+3. 再投入後の保持を確認する手順は、再投入後に `python setup_EKF_Observer5.py --check` を実行し、全 157 項目の一致を確認する方法である。この確認結果は未取得である。
 4. EEPROM への保存成功を断定する表示は削除済みである。断定表示の不在は `EKF/test_observer5_params.py::test_no_misleading_eeprom_message` が確認する。
 
 ## 危険項目
@@ -536,3 +551,4 @@ Observer4 の安定性分析は `EKF/MEMORY_BANK.md` に記録されている。
 | 日付 | 内容 |
 |---|---|
 | 2026-10-16 | 初版作成。Observer5 の生成・選定規則、更新手順、USB 検証、永続化確認、危険項目を記録した。 |
+| 2026-10-17 | 完全プロファイル化。Observer5 を RTK V2 とキー集合一致の 157 項目に拡張し、値差分を GPS/CAN/コンパス方位の 9 項目に限定した。Observer 側は GPS1_TYPE 14 / GPS2_TYPE 0 / CAN 無効 / GPS_INJECT_TO 0 / SERIAL1_BAUD 1000000。RTK 側の方位は V1 の外付コンパス 2 構成（YAW1+USE0/USE2=1/LEARN0）を採用した。 |

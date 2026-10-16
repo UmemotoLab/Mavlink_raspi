@@ -10,6 +10,9 @@ live-scan evidence (/tmp/live_scan.txt):
    (26 missing items resolve in well under the budget).
 6. No MAV_CMD_PREFLIGHT_STORAGE explicit-save command remains.
 7. No misleading EEPROM-saved/persisted success message remains.
+8. Complete profile: 157 items with key set identical to RTK/setup_RTK_V2.py;
+   value diff limited to 9 GPS/CAN/compass items. Observer side asserts
+   GPS1_TYPE 14 / GPS2_TYPE 0 / CAN0 / RTCM注入0 / SERIAL1_BAUD 1000000.
 """
 import ast
 import os
@@ -19,6 +22,7 @@ import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OBS5 = os.path.join(REPO, "EKF", "setup_EKF_Observer5.py")
+RTKV2 = os.path.join(REPO, "RTK", "setup_RTK_V2.py")
 V2 = "/home/taki/Downloads/Full-Params_ekf_V2.param"
 
 OLD26 = """WPNAV_SPEED_UP WPNAV_SPEED_DN WPNAV_ACCEL_Z WPNAV_SPEED WPNAV_ACCEL
@@ -70,6 +74,20 @@ def load_params():
         if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == "params_to_set":
             return ast.literal_eval(node.value)
     raise AssertionError("params_to_set not found")
+
+
+def load_params_path(path):
+    src = open(path, encoding="utf-8").read()
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == "params_to_set":
+            return ast.literal_eval(node.value)
+    raise AssertionError(f"params_to_set not found in {path}")
+
+
+EXPECTED_DIFF9 = {"GPS1_TYPE", "GPS1_CAN_NODEID", "GPS_INJECT_TO",
+                  "CAN_P1_DRIVER", "CAN_D1_PROTOCOL", "COMPASS_USE",
+                  "COMPASS_USE2", "COMPASS_LEARN", "EK3_SRC1_YAW"}
 
 
 def load_v2():
@@ -149,6 +167,27 @@ def test_no_misleading_eeprom_message():
     assert "RAM内に設定されていますが" not in src, "RAM/EEPROMの誤解表示が残っている"
     assert "再保存" not in src, "再保存の表示が残っている"
     assert "電源再投入後の保持は未検証" in src, "再投入未検証の明記がない"
+
+
+def test_complete_profile_keys_match_rtk_v2():
+    obs = load_params()
+    rtk = load_params_path(RTKV2)
+    assert len(obs) == 157, f"Observer5 changed? {len(obs)}"
+    assert set(obs) == set(rtk), (
+        f"key set mismatch: only obs={sorted(set(obs) - set(rtk))} "
+        f"only rtk={sorted(set(rtk) - set(obs))}")
+    diff = sorted(n for n in obs if obs[n][:2] != rtk[n][:2])
+    assert diff == sorted(EXPECTED_DIFF9), f"value diff not limited to 9: {diff}"
+
+
+def test_observer_profile_values():
+    params = load_params()
+    assert params["GPS1_TYPE"][:2] == (14, "AP_Int8"), params["GPS1_TYPE"]
+    assert params["GPS2_TYPE"][:2] == (0, "AP_Int8"), params["GPS2_TYPE"]
+    assert params["CAN_P1_DRIVER"][:2] == (0, "AP_Int8"), params["CAN_P1_DRIVER"]
+    assert params["CAN_D1_PROTOCOL"][:2] == (0, "AP_Int8"), params["CAN_D1_PROTOCOL"]
+    assert params["GPS_INJECT_TO"][:2] == (0, "AP_Int8"), params["GPS_INJECT_TO"]
+    assert params["SERIAL1_BAUD"][:2] == (1000000, "AP_Int32"), params["SERIAL1_BAUD"]
 
 
 if __name__ == "__main__":

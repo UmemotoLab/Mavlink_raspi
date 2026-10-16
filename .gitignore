@@ -1,2 +1,4 @@
 No1/__pycache__/setup_ELRS_6.cpython-312.pyc
 AR-hook/__pycache__/AR-hook1.cpython-311.pyc
+__pycache__/
+*.pyc
