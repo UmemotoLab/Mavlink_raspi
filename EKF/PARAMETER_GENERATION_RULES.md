@@ -468,11 +468,13 @@ Observer 運用では `GPS1_TYPE` 14（MAVLink GPS 入力）、`GPS2_TYPE` 0、`
 | 入力または指定 | デバイス | ボーレート | `rtscts` |
 |---|---|---|---|
 | 対話入力 `y` | `/dev/ttyACM0` | `--baud-usb`（既定 115200） | `False` |
-| 対話入力 `n` | `/dev/ttyAMA0` | `1000000` | `True` |
+| 対話入力 `n` | `/dev/ttyAMA0` | `SERIAL1_BAUD`（=1000000） | `True` |
 | `--device /dev/ttyACM0` | 指定値 | `--baud-usb`（既定 115200） | `False` |
-| `--device /dev/ttyAMA0` | 指定値 | `1000000` | `True` |
+| `--device /dev/ttyAMA0` | 指定値 | `SERIAL1_BAUD`（=1000000） | `True` |
 
 `--device` に `ACM` を含む場合は USB とみなし、含まない場合は UART とみなす。対話入力を使わない検証では `--device` を明示する。
+
+UART 側のボーレートは設定辞書を単一の出典とする。`UART_BAUD = int(params_to_set['SERIAL1_BAUD'][0])` を読み、`resolve_connection()` に渡す。接続ブロックに数値を直書きすると、片側だけ変更してリンクが繋がらなくなるため、ここは必ず辞書に追従させる。USB 側の `--baud-usb` は CDC-ACM ではファームが指定を無視する名目値である。この対応は `EKF/test_observer5_params.py::test_uart_baud_follows_serial1_baud` が検証する。
 
 接続後はハートビートを待ち、`--check` では読み取り専用の照合のみを行う。検証は `PARAM_REQUEST_LIST` で全項目を一括取得し、辞書照合する方式である。項目ごとの直列タイムアウトを行わないため、現行ファームに存在しない項目を含んでいても待ち時間が増えない。照合の総時間上限は `--verify-budget`（既定 60 秒）で制限する。
 

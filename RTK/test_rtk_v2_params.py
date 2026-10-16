@@ -20,6 +20,9 @@ and /home/taki/Downloads/Full-Params_ekf_V2.param:
 10. No misleading EEPROM-saved/persisted success message remains.
 11. Default mode is read-only check; --write is required for writes.
 12. 2026-10-17付の実機確認TODOが残っている。
+13. Connection baud follows the profile: the /dev/ttyAMA0 (TELEM1) path derives
+    its baud from params_to_set['SERIAL1_BAUD'], and no literal baud is left in
+    the connection block.
 """
 import ast
 import os
@@ -64,6 +67,16 @@ def load_verify_fns():
     return ns["verify_all_cached"]
 
 
+def load_resolve_connection():
+    """Exec only resolve_connection (no MAVLink connection)."""
+    src = open(RTKV2, encoding="utf-8").read()
+    m = re.search(r"(def resolve_connection\(.*?)\n\n\n", src, re.S)
+    assert m, "resolve_connection not found"
+    ns = {"input": input}
+    exec(m.group(1), ns)
+    return ns["resolve_connection"]
+
+
 # Complete profile: identical key sets, diff limited to 9 GPS/CAN/compass items.
 EXPECTED_DIFF9 = {"GPS1_TYPE", "GPS1_CAN_NODEID", "GPS_INJECT_TO",
                   "CAN_P1_DRIVER", "CAN_D1_PROTOCOL", "COMPASS_USE",
@@ -94,6 +107,22 @@ def test_rtk_profile_values():
     assert params["COMPASS_USE"][:2] == (0, "AP_Int8"), params["COMPASS_USE"]
     assert params["COMPASS_USE2"][:2] == (1, "AP_Int8"), params["COMPASS_USE2"]
     assert params["COMPASS_LEARN"][:2] == (0, "AP_Int8"), params["COMPASS_LEARN"]
+
+
+def test_uart_baud_follows_serial1_baud():
+    params = load_params(RTKV2)
+    src = open(RTKV2, encoding="utf-8").read()
+    assert "UART_BAUD = int(params_to_set['SERIAL1_BAUD'][0])" in src, \
+        "接続baudが設定辞書のSERIAL1_BAUDから導出されていない"
+    block = src[src.index("def resolve_connection"):src.index("master.wait_heartbeat()")]
+    assert "1000000" not in block, "接続ブロックにbaudのハードコードが残っている"
+    resolve = load_resolve_connection()
+    uart_baud = params["SERIAL1_BAUD"][0]
+    # UART (/dev/ttyAMA0) 経路は SERIAL1_BAUD、USB 経路は --baud-usb を使う
+    assert resolve("auto", 115200, uart_baud, lambda _msg: "y") == ("/dev/ttyACM0", 115200, False)
+    assert resolve("auto", 115200, uart_baud, lambda _msg: "n") == ("/dev/ttyAMA0", 1000000, True)
+    assert resolve("/dev/ttyACM0", 115200, uart_baud) == ("/dev/ttyACM0", 115200, False)
+    assert resolve("/dev/ttyAMA0", 115200, uart_baud) == ("/dev/ttyAMA0", 1000000, True)
 
 
 V1P = os.path.join(REPO, "setup_RTK_V1.py")

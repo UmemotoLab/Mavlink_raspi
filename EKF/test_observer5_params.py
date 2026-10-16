@@ -13,6 +13,9 @@ live-scan evidence (/tmp/live_scan.txt):
 8. Complete profile: 157 items with key set identical to RTK/setup_RTK_V2.py;
    value diff limited to 9 GPS/CAN/compass items. Observer side asserts
    GPS1_TYPE 14 / GPS2_TYPE 0 / CAN0 / RTCM注入0 / SERIAL1_BAUD 1000000.
+9. Connection baud follows the profile: the /dev/ttyAMA0 (TELEM1) path derives
+   its baud from params_to_set['SERIAL1_BAUD'], and no literal baud is left in
+   the connection block.
 """
 import ast
 import os
@@ -111,6 +114,16 @@ def load_verify_fns():
     return ns["verify_all_cached"]
 
 
+def load_resolve_connection():
+    """Exec only resolve_connection (no MAVLink connection)."""
+    src = open(OBS5, encoding="utf-8").read()
+    m = re.search(r"(def resolve_connection\(.*?)\n\n\n", src, re.S)
+    assert m, "resolve_connection not found"
+    ns = {"input": input}
+    exec(m.group(1), ns)
+    return ns["resolve_connection"]
+
+
 def test_old_names_absent():
     params = load_params()
     left = [n for n in OLD26 if n in params]
@@ -188,6 +201,22 @@ def test_observer_profile_values():
     assert params["CAN_D1_PROTOCOL"][:2] == (0, "AP_Int8"), params["CAN_D1_PROTOCOL"]
     assert params["GPS_INJECT_TO"][:2] == (0, "AP_Int8"), params["GPS_INJECT_TO"]
     assert params["SERIAL1_BAUD"][:2] == (1000000, "AP_Int32"), params["SERIAL1_BAUD"]
+
+
+def test_uart_baud_follows_serial1_baud():
+    params = load_params()
+    src = open(OBS5, encoding="utf-8").read()
+    assert "UART_BAUD = int(params_to_set['SERIAL1_BAUD'][0])" in src, \
+        "接続baudが設定辞書のSERIAL1_BAUDから導出されていない"
+    block = src[src.index("def resolve_connection"):src.index("master.wait_heartbeat()")]
+    assert "1000000" not in block, "接続ブロックにbaudのハードコードが残っている"
+    resolve = load_resolve_connection()
+    uart_baud = params["SERIAL1_BAUD"][0]
+    # UART (/dev/ttyAMA0) 経路は SERIAL1_BAUD、USB 経路は --baud-usb を使う
+    assert resolve("auto", 115200, uart_baud, lambda _msg: "y") == ("/dev/ttyACM0", 115200, False)
+    assert resolve("auto", 115200, uart_baud, lambda _msg: "n") == ("/dev/ttyAMA0", 1000000, True)
+    assert resolve("/dev/ttyACM0", 115200, uart_baud) == ("/dev/ttyACM0", 115200, False)
+    assert resolve("/dev/ttyAMA0", 115200, uart_baud) == ("/dev/ttyAMA0", 1000000, True)
 
 
 if __name__ == "__main__":

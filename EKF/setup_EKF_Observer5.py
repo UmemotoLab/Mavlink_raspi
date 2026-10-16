@@ -33,21 +33,6 @@ parser.add_argument("--verify-budget", type=float, default=60.0, help="verify ph
 args = parser.parse_args()
 WRITE_MODE = bool(args.write)
 
-# 接続設定
-if args.device == "auto":
-    ans = input("USB接続を行いますか (y/n): ").strip().lower()
-    dev, baud, rts = ("/dev/ttyACM0", args.baud_usb, False) if ans == "y" else ("/dev/ttyAMA0", 1000000, True)
-else:
-    dev = args.device
-    baud, rts = (args.baud_usb, False) if "ACM" in dev else (1000000, True)
-master = mavutil.mavlink_connection(dev, baud=baud, rtscts=rts)
-
-# ハートビート確認
-print("接続を待機中...")
-master.wait_heartbeat()
-print(f"接続完了 (システム: {master.target_system}, コンポーネント: {master.target_component})")
-print(f"モード: {'WRITE' if WRITE_MODE else 'CHECK (読み取り専用)'}")
-
 # 振り子周波数の計算
 import math
 # PENDULUM_LENGTH = 2.00  # [m]  # （旧値: 2.00）→ Futaba5に合わせて変更
@@ -302,6 +287,34 @@ MAV_PARAM_TYPE_MAP = {
     'AP_Int32': mavutil.mavlink.MAV_PARAM_TYPE_INT32,
     'AP_Float': mavutil.mavlink.MAV_PARAM_TYPE_REAL32,
 }
+
+# ================================
+# 接続
+# ================================
+
+def resolve_connection(device, baud_usb, uart_baud, ask=input):
+    """接続先と baud を決める。UART 側の baud は設定辞書の SERIAL1_BAUD を渡す。"""
+    if device == "auto":
+        ans = ask("USB接続を行いますか (y/n): ").strip().lower()
+        if ans == "y":
+            return "/dev/ttyACM0", baud_usb, False
+        return "/dev/ttyAMA0", uart_baud, True
+    if "ACM" in device:
+        return device, baud_usb, False
+    return device, uart_baud, True
+
+
+# /dev/ttyAMA0 (TELEM1) の baud は設定辞書の SERIAL1_BAUD を単一の出典とする。
+# 片側だけ変更してリンクが繋がらなくなる事故を防ぐため、接続 baud は必ずこれに追従させる。
+UART_BAUD = int(params_to_set['SERIAL1_BAUD'][0])
+dev, baud, rts = resolve_connection(args.device, args.baud_usb, UART_BAUD)
+master = mavutil.mavlink_connection(dev, baud=baud, rtscts=rts)
+
+# ハートビート確認
+print("接続を待機中...")
+master.wait_heartbeat()
+print(f"接続完了 (システム: {master.target_system}, コンポーネント: {master.target_component})")
+print(f"モード: {'WRITE' if WRITE_MODE else 'CHECK (読み取り専用)'}")
 
 # ================================
 # ユーティリティ関数

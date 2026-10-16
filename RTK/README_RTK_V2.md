@@ -5,7 +5,7 @@
 | ファイル | 役割 |
 |---|---|
 | `setup_RTK_V2.py` | ekf-V2対応の全ArduPilot設定ツール（本命） |
-| `test_rtk_v2_params.py` | ハードウェア不要のfocused test（13項目） |
+| `test_rtk_v2_params.py` | ハードウェア不要のfocused test（14項目） |
 | `setup_RTK_V1.py` | V1（不変。DGNSSMODE=0時代の記録として残す） |
 | `archive/rtcm_injector.py` | 旧自律注入スクリプト（参照用に移動。正式注入は gcs/ops/3 のみ） |
 
@@ -24,6 +24,10 @@ RTK側の値: `GPS1_TYPE` 9（DroneCAN GPS）/ `GPS2_TYPE` 0 / CAN1
 Observer側の値: `GPS1_TYPE` 14 / `GPS2_TYPE` 0 / CAN無効 / `GPS_INJECT_TO` 0 /
 `SERIAL1_BAUD` 1000000。
 意図的乖離: `GPS_SAVE_CFG`は基準ファイル値2に対し安全側の0を採用。
+
+接続側のボーレートも `SERIAL1_BAUD` を単一の出典とする。`/dev/ttyAMA0` 経路は
+設定辞書の値に追従し、接続ブロックに数値を直書きしない
+（`test_rtk_v2_params.py::test_uart_baud_follows_serial1_baud` が検証する）。
 
 TODO(2026-10-17実機確認): RTK方位（YAW1+USE0/USE2=1/LEARN0）と
 SERIAL1_BAUD 1000000を実機 --check で確認すること（未実施）。
