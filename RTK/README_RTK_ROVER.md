@@ -230,6 +230,7 @@ PTY を Pixhawk、ローカル TCP サーバを基地局に見立てた統合テ
 
 ## 関連
 
+- [REPORT_RTK_ROVER_20261018.md](REPORT_RTK_ROVER_20261018.md) — 2026-10-18 の実機検証報告
 - `README_RTK_V2.md` — ArduPilot 側 RTK V2 プロファイル
 - `archive/rtcm_injector.py` — 旧・単体注入スクリプト（参照用。現行は `mavlink_bridge.py`）
 - `~/rtk-pipeline/windows/PI_HANDOFF_PROMPT.md` — 引継ぎ契約
