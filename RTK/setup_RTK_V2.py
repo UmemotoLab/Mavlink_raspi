@@ -453,30 +453,86 @@ def verify_parameter(param_name, expected_value):
 # キャッシュ照合ユーティリティ（PARAM_REQUEST_LIST 一括取得 + 総時間上限）
 # ================================
 
-def fetch_param_cache(list_timeout=20.0, settle=0.5):
-    """PARAM_REQUEST_LIST を送り、PARAM_VALUE を辞書に集める。"""
+def fetch_param_cache(list_timeout=45.0, settle=0.5, retry_rounds=2):
+    """PARAM_REQUEST_LIST を送り、PARAM_VALUE を辞書に集める。
+
+    TELEM1 (UART) では FC が約 50 個/秒でしかパラメータを送らないため、
+    1050 個の取得に約 21 秒かかる。固定 20 秒で打ち切るとリスト末尾
+    （OBS_* ブロック = param_index 1033-1049）が欠落し、USB 接続時と
+    CHECK 結果が食い違う。そのため
+      (1) param_count に到達したら即終了（USB は従来どおり数秒）
+      (2) それでも不足する分は param_index 指定の PARAM_REQUEST_READ で補完
+    の 2 段構えにしている。
+    """
+    def store(msg):
+        d = msg.to_dict()
+        name = d.get("param_id", "").rstrip("\x00")
+        if not name:
+            return None, None
+        cache[name] = (d.get("param_value"), d.get("param_type"))
+        idx = d.get("param_index", -1)
+        if isinstance(idx, int) and idx >= 0:
+            index_of[idx] = name
+        count = d.get("param_count", 0)
+        return (count if isinstance(count, int) and count > 0 else None), idx
+
     while master.recv_match(blocking=False) is not None:
         pass
-    master.mav.param_request_list_send(master.target_system, master.target_component)
+
     cache = {}
+    index_of = {}
+    param_count = None
+
+    master.mav.param_request_list_send(master.target_system, master.target_component)
     t0 = time.time()
     last = t0
     while time.time() - t0 < list_timeout:
         msg = master.recv_match(type="PARAM_VALUE", blocking=True, timeout=1.0)
         if msg is None:
+            if param_count is not None and len(cache) >= param_count:
+                break
             if time.time() - last > 2.0:
                 break
             continue
-        d = msg.to_dict()
-        cache[d.get("param_id", "").rstrip("\x00")] = (d.get("param_value"), d.get("param_type"))
+        count, _idx = store(msg)
+        if count is not None:
+            param_count = count
         last = time.time()
+        if param_count is not None and len(cache) >= param_count:
+            break
+
     time.sleep(settle)
     while True:
         msg = master.recv_match(type="PARAM_VALUE", blocking=False)
         if msg is None:
             break
-        d = msg.to_dict()
-        cache[d.get("param_id", "").rstrip("\x00")] = (d.get("param_value"), d.get("param_type"))
+        count, _idx = store(msg)
+        if count is not None:
+            param_count = count
+
+    # 一括送信で取りこぼした分を index 指定で個別取得（1 件あたり数十 ms）
+    if param_count:
+        for _ in range(retry_rounds):
+            missing_idx = [i for i in range(param_count) if i not in index_of]
+            if not missing_idx:
+                break
+            print(f"  [再取得] 不足 {len(missing_idx)} 件を PARAM_REQUEST_READ で補完")
+            for idx in missing_idx:
+                master.mav.param_request_read_send(
+                    master.target_system, master.target_component, b"", idx)
+                deadline = time.time() + 1.0
+                while time.time() < deadline:
+                    msg = master.recv_match(type="PARAM_VALUE", blocking=True, timeout=0.5)
+                    if msg is None:
+                        break
+                    count, got_idx = store(msg)
+                    if count is not None:
+                        param_count = count
+                    if got_idx == idx:
+                        break
+
+    if param_count is not None and len(cache) < param_count:
+        print(f"  ⚠ 取得 {len(cache)}/{param_count} 件（FC が応答しない項目あり）")
     return cache
 
 

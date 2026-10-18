@@ -11,13 +11,17 @@ try:
     print(f"Heartbeat received from system {master.target_system}, component {master.target_component}")
 
     # 3. AUTOPILOT_VERSION_REQUEST の送信
-    master.mav.autopilot_version_request_send(
+    master.mav.command_long_send(
         master.target_system,
-        master.target_component
+        1,
+        mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
+        0,
+        mavutil.mavlink.MAVLINK_MSG_ID_AUTOPILOT_VERSION,
+        0, 0, 0, 0, 0, 0
     )
 
     # 4. AUTOPILOT_VERSION メッセージの受信（タイムアウト設定）
-    msg = master.recv_match(type='AUTOPILOT_VERSION', blocking=True, timeout=3)
+    msg = master.recv_match(type='AUTOPILOT_VERSION', blocking=True, timeout=2)
     if msg:
         data = msg.to_dict()
         print("AUTOPILOT_VERSION received:")

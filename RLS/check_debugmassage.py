@@ -31,9 +31,13 @@ try:
     )
 
     # システム情報を要求
-    master.mav.autopilot_version_request_send(
+    master.mav.command_long_send(
         master.target_system,
-        master.target_component
+        1,
+        mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
+        0,
+        mavutil.mavlink.MAVLINK_MSG_ID_AUTOPILOT_VERSION,
+        0, 0, 0, 0, 0, 0
     )
 
     print("デバッグメッセージ受信中... (すべてのメッセージを表示)")

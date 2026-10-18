@@ -38,12 +38,16 @@ class ArduPilotConnector:
             print(f"Heartbeat received from system {self.target_system}, component {self.target_component}")
             
             # 接続確認
-            self.master.mav.autopilot_version_request_send(
+            self.master.mav.command_long_send(
                 self.target_system,
-                self.target_component
+                self.target_component or 1,
+                mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
+                0,
+                mavutil.mavlink.MAVLINK_MSG_ID_AUTOPILOT_VERSION,
+                0, 0, 0, 0, 0, 0
             )
             
-            msg = self.master.recv_match(type='AUTOPILOT_VERSION', blocking=True, timeout=5)
+            msg = self.master.recv_match(type='AUTOPILOT_VERSION', blocking=True, timeout=2)
             if msg:
                 print("ArduPilot接続成功!")
                 print(f"Flight SW Version: {msg.flight_sw_version}")
