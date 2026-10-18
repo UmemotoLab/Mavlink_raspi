@@ -6,8 +6,20 @@
 |---|---|
 | `setup_RTK_V2.py` | ekf-V2対応の全ArduPilot設定ツール（本命） |
 | `test_rtk_v2_params.py` | ハードウェア不要のfocused test（14項目） |
-| `setup_RTK_V1.py` | V1（不変。DGNSSMODE=0時代の記録として残す） |
+| `mavlink_bridge.py` | rover側: Windows基地局TCP:2101 → MAVLink `GPS_RTCM_DATA` → Pixhawk |
+| `verify_rtcm_tcp.py` | rover側: 基地局TCPのRTCM3タイプ検証 |
+| `rtcm_monitor.py` | RTCM3フレーム抽出・CRC-24Qの正典（`verify_rtcm_tcp.py`が使用） |
+| `rover_config.json` | rover側の接続・ログ設定 |
+| `run_rover_bridge.sh` | `~/Mavlink_venv` で `mavlink_bridge.py` を起動 |
+| `test_rtk_rover.py` | rover側ツールのハードウェア不要テスト |
+| `README_RTK_ROVER.md` | rover側の起動手順・契約・検証手順 |
+| `archive/setup_RTK_V1.py` | V1（不変。DGNSSMODE=0時代の記録として残す） |
 | `archive/rtcm_injector.py` | 旧自律注入スクリプト（参照用に移動。正式注入は gcs/ops/3 のみ） |
+
+rover側の詳細は `README_RTK_ROVER.md` を参照してください。Windows基地局の
+観測・Fixed登録・RTCM配信（`observe_static_windows.py` /
+`register_fixed_windows.py` / `broadcast_rtcm_windows.py`）はPi側には置かず、
+Piから基地局を再設定しません。
 
 ## setup_RTK_V2.py
 
@@ -15,7 +27,7 @@
 値差分は GPS/CAN/コンパス方位の9項目のみで、それ以外は値・型が同一である。
 交互実行時は Observer5 と本スクリプトを入れ替えるだけで切替えできる。基準は
 `/home/taki/Downloads/Full-Params_ekf_V2.param`、RTK接続の正典は
-`RTK/setup_RTK_V1.py`（DroneCAN構成）である。
+`RTK/archive/setup_RTK_V1.py`（DroneCAN構成）である。
 
 RTK側の値: `GPS1_TYPE` 9（DroneCAN GPS）/ `GPS2_TYPE` 0 / CAN1
 （`CAN_P1_DRIVER` 1 / `CAN_D1_PROTOCOL` 1）/ `GPS_INJECT_TO` 127 /

@@ -2,7 +2,7 @@
 
 Complete profile: 157 items with key set identical to
 EKF/setup_EKF_Observer5.py; value diff limited to 9 GPS/CAN/compass items.
-Checks against RTK/setup_RTK_V1.py (DroneCAN + 外付コンパス2方位の正典)
+Checks against RTK/archive/setup_RTK_V1.py (DroneCAN + 外付コンパス2方位の正典)
 and /home/taki/Downloads/Full-Params_ekf_V2.param:
 1. Key sets match Observer5 (157); diff limited to 9 declared items.
 2. RTK profile values: GPS1_TYPE 9 / GPS2_TYPE 0 / CAN1 / 注入127,
@@ -14,7 +14,7 @@ and /home/taki/Downloads/Full-Params_ekf_V2.param:
 4. No CFG_* param is written (never write CFG to the F9P).
 5. No gcs/rtk_tools entity is imported or directly called.
 6. rtcm_injector.py lives in RTK/archive/ (not in RTK/).
-7. setup_RTK_V1.py is untouched (still in RTK/, still DGNSSMODE-era content).
+7. setup_RTK_V1.py is untouched (still archived, still DGNSSMODE-era content).
 8. verify_all_cached() judges missing items without per-item waiting.
 9. No MAV_CMD_PREFLIGHT_STORAGE explicit-save command remains.
 10. No misleading EEPROM-saved/persisted success message remains.
@@ -125,7 +125,7 @@ def test_uart_baud_follows_serial1_baud():
     assert resolve("/dev/ttyAMA0", 115200, uart_baud) == ("/dev/ttyAMA0", 1000000, True)
 
 
-V1P = os.path.join(REPO, "setup_RTK_V1.py")
+V1P = os.path.join(REPO, "archive", "setup_RTK_V1.py")
 
 
 def load_v1_params():
@@ -134,6 +134,9 @@ def load_v1_params():
 
 def test_rtk_trio_and_v2_match():
     params = load_params(RTKV2)
+    if not os.path.isfile(V2):
+        print(f"  SKIP: external reference not found: {V2}")
+        return
     v2f = load_v2()
     assert params["GPS_AUTO_CONFIG"][0] == 0
     assert params["GPS_SAVE_CFG"][0] == 0
@@ -193,7 +196,7 @@ def test_injector_archived():
 
 
 def test_v1_untouched():
-    p = os.path.join(REPO, "setup_RTK_V1.py")
+    p = os.path.join(REPO, "archive", "setup_RTK_V1.py")
     assert os.path.isfile(p), "V1 missing!"
     src = open(p, encoding="utf-8").read()
     assert "GPS1_GNSS_MODE" in src and "127" in src, "V1 content changed?"

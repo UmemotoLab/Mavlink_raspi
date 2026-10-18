@@ -1,0 +1,4 @@
+# Raspberry Pi rover 側（RTK/mavlink_bridge.py, verify_rtcm_tcp.py）の依存。
+# 既存の ~/Mavlink_venv には導入済み。pyubx2 は不要（F9P を直接設定しない）。
+pyserial==3.5
+pymavlink==2.4.50
