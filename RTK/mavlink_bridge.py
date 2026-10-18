@@ -2,8 +2,10 @@
 """mavlink_bridge.py — Raspberry Pi rover 側の MAVLink 中継 + RTCM 注入。
 
 Windows 基地局が TCP 0.0.0.0:2101 で配信する RTCM3 (MSM4) を受信し、
-Pixhawk (/dev/ttyAMA0 @ 1,000,000 bps, MAVLink 2.0, RTS/CTS) へ
-GPS_RTCM_DATA として注入する。基地局の再登録・F9P への設定書き込み・
+Pixhawk (/dev/ttyAMA0 @ 1,000,000 bps, MAVLink 2.0) へ
+GPS_RTCM_DATA として注入する。RTS/CTS は配線に応じて --rtscts / --no-rtscts で
+切り替える（この環境では --no-rtscts で動作確認済み）。
+基地局の再登録・F9P への設定書き込み・
 BBR/flash 保存は一切行わない（Pi は rover 経路のみを担当）。
 
 参考実装: ~/rtk-pipeline/gcs/rtk_tools/mavlink_bridge.py
@@ -61,9 +63,9 @@ DEFAULT_LOG_DIR = Path.home() / "logs"
 # Windows 基地局の契約（引継ぎプロンプト）に合わせた Pi 側の既定値。
 DEFAULT_SERIAL = "/dev/ttyAMA0"
 DEFAULT_BAUD = 1000000
-DEFAULT_RTCM_HOST = "192.168.252.33"
+DEFAULT_RTCM_HOST = "192.168.137.1"
 DEFAULT_RTCM_PORT = 2101
-DEFAULT_TARGET_HOST = "192.168.252.33"
+DEFAULT_TARGET_HOST = "192.168.137.1"
 DEFAULT_TARGET_PORT = 14550
 
 # GPS_RTCM_DATA: MAVLink の data[180] に合わせる。
@@ -302,11 +304,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-rtscts", action="store_false", dest="rtscts",
                         help="Disable RTS/CTS hardware flow control")
     parser.add_argument("--target-host", default=None,
-                        help="GCS UDP host (default: 192.168.252.33)")
+                        help="GCS UDP host (default: 192.168.137.1)")
     parser.add_argument("--target-port", type=int, default=None,
                         help="GCS UDP port (default: 14550)")
     parser.add_argument("--rtcm-host", default=None,
-                        help="Windows base TCP host (default: 192.168.252.33)")
+                        help="Windows base TCP host (default: 192.168.137.1)")
     parser.add_argument("--rtcm-port", type=int, default=None,
                         help="Windows base TCP port (default: 2101)")
     parser.add_argument("--log-dir", default=None,
@@ -394,6 +396,7 @@ def main() -> int:
 
     # 起動時フェイルセーフ確認フラグ
     fs_checked = False
+    gps_interval_requested = False
 
     def request_param(name: str):
         msg = mav_send.param_request_read_encode(1, 1, name.encode('ascii'), -1)
@@ -402,7 +405,7 @@ def main() -> int:
 
     # 1. Serial -> UDP (Pixhawk -> GCS) + Parse GPS_RAW_INT & PARAM_VALUE
     def serial_to_udp():
-        nonlocal last_log_time, last_fix_type, fs_checked
+        nonlocal last_log_time, last_fix_type, fs_checked, gps_interval_requested
         target = (args.target_host, args.target_port)
         req_sent = False
 
@@ -412,6 +415,20 @@ def main() -> int:
                 if not req_sent and time.time() - start_time > 1.0:
                     request_param("FS_GCS_ENABLE")
                     req_sent = True
+
+                # GPS_RAW_INT は ArduPilot の既定ストリームに含まれないことがある。
+                # fix ログのため 1 Hz を明示要求する（テレメトリのみ、永続設定なし）。
+                if not gps_interval_requested and time.time() - start_time > 1.0:
+                    cmd = mav_send.command_long_encode(
+                        1, 1,
+                        mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
+                        mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT,
+                        1000000, 0, 0, 0, 0, 0,
+                    )
+                    with serial_lock:
+                        ser.write(cmd.pack(mav_send))
+                    gps_interval_requested = True
+                    print("[GPS] requested GPS_RAW_INT at 1 Hz")
 
                 data = ser.read(ser.in_waiting or 1)
                 if data:

@@ -50,7 +50,7 @@ def test_config_contract():
         cfg = json.load(f)
     assert cfg["serial_port"] == "/dev/ttyAMA0", cfg
     assert cfg["baudrate"] == 1000000, cfg
-    assert cfg["rtscts"] is True, cfg
+    assert cfg["rtscts"] is False, cfg
     assert cfg["tcp_port"] == 2101, cfg
     assert cfg["enable_udp"] is False, cfg
     assert cfg["layer_ram_only"] is True, cfg
@@ -149,6 +149,8 @@ def test_bridge_source_contract():
     assert "rtscts" in src
     assert "/dev/ttyAMA0" in src
     assert "1000000" in src
+    assert "MAV_CMD_SET_MESSAGE_INTERVAL" in src
+    assert "GPS_RAW_INT" in src
     for token in ("CFG_VALSET", "CFG_TMODE", "save_to_flash", "pyubx2", "COM10"):
         assert token not in src, f"base-only token remains: {token}"
 
@@ -186,8 +188,10 @@ def test_cli_help():
 def test_bridge_dry_run():
     r = _run([BRIDGE, "--dry-run"])
     assert r.returncode == 0, r.stderr
+    cfg = json.load(open(CONFIG, encoding="utf-8"))
+    expected = f"{cfg['tcp_host']}:{cfg['tcp_port']}"
     assert "dry-run" in r.stdout, r.stdout
-    assert "192.168.252.33:2101" in r.stdout, r.stdout
+    assert expected in r.stdout, r.stdout
     assert "Fragment check" in r.stdout, r.stdout
 
 
@@ -268,6 +272,9 @@ def test_config_precedence_and_overrides():
     cfg_no_rts["rtscts"] = False
     args = mb.apply_config(parser.parse_args([]), cfg_no_rts)
     assert args.rtscts is False, args.rtscts
+
+    args = mb.apply_config(parser.parse_args(["--rtscts"]), cfg)
+    assert args.rtscts is True, args.rtscts
 
 
 def test_bridge_pty_end_to_end():

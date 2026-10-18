@@ -4,6 +4,20 @@ Windows 基地局（`rtk-pipeline/windows/`）が配信する RTCM3 を消費し
 Pixhawk 経由で rover F9P に補正データを渡すための最小構成です。
 **Pi は rover 側のみ**を担当し、基地局の観測・Fixed 登録・RTCM 配信は行いません。
 
+## 現在の接続構成
+
+```text
+Windows 基地局  192.168.137.1:2101  (broadcast_rtcm_windows.py)
+        ↑ TCP 2101
+Raspberry Pi    192.168.137.169     (/dev/ttyAMA0 -> Pixhawk)
+```
+
+- Pi 側の接続先は `rover_config.json` の `tcp_host` で指定します。
+- Windows 側の `base_config_windows.json` は `tcp_host: 0.0.0.0` のままにします
+  （Pi の IP を書く必要はありません）。
+- Pi の IP は DHCP で変わることがあります。SSH/GCS の接続先だけ必要に応じて更新して
+  ください。基地局 TCP の接続には影響しません。
+
 ## Windows 基地局との契約
 
 | 項目 | 値 |
@@ -52,12 +66,12 @@ Pixhawk 経由で rover F9P に補正データを渡すための最小構成で�
 {
   "serial_port": "/dev/ttyAMA0",
   "baudrate": 1000000,
-  "rtscts": true,
-  "tcp_host": "192.168.252.33",
+  "rtscts": false,
+  "tcp_host": "192.168.137.1",
   "tcp_port": 2101,
   "enable_udp": false,
   "layer_ram_only": true,
-  "target_host": "192.168.252.33",
+  "target_host": "192.168.137.1",
   "target_port": 14550,
   "mavlink_forward": true,
   "log_enabled": true,
@@ -66,6 +80,9 @@ Pixhawk 経由で rover F9P に補正データを渡すための最小構成で�
 ```
 
 - `tcp_host` は Windows 基地局の IP です。
+- `rtscts` はこの Pi/Pixhawk 構成では `false` で検証済みです。`true` にすると
+  `/dev/ttyAMA0` の送信が CTS 待ちでブロックする場合があります。配線が整っている
+  場合のみ `--rtscts` で有効化してください。
 - `target_host/port` は Pixhawk → GCS の MAVLink UDP 中継先です。中継が不要なら
   `mavlink_forward: false` または `--no-forward`。
 - `enable_udp` は必ず `false`（基地局契約）。`true` だと起動を拒否します。
@@ -76,12 +93,32 @@ Pixhawk 経由で rover F9P に補正データを渡すための最小構成で�
 ```bash
 cd /home/taki/Mavlink_raspi/RTK
 ~/Mavlink_venv/bin/python3 verify_rtcm_tcp.py \
-  --host 192.168.252.33 --port 2101 --duration 30
+  --host 192.168.137.1 --port 2101 --duration 30
 ```
 
 期待値:
 - `1005/1006/1074/1084/1094/1124/1230` が CRC 正常で受信される
 - MSM7（`1077/1087/1097/1127`）が無い
+
+### 実機検証結果（2026-10-18）
+
+| 項目 | 結果 |
+|---|---|
+| 基地局 TCP 2101 | 20 秒で 706 フレーム、7 タイプすべて受信、MSM7 なし |
+| Pixhawk プロファイル | `setup_RTK_V2.py --write` で 157/157 成功 |
+| GPS 認識 | 32 機、3D Fix、EKF3 が GPS 使用 |
+| RTK 遷移 | DGPS(4) → **RTK_FIXED(6)** まで 2.73 秒 |
+| 安定性 | 46 秒間で 33 サンプル中 32 サンプル（97%）が RTK_FIXED |
+| 位置ばらつき（1σ） | 水平 0.9 cm、垂直 0.8 cm、最大水平偏位 3.9 cm |
+| ログ | `~/logs/rtk_status_20261018_190715.csv` / `~/logs/rtcm_rover_20261018_190715.rtcm3` |
+
+注意:
+- `GPS1_TYPE=9` / CAN の変更は Pixhawk の再起動後に反映されます。プロファイル
+  適用後は一度 Pixhawk を再起動してください。
+- 実機の `GPS1_CAN_NODEID` は **124** で認識されました。プロファイルの期待値は
+  125 のため、次回 `setup_RTK_V2.py --check` では 1 項目だけ不一致になります。
+  RTK Fix には影響しません。必要に応じて F9P 側を 125 に設定するか、プロファイルを
+  実機の 124 に合わせてください。
 
 ### 3. rover 起動
 
@@ -185,9 +222,10 @@ PTY を Pixhawk、ローカル TCP サーバを基地局に見立てた統合テ
 | 症状 | 確認 |
 |---|---|
 | `Connection refused` / `receive timeout` | Windows 基地局の `broadcast_rtcm_windows.py` が起動しているか、IP/ポートが正しいか |
+| Windows ファイアウォール | 受信 TCP `2101` を許可しているか（`192.168.137.0/24`） |
 | `PORT_FAIL` / `Failed to open serial port` | `/dev/ttyAMA0` が他プロセスに使われていないか、`ls -l /dev/ttyAMA0` |
 | fix が 6 にならない | 基地局の RTCM タイプ、rover F9P の UART2 RTCM3 入力、`GPS_INJECT_TO`、アンテナ視界 |
-| RTS/CTS 未配線 | `--no-rtscts` を付ける |
+| RTS/CTS 未配線 | `--no-rtscts` を付ける（この環境では `rtscts: false` で検証済み） |
 | USB ベンチで確認 | `--serial /dev/ttyACM0 --baud 115200`（Pixhawk USB） |
 
 ## 関連
