@@ -209,6 +209,14 @@ def quaternion_to_euler_ned(qx, qy, qz, qw):    # Motive(X=北,Z=東,Y=上左手
     yaw   = math.atan2(2*(qw*qz+qx*qy), 1-2*(qy**2+qz**2))
     return roll, pitch, yaw
 
+
+def _motive_yaw_south_positive(yaw_ned_rad):
+    yaw = (yaw_ned_rad + math.pi) % (2 * math.pi)
+    if yaw > math.pi:
+        yaw -= 2 * math.pi
+    return yaw
+
+
 def _store_motive_rigid_body_attitude(rigid_body_id, qx, qy, qz, qw):
     global motive_roll_rad, motive_pitch_rad, motive_yaw_rad
     global motive_attitude_received
@@ -233,10 +241,7 @@ def _store_motive_rigid_body_attitude(rigid_body_id, qx, qy, qz, qw):
         motive_rigid_body_attitude_received[rigid_body_id] = True
         if rigid_body_id == 1:
             motive_roll_rad, motive_pitch_rad = attitude_ned[:2]
-            south_positive_yaw = (attitude_ned[2] + math.pi) % (2 * math.pi)
-            if south_positive_yaw > math.pi:
-                south_positive_yaw -= 2 * math.pi
-            motive_yaw_rad = south_positive_yaw
+            motive_yaw_rad = attitude_ned[2]
             motive_attitude_received = True
 
 def quaternion_to_rotation_matrix(qx, qy, qz, qw):
@@ -680,7 +685,7 @@ def _active_camera_to_ned_rotation():
             motive_attitude_received_local = motive_attitude_received
             roll = motive_roll_rad
             pitch = motive_pitch_rad
-            yaw = motive_yaw_rad
+            yaw = _motive_yaw_south_positive(motive_yaw_rad)
         else:
             camera_received = False
             R_camera_to_ned = None
@@ -1102,10 +1107,10 @@ def camera_tracker_loop(m, show_window=False):
                     with io_lock:
                         drone_gps = gps_now.copy()
                         if motive_attitude_received:
-                            # ✅ ID1センサから取得したドローン真値を使用（すでにSouth-positive）
+                            # ✅ ID1のNED yawを既存の座標変換用South-positiveへ戻す
                             drone_roll = motive_roll_rad
                             drone_pitch = motive_pitch_rad
-                            drone_yaw = motive_yaw_rad
+                            drone_yaw = _motive_yaw_south_positive(motive_yaw_rad)
                         else:
                             # フォールバック: Pixhawk IMU（North-positiveのためSouth-positiveへ変換）
                             drone_roll = current_roll_rad
