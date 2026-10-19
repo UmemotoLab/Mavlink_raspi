@@ -643,6 +643,17 @@ def rotation_matrix_to_euler_rpy(rotation):
     return roll, pitch, yaw
 
 
+def ar_marker_front_facing_reference_rotation():
+    return HAND_ROT_OFFSET @ np.diag(
+        [1.0, -1.0, -1.0]
+    ).astype(np.float32)
+
+
+def ar_marker_relative_attitude_rpy(rotation, reference_rotation):
+    relative_rotation = reference_rotation.T @ rotation
+    return rotation_matrix_to_euler_rpy(relative_rotation)
+
+
 def _camera_to_ned_rotation_from_euler(roll_rad, pitch_rad, yaw_rad):
     cr, sr = math.cos(roll_rad), math.sin(roll_rad)
     cp, sp = math.cos(pitch_rad), math.sin(pitch_rad)
@@ -767,7 +778,7 @@ def my_estimatePoseSingleMarkers(corners, marker_size, camera_matrix, distortion
             c,
             camera_matrix,
             distortion_coeff,
-            flags=cv2.SOLVEPNP_IPPE_SQUARE
+            flags=cv2.SOLVEPNP_ITERATIVE
         )
         rvecs.append(rvec)
         tvecs.append(tvec)
@@ -947,6 +958,9 @@ def camera_tracker_loop(m, show_window=False):
     fps_frame_count = 0
     try:
         while running:
+            ar_cargo_ned = None
+            ar_target_ned = None
+            ar_hand_camera = None
             # フレーム取得
             if picam2:
                 img = picam2.capture_array()
@@ -1027,10 +1041,14 @@ def camera_tracker_loop(m, show_window=False):
                     has_id1 = True
                     R_cam_marker, _ = cv2.Rodrigues(id1_rvec_cam)
                     R_cam_marker = HAND_ROT_OFFSET @ R_cam_marker
-                    attitude_cam = rotation_matrix_to_euler_rpy(R_cam_marker)
+                    R_front_reference = ar_marker_front_facing_reference_rotation()
+                    attitude_cam = ar_marker_relative_attitude_rpy(
+                        R_cam_marker, R_front_reference
+                    )
                     R_camera_to_ned = _active_camera_to_ned_rotation()
-                    attitude_world = rotation_matrix_to_euler_rpy(
-                        R_camera_to_ned @ R_cam_marker
+                    attitude_world = ar_marker_relative_attitude_rpy(
+                        R_camera_to_ned @ R_cam_marker,
+                        R_camera_to_ned @ R_front_reference,
                     )
                     with io_lock:
                         id1_detected = True
@@ -1053,6 +1071,7 @@ def camera_tracker_loop(m, show_window=False):
                     h_cam_raw_val = [float(id1_cam[0]), float(id1_cam[1]), float(id1_cam[2])]
                     # 回転・並進オフセット適用 (カメラから手先への6DOFオフセット, ワールド目標算出用)
                     id1_cam = HAND_ROT_OFFSET.dot(id1_cam) + np.array([HAND_OFFSET_CAM_X, HAND_OFFSET_CAM_Y, HAND_OFFSET_CAM_Z], dtype=np.float32)
+                    ar_hand_camera = tuple(float(value) for value in id1_cam)
 
                 # Motiveデータのカメラ座標系への逆投影真値の算出
                 m_cargo_cam_val = [float('nan'), float('nan'), float('nan')]
@@ -1165,6 +1184,8 @@ def camera_tracker_loop(m, show_window=False):
                         cargo_center_world['x'] = cargo_x
                         cargo_center_world['y'] = cargo_y
                         cargo_center_world['z'] = cargo_z
+                        ar_cargo_ned = (cargo_x, cargo_y, cargo_z)
+                        ar_target_ned = (target_x, target_y, target_z)
                         cargo_detected = True
                         id1_detected = has_id1
                         dist_id1_to_cargo_x = dist_x
@@ -1264,12 +1285,33 @@ def camera_tracker_loop(m, show_window=False):
                     f"{math.degrees(angle):.1f}" for angle in ar_attitude_world_log
                 )
                 ids_text = ",".join(map(str, detected_ids)) or "none"
+                ar_hand_position_text = (
+                    f"X:{ar_hand_camera[0]:.3f},Y:{ar_hand_camera[1]:.3f},"
+                    f"Z:{ar_hand_camera[2]:.3f}"
+                    if ar_hand_camera is not None
+                    else "N/A"
+                )
+                ar_cargo_position_text = (
+                    f"N:{ar_cargo_ned[0]:.3f},E:{ar_cargo_ned[1]:.3f},"
+                    f"D:{ar_cargo_ned[2]:.3f}"
+                    if ar_cargo_ned is not None
+                    else "N/A"
+                )
+                ar_target_position_text = (
+                    f"N:{ar_target_ned[0]:.3f},E:{ar_target_ned[1]:.3f},"
+                    f"D:{ar_target_ned[2]:.3f}"
+                    if ar_target_ned is not None
+                    else "N/A"
+                )
                 print(
                     f"[Tracker] AR={measured_fps:.1f}/{AR_MEASUREMENT_FPS}Hz "
                     f"IDs={ids_text} ID1={'visible' if has_id1 else 'not visible'} | "
                     f"AR ID1 RPY[deg] Cam=[{ar_cam_text}] "
                     f"NED=[{ar_world_text}]"
                     f"{'' if has_id1 else ' (last)'} | "
+                    f"AR Position[m] hand-Cam=[{ar_hand_position_text}] "
+                    f"cargo-NED=[{ar_cargo_position_text}] "
+                    f"target-NED=[{ar_target_position_text}] | "
                     f"Motive {motive_attitude_text} | "
                     f"Position NED[m] drone="
                     f"{motive_drone if motive_drone_available else 'N/A'} cargo="

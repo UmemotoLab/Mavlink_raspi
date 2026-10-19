@@ -230,7 +230,7 @@ Motive SDKはID1・ID2・カメラID3の位置・クォータニオンを専用U
 
 `Motive_RB1/2/3_*` はIDごとの姿勢パケットを記録します。従来の `Motive_Roll/Pitch/Yaw_rad` はID1の南向き正ヨー角を維持し、互換性のため残しています。各受信フラグは、記録開始後に該当IDの姿勢を一度でも受信したかを示します。受信開始前のクォータニオンと角度はNaNです。
 
-AR姿勢は、マーカー未検出の行では最後に検出した値を保持します。該当行の `ID1_Detected=0` を無効値として扱ってください。W姿勢はMotiveカメラ姿勢を優先し、未受信時は選択中のIMU姿勢から得た回転を使用します。
+AR姿勢は正面向きのID1マーカー姿勢を基準（Roll/Pitch/Yaw = 0）にした相対角です。姿勢は正面基準回転を除去してからRoll/Pitch/Yawに分解し、正面を向いた合成画像ではすべて0度、マーカー座標系X/Y/Zまわりの回転はそれぞれRoll/Pitch/Yawに出ることを確認しています。マーカー未検出の行では最後に検出した値を保持するため、該当行の `ID1_Detected=0` を無効値として扱ってください。W姿勢も同じ正面基準からの相対角です。
 
 ### 7.1 手先座標の時系列グラフ
 
@@ -242,7 +242,7 @@ python3 plot_hand_ar_camera.py <CSV_PATH>
 python3 plot_hand_ar_world.py <CSV_PATH>
 ```
 
-PNGは入力CSVと同じフォルダーに保存され、既定ではグラフ画面も表示されます。画面を表示せず保存だけ行う場合は `--no-show` を付けます。Motive版はID1ドローン／手先マーカー位置（NED）とMotive ID1センサ姿勢（Roll/Pitch/Yaw、度）を別々のグラフに保存します。ARカメラ座標版は `Hand_Cam_Raw_X/Y/Z_m` とマーカー姿勢（カメラ座標系）、ARからW座標への変換版は保存済みカメラ姿勢行列を適用したNED位置とCSVに記録したNED姿勢を描画します。AR姿勢角はArUco ID1のPnP回転ベクトルから算出したRoll/Pitch/Yaw（ラジアン保存、グラフは度表示）です。Matplotlibが必要です。
+PNGは入力CSVと同じフォルダーに保存され、既定ではグラフ画面も表示されます。画面を表示せず保存だけ行う場合は `--no-show` を付けます。Motive版はID1ドローン／手先マーカー位置（NED）とMotive ID1センサ姿勢（Roll/Pitch/Yaw、度）を別々のグラフに保存します。ARカメラ座標版は `Hand_Cam_Raw_X/Y/Z_m` とマーカー姿勢（カメラ座標系）、ARからW座標への変換版は保存済みカメラ姿勢行列を適用したNED位置とCSVに記録したNED姿勢を描画します。AR姿勢角は正面向きで0となる相対Roll/Pitch/Yaw（ラジアン保存、グラフは度表示）です。Matplotlibが必要です。
 
 ---
 
@@ -431,7 +431,7 @@ CAMERA_RIGID_BODY_ID = 3             # Motive カメラ剛体 ID
 CAMERA_MOUNT_DIRECTION = 'front'     # 'front' (前向きテスト) / 'down' (下向き実機)
 ```
 
-Picamera2では `AR_MEASUREMENT_FPS` からフレーム時間を指定し、USBカメラでは同FPSと1フレームバッファを要求します。カメラや画像処理が要求FPSに届かない場合も処理は継続し、実測した検出FPSを毎秒 `[Tracker]` に表示します。`AR_LOG_HZ` はAR計測CSVの記録頻度を指定します。制御・テレメトリ監視の周期 `SEND_HZ` は独立して維持されます。実行ログにはMotive rigid body ID 1/2/3とAR ID1の姿勢角を度で表示します。
+Picamera2では `AR_MEASUREMENT_FPS` からフレーム時間を指定し、USBカメラでは同FPSと1フレームバッファを要求します。カメラや画像処理が要求FPSに届かない場合も処理は継続し、実測した検出FPSを毎秒 `[Tracker]` に表示します。`AR_LOG_HZ` はAR計測CSVの記録頻度を指定します。制御・テレメトリ監視の周期 `SEND_HZ` は独立して維持されます。実行ログにはMotive rigid body ID 1/2/3とAR ID1の姿勢角を度で表示します。また、AR推定のID1カメラ座標、荷物中心NED位置、誘導目標NED位置も表示します。PnP姿勢は角点順とマーカー座標の対応を保つため `SOLVEPNP_ITERATIVE` を使用し、正面基準に対する相対角を求めます。
 
 ---
 **文書版数**: v2.0  
