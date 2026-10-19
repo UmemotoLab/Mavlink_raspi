@@ -154,6 +154,19 @@ motive_pitch_rad = 0.0
 motive_yaw_rad = 0.0
 motive_attitude_received = False
 motive_drone_pos_received = False
+MOTIVE_RIGID_BODY_IDS = (1, 2, CAMERA_RIGID_BODY_ID)
+motive_rigid_body_quaternions = {
+    rigid_body_id: [float('nan')] * 4
+    for rigid_body_id in MOTIVE_RIGID_BODY_IDS
+}
+motive_rigid_body_attitudes_ned = {
+    rigid_body_id: [float('nan')] * 3
+    for rigid_body_id in MOTIVE_RIGID_BODY_IDS
+}
+motive_rigid_body_attitude_received = {
+    rigid_body_id: False
+    for rigid_body_id in MOTIVE_RIGID_BODY_IDS
+}
 
 # ✅ Cargo Motive Position & Orientation (ID2-5マーカー)
 motive_cargo_x = 0.0
@@ -192,6 +205,36 @@ def quaternion_to_euler_ned(qx, qy, qz, qw):    # Motive(X=北,Z=東,Y=上左手
     pitch = math.asin(max(-1,min(1, 2*(qw*qy-qz*qx))))
     yaw   = math.atan2(2*(qw*qz+qx*qy), 1-2*(qy**2+qz**2))
     return roll, pitch, yaw
+
+def _store_motive_rigid_body_attitude(rigid_body_id, qx, qy, qz, qw):
+    global motive_roll_rad, motive_pitch_rad, motive_yaw_rad
+    global motive_attitude_received
+    if rigid_body_id not in MOTIVE_RIGID_BODY_IDS:
+        return
+
+    quat_norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    if not math.isfinite(quat_norm) or quat_norm == 0:
+        raise ValueError(f"invalid rigid-body quaternion for ID {rigid_body_id}")
+    raw_quaternion = [component / quat_norm for component in (qx, qy, qz, qw)]
+    ned_quaternion = (
+        raw_quaternion[0],
+        raw_quaternion[2],
+        -raw_quaternion[1],
+        raw_quaternion[3],
+    )
+    attitude_ned = quaternion_to_euler_ned(*ned_quaternion)
+
+    with io_lock:
+        motive_rigid_body_quaternions[rigid_body_id] = raw_quaternion
+        motive_rigid_body_attitudes_ned[rigid_body_id] = list(attitude_ned)
+        motive_rigid_body_attitude_received[rigid_body_id] = True
+        if rigid_body_id == 1:
+            motive_roll_rad, motive_pitch_rad = attitude_ned[:2]
+            south_positive_yaw = (attitude_ned[2] + math.pi) % (2 * math.pi)
+            if south_positive_yaw > math.pi:
+                south_positive_yaw -= 2 * math.pi
+            motive_yaw_rad = south_positive_yaw
+            motive_attitude_received = True
 
 def quaternion_to_rotation_matrix(qx, qy, qz, qw):
     """クォータニオン → 3x3 回転行列 (右手系, 標準形式)"""
@@ -334,33 +377,16 @@ def motive_udp_listener():
                 mx, my, mz = gps_to_local_xyz(lat, lon, alt)
                 
                 if rigid_body_id == 1:
-                    # ✅ ID1 = ドローン側マーカー + センサ（ドローン真値）
-                    motive_qx = unpacked[5]
-                    motive_qy = unpacked[6]
-                    motive_qz = unpacked[7]
-                    motive_qw = unpacked[8]
-                    
-                    # Convert Motive quat (X=North, Y=Up, Z=East, left-handed) to NED quat (X=North, Y=East, Z=Down, right-handed)
-                    ned_qx = motive_qx
-                    ned_qy = motive_qz
-                    ned_qz = -motive_qy
-                    ned_qw = motive_qw
-                    
-                    r, p, y = quaternion_to_euler_ned(ned_qx, ned_qy, ned_qz, ned_qw)
-                    # South-positive: rotate yaw by 180 degrees (pi radians)
-                    y = (y + math.pi) % (2 * math.pi)
-                    if y > math.pi:
-                        y -= 2 * math.pi
+                    # ID1 legacy packet also carries its attitude.
+                    _store_motive_rigid_body_attitude(
+                        rigid_body_id, unpacked[5], unpacked[6],
+                        unpacked[7], unpacked[8]
+                    )
                     
                     with io_lock:
-                        # ✅ ID1センサから取得したドローン真値
                         motive_drone_x = mx
                         motive_drone_y = my
                         motive_drone_z = mz
-                        motive_roll_rad = r
-                        motive_pitch_rad = p
-                        motive_yaw_rad = y
-                        motive_attitude_received = True
                         motive_drone_pos_received = True
                         
                 elif rigid_body_id == 2:
@@ -478,10 +504,11 @@ def motive_rigid_body_pose_udp_listener():
             if rigid_body_id not in (1, 2, CAMERA_RIGID_BODY_ID):
                 raise ValueError(f"未対応の剛体IDです: {rigid_body_id}")
             if not all(math.isfinite(value) for value in (qx, qy, qz, qw, timestamp)):
-                raise ValueError("姿勢または時刻に有限値でない値があります")
+                raise ValueError("剛体姿勢または時刻に有限値でない値があります")
             quat_norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
             if not math.isfinite(quat_norm) or quat_norm == 0:
-                raise ValueError("カメラ姿勢クォータニオンが不正です")
+                raise ValueError("剛体姿勢クォータニオンが不正です")
+            _store_motive_rigid_body_attitude(rigid_body_id, qx, qy, qz, qw)
             lat = lat_e7 / 1e7
             lon = lon_e7 / 1e7
             alt = alt_mm / 1000.0
@@ -1374,6 +1401,15 @@ def record_data():
             m_h_cam = motive_hand_cam.copy()
             ar_att_cam = ar_hand_attitude_cam.copy()
             ar_att_world = ar_hand_attitude_world.copy()
+            motive_pose_log = [
+                component
+                for rigid_body_id in MOTIVE_RIGID_BODY_IDS
+                for component in (
+                    *motive_rigid_body_quaternions[rigid_body_id],
+                    *motive_rigid_body_attitudes_ned[rigid_body_id],
+                    1 if motive_rigid_body_attitude_received[rigid_body_id] else 0,
+                )
+            ]
             
         data_records.append([
             time.time(), 
@@ -1408,7 +1444,8 @@ def record_data():
             m_h_cam[0], m_h_cam[1], m_h_cam[2],
             ar_att_cam[0], ar_att_cam[1], ar_att_cam[2],
             ar_att_world[0], ar_att_world[1], ar_att_world[2],
-            m_att_rcv
+            m_att_rcv,
+            *motive_pose_log
         ])
         time.sleep(1 / SEND_HZ)
 def save_csv():
@@ -1452,7 +1489,21 @@ def save_csv():
             # ✅ AR ID1マーカー姿勢（rvecから算出したRoll/Pitch/Yaw）
             'AR_Hand_Roll_Cam_rad', 'AR_Hand_Pitch_Cam_rad', 'AR_Hand_Yaw_Cam_rad',
             'AR_Hand_Roll_W_NED_rad', 'AR_Hand_Pitch_W_NED_rad', 'AR_Hand_Yaw_W_NED_rad',
-            'Motive_Attitude_Received'
+            'Motive_Attitude_Received',
+            *[
+                column
+                for rigid_body_id in MOTIVE_RIGID_BODY_IDS
+                for column in (
+                    f'Motive_RB{rigid_body_id}_QX',
+                    f'Motive_RB{rigid_body_id}_QY',
+                    f'Motive_RB{rigid_body_id}_QZ',
+                    f'Motive_RB{rigid_body_id}_QW',
+                    f'Motive_RB{rigid_body_id}_Roll_NED_rad',
+                    f'Motive_RB{rigid_body_id}_Pitch_NED_rad',
+                    f'Motive_RB{rigid_body_id}_Yaw_NED_rad',
+                    f'Motive_RB{rigid_body_id}_Attitude_Received',
+                )
+            ]
         ])
         writer.writerows(data_records)
     print(f"\n✓ CSV保存完了: {path} ({len(data_records)} 行)")

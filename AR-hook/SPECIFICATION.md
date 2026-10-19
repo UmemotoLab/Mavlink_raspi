@@ -186,7 +186,7 @@ $$
 
 ## 7. CSV ログフォーマット仕様
 
-`AR-hook1_test.py` が `~/LOGS_Pixhawk6c/YYYYMMDD_HHMMSS_1.csv` に出力する現行70列のログ構成です。ワールド座標を記録するX/Y/Z列はN/E/D（北・東・下）の順です。
+`AR-hook1_test.py` が `~/LOGS_Pixhawk6c/YYYYMMDD_HHMMSS_1.csv` に出力する現行94列のログ構成です。ワールド座標を記録するX/Y/Z列はN/E/D（北・東・下）の順です。
 
 | 列番号 | カラム名 | 単位 | 説明 |
 |---|---|---|---|
@@ -215,11 +215,20 @@ $$
 | 61-63 | `Motive_Hand_Cam_X/Y/Z` | m | Motive 手先真値のカメラ座標系逆投影値 |
 | 64-66 | `AR_Hand_Roll_Cam_rad`, `AR_Hand_Pitch_Cam_rad`, `AR_Hand_Yaw_Cam_rad` | rad | AR ID1マーカー姿勢（カメラ座標系） |
 | 67-69 | `AR_Hand_Roll_W_NED_rad`, `AR_Hand_Pitch_W_NED_rad`, `AR_Hand_Yaw_W_NED_rad` | rad | AR ID1マーカー姿勢（W=NED座標系） |
-| 70 | `Motive_Attitude_Received` | 0/1 | Motive UDP 15769からID1姿勢を受信したか |
+| 70 | `Motive_Attitude_Received` | 0/1 | Motive ID1姿勢を受信したか |
+| 71-74 | `Motive_RB1_QX/QY/QZ/QW` | - | Motive剛体ID1の正規化済み生クォータニオン |
+| 75-77 | `Motive_RB1_Roll/Pitch/Yaw_NED_rad` | rad | Motive剛体ID1のNED姿勢 |
+| 78 | `Motive_RB1_Attitude_Received` | 0/1 | Motive剛体ID1姿勢の受信フラグ |
+| 79-82 | `Motive_RB2_QX/QY/QZ/QW` | - | Motive剛体ID2の正規化済み生クォータニオン |
+| 83-85 | `Motive_RB2_Roll/Pitch/Yaw_NED_rad` | rad | Motive剛体ID2のNED姿勢 |
+| 86 | `Motive_RB2_Attitude_Received` | 0/1 | Motive剛体ID2姿勢の受信フラグ |
+| 87-90 | `Motive_RB3_QX/QY/QZ/QW` | - | Motive剛体ID3の正規化済み生クォータニオン |
+| 91-93 | `Motive_RB3_Roll/Pitch/Yaw_NED_rad` | rad | Motive剛体ID3のNED姿勢 |
+| 94 | `Motive_RB3_Attitude_Received` | 0/1 | Motive剛体ID3姿勢の受信フラグ |
 
-Motive SDKはID1・ID2・カメラID3の位置・クォータニオンを専用UDPポート15770で全設定済みPiへ配信する。比較スクリプトは各行の適用済み回転行列を使ってカメラ相対XYZをNED（北・東・下）へ変換する。
+Motive SDKはID1・ID2・カメラID3の位置・クォータニオンを専用UDPポート15770で全設定済みPiへ配信します。15769の23バイトGPSパケットにはクォータニオンが含まれないため、姿勢記録には15770の41バイト姿勢パケットを使用します。SDK側の送信間隔制御はIP単位で共有されていたため、同一IPに複数剛体を送るとフレーム内で最初の剛体以外が抑止される問題がありました。現在はIPと剛体IDの組ごとに送信間隔を管理します。比較スクリプトは各行の適用済み回転行列を使ってカメラ相対XYZをNED（北・東・下）へ変換します。
 
-`Motive_Roll_rad`、`Motive_Pitch_rad`、`Motive_Yaw_rad` はMotive UDPポート15769のID1姿勢データを受信したときだけ更新します。15770の姿勢受信スレッドはID1位置しか取り込まないため、15769から姿勢が届かない構成では列が初期値 `(0, 0, 0)` のままです。`Motive_Attitude_Received=0` は未受信として扱います。
+`Motive_RB1/2/3_*` はIDごとの姿勢パケットを記録します。従来の `Motive_Roll/Pitch/Yaw_rad` はID1の南向き正ヨー角を維持し、互換性のため残しています。各受信フラグは、記録開始後に該当IDの姿勢を一度でも受信したかを示します。受信開始前のクォータニオンと角度はNaNです。
 
 AR姿勢は、マーカー未検出の行では最後に検出した値を保持します。該当行の `ID1_Detected=0` を無効値として扱ってください。W姿勢はMotiveカメラ姿勢を優先し、未受信時は選択中のIMU姿勢から得た回転を使用します。
 
@@ -296,7 +305,7 @@ python3 camera-cal.py
 ---
 
 ### 8.5 ステップ 4: オプティカルオフセット校正 (`verify_displacement.py`)
-現行70列ログを2本読み込み、検出フラグ・有限なカメラ座標・受信済みのMotiveカメラ姿勢行列を使って解析します。Motive荷物位置がNED原点の `(0, 0, 0)` でも、Motiveカメラ座標への逆投影値が有効なら有効なサンプルとして扱います。旧ログでは姿勢行列がない場合に限り、旧方式の回転推定へフォールバックします。
+現行94列ログを2本読み込み、検出フラグ・有限なカメラ座標・受信済みのMotiveカメラ姿勢行列を使って解析します。Motive荷物位置がNED原点の `(0, 0, 0)` でも、Motiveカメラ座標への逆投影値が有効なら有効なサンプルとして扱います。旧ログでは姿勢行列がない場合に限り、旧方式の回転推定へフォールバックします。
 
 ```bash
 python3 verify_displacement.py <RUN1_LOG.csv> <RUN2_LOG.csv>
