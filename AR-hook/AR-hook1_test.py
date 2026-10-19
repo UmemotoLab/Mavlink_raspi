@@ -19,6 +19,9 @@ except ImportError:
 STEP = 0.10
 TAKEOFF_ALT = 0.50
 SEND_HZ = 10
+AR_MEASUREMENT_FPS = 40
+AR_LOG_HZ = 40
+AR_FRAME_DURATION_US = round(1_000_000 / AR_MEASUREMENT_FPS)
 MASK = 0x09F8
 CAMERA_WIDTH = 1640
 CAMERA_HEIGHT = 1232
@@ -878,6 +881,22 @@ def camera_tracker_loop(m, show_window=False):
             config = picam2.create_preview_configuration(main={"format": 'BGR888', "size": (CAMERA_WIDTH, CAMERA_HEIGHT)})
             picam2.configure(config)
             picam2.start()
+            try:
+                picam2.set_controls({
+                    "FrameDurationLimits": (
+                        AR_FRAME_DURATION_US,
+                        AR_FRAME_DURATION_US,
+                    )
+                })
+                print(
+                    f"✓ AR計測レート上限を{AR_MEASUREMENT_FPS}Hz"
+                    f"（{AR_FRAME_DURATION_US}μs/frame）に設定しました。"
+                )
+            except Exception as e:
+                print(
+                    f"⚠ Picamera2で{AR_MEASUREMENT_FPS}Hzを設定できません"
+                    f" ({e})。カメラ既定レートで続行します。"
+                )
             print(f"✓ Picamera2 起動完了 ({CAMERA_WIDTH}x{CAMERA_HEIGHT})")
         except Exception as e:
             print(f"⚠ Picamera2 の起動に失敗しました: {e}。USBカメラへの切り替えを試みます。")
@@ -890,6 +909,15 @@ def camera_tracker_loop(m, show_window=False):
             return
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        if not cap.set(cv2.CAP_PROP_FPS, AR_MEASUREMENT_FPS):
+            print(
+                f"⚠ USBカメラが{AR_MEASUREMENT_FPS}Hz設定を受け付けませんでした。"
+            )
+        if not cap.set(cv2.CAP_PROP_BUFFERSIZE, 1):
+            print("⚠ USBカメラのフレームバッファサイズを1にできませんでした。")
+        actual_camera_fps = cap.get(cv2.CAP_PROP_FPS)
+        if actual_camera_fps > 0:
+            print(f"USBカメラ申告FPS: {actual_camera_fps:.1f}")
         print(f"✓ USBカメラ 起動完了 ({CAMERA_WIDTH}x{CAMERA_HEIGHT})")
     # カメラキャリブレーションパラメータの読み込み
     params_file = "camera_params.npz"
@@ -914,7 +942,9 @@ def camera_tracker_loop(m, show_window=False):
     dictionary = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
     detector = aruco.ArucoDetector(dictionary)
     print("✓ マーカー追跡ループを開始します（中心ID: {}, 正方形頂点ID: {}）...".format(ID_CENTER_MARKER, SQUARE_MARKER_IDS))
-    last_print_time = 0
+    last_print_time = time.monotonic()
+    fps_window_started = last_print_time
+    fps_frame_count = 0
     try:
         while running:
             # フレーム取得
@@ -926,8 +956,10 @@ def camera_tracker_loop(m, show_window=False):
             if not ret or img is None:
                 time.sleep(0.01)
                 continue
+            fps_frame_count += 1
             # マーカー検出
             corners, ids, rejected = detector.detectMarkers(img)
+            detected_ids = [] if ids is None else [int(marker_id) for marker_id in ids.flatten()]
             has_cargo = False
             has_id1 = False
             dist_x, dist_y, dist_z = float('nan'), float('nan'), float('nan')
@@ -937,9 +969,9 @@ def camera_tracker_loop(m, show_window=False):
             if ids is not None:
                 obj_points = []
                 img_points = []
-                detected_ids = []
                 for i, corner in enumerate(corners):
                     marker_id = int(ids[i][0])
+                    detected_ids.append(marker_id)
                     # ID2-5: 荷物の頂点として中心を推定
                     if marker_id in MARKER_CENTER_OFFSETS:
                         O_id = MARKER_CENTER_OFFSETS[marker_id]
@@ -952,7 +984,6 @@ def camera_tracker_loop(m, show_window=False):
                         ], dtype=np.float32)
                         obj_points.append(corners_3d)
                         img_points.append(corner.reshape(4, 2))
-                        detected_ids.append(marker_id)
                     # ID1: ドローン側マーカー（補正用）
                     elif marker_id == ID_CENTER_MARKER:
                         id1_cam, id1_rvec_cam = estimate_square_pose_from_marker(
@@ -1158,41 +1189,6 @@ def camera_tracker_loop(m, show_window=False):
                         lat, lon, alt = local_xyz_to_gps(target_x, target_y, target['z'])
                         send_setpoint(m, int(lat*1e7), int(lon*1e7), alt, yaw_t_deg)
 
-                    # 1秒間隔でコンソールに進捗を表示
-                    if time.time() - last_print_time > 1.0:
-                        ids_text = ",".join(str(mid) for mid in detected_ids)
-                        id1_text = "(ID1 vis)" if has_id1 else "(ID1 NOT vis)"
-                        last_text = "(using last center)" if used_last_center else ""
-                        
-                        dist_id1_text = f"X:{dist_x:.3f}, Y:{dist_y:.3f}, Z:{dist_z:.3f}" if has_id1 else "N/A"
-                        with io_lock:
-                            motive_cargo = (
-                                motive_cargo_x, motive_cargo_y, motive_cargo_z
-                            )
-                            motive_cargo_available = motive_cargo_pos_received
-                            motive_drone = (
-                                motive_drone_x, motive_drone_y, motive_drone_z
-                            )
-                            motive_drone_available = motive_drone_pos_received
-                        motive_cargo_text = (
-                            f"N:{motive_cargo[0]:.2f}, E:{motive_cargo[1]:.2f}, "
-                            f"D:{motive_cargo[2]:.2f}"
-                            if motive_cargo_available else "N/A"
-                        )
-                        motive_drone_text = (
-                            f"N:{motive_drone[0]:.2f}, E:{motive_drone[1]:.2f}, "
-                            f"D:{motive_drone[2]:.2f}"
-                            if motive_drone_available else "N/A"
-                        )
-                        print(f"[Tracker] 検出IDs: {ids_text} {id1_text} {last_text} | "
-                               f"座標ソース: {coord_source} | "
-                               f"推定中心(px): [X:{cargo_center_cam_x:.1f}, Y:{cargo_center_cam_y:.1f}] | "
-                               f"ID1-中心目標距離(xyz): [{dist_id1_text}] | "
-                               f"W座標 NED[m] Motive荷物[{motive_cargo_text}] "
-                               f"Motive機体[{motive_drone_text}] | "
-                               f"AR荷物[N:{cargo_x:.2f}, E:{cargo_y:.2f}, D:{cargo_z:.2f}] | "
-                               f"AR目標[N:{target_x:.2f}, E:{target_y:.2f}, D:{target_z:.2f}]")
-                        last_print_time = time.time()
                 else:
                     # 荷物が検出されていない場合
                     with io_lock:
@@ -1221,6 +1217,68 @@ def camera_tracker_loop(m, show_window=False):
                     hand_cam_raw = [float('nan'), float('nan'), float('nan')]
                     motive_cargo_cam = [float('nan'), float('nan'), float('nan')]
                     motive_hand_cam = [float('nan'), float('nan'), float('nan')]
+
+            now = time.monotonic()
+            if now - last_print_time >= 1.0:
+                measured_fps = fps_frame_count / max(now - fps_window_started, 1e-6)
+                with io_lock:
+                    motive_attitudes = {
+                        rigid_body_id: (
+                            motive_rigid_body_attitudes_ned[rigid_body_id].copy(),
+                            motive_rigid_body_attitude_received[rigid_body_id],
+                        )
+                        for rigid_body_id in MOTIVE_RIGID_BODY_IDS
+                    }
+                    ar_attitude_cam_log = ar_hand_attitude_cam.copy()
+                    ar_attitude_world_log = ar_hand_attitude_world.copy()
+                    motive_cargo = (
+                        motive_cargo_x, motive_cargo_y, motive_cargo_z
+                    )
+                    motive_cargo_available = motive_cargo_pos_received
+                    motive_drone = (
+                        motive_drone_x, motive_drone_y, motive_drone_z
+                    )
+                    motive_drone_available = motive_drone_pos_received
+                    motive_camera_available = motive_camera_received
+                    motive_cargo_available = (
+                        motive_cargo_available
+                        or motive_rigid_body_attitude_received[2]
+                    )
+                    motive_drone_available = (
+                        motive_drone_available
+                        or motive_rigid_body_attitude_received[1]
+                    )
+                motive_attitude_text = " | ".join(
+                    f"RB{rigid_body_id} NED RPY[deg]="
+                    + (
+                        ",".join(f"{math.degrees(angle):.1f}" for angle in attitude)
+                        if received
+                        else "N/A"
+                    )
+                    for rigid_body_id, (attitude, received) in motive_attitudes.items()
+                )
+                ar_cam_text = ",".join(
+                    f"{math.degrees(angle):.1f}" for angle in ar_attitude_cam_log
+                )
+                ar_world_text = ",".join(
+                    f"{math.degrees(angle):.1f}" for angle in ar_attitude_world_log
+                )
+                ids_text = ",".join(map(str, detected_ids)) or "none"
+                print(
+                    f"[Tracker] AR={measured_fps:.1f}/{AR_MEASUREMENT_FPS}Hz "
+                    f"IDs={ids_text} ID1={'visible' if has_id1 else 'not visible'} | "
+                    f"AR ID1 RPY[deg] Cam=[{ar_cam_text}] "
+                    f"NED=[{ar_world_text}]"
+                    f"{'' if has_id1 else ' (last)'} | "
+                    f"Motive {motive_attitude_text} | "
+                    f"Position NED[m] drone="
+                    f"{motive_drone if motive_drone_available else 'N/A'} cargo="
+                    f"{motive_cargo if motive_cargo_available else 'N/A'} "
+                    f"camera={'received' if motive_camera_available else 'N/A'}"
+                )
+                last_print_time = now
+                fps_window_started = now
+                fps_frame_count = 0
 
             # 表示が許可されていればウィンドウ表示
             if show_window:
@@ -1282,7 +1340,9 @@ def camera_tracker_loop(m, show_window=False):
                     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                     now_str = datetime.datetime.now(pytz.timezone("Asia/Tokyo")).strftime("%Y%m%d_%H%M%S")
                     video_path = CSV_DIR / f"{now_str}_video.mp4"
-                    video_writer = cv2.VideoWriter(str(video_path), fourcc, 20.0, (width, height))
+                    video_writer = cv2.VideoWriter(
+                        str(video_path), fourcc, float(AR_MEASUREMENT_FPS), (width, height)
+                    )
                     print(f"✓ ビデオ録画を開始しました: {video_path}")
                 video_writer.write(display)
 
@@ -1291,8 +1351,6 @@ def camera_tracker_loop(m, show_window=False):
                     running = False
                     break
 
-            # 処理負荷抑制のための微小なスリープ
-            time.sleep(0.01)
     finally:
         print("カメラ追跡スレッドを終了し、カメラを解放します...")
         if video_writer is not None:
@@ -1447,7 +1505,7 @@ def record_data():
             m_att_rcv,
             *motive_pose_log
         ])
-        time.sleep(1 / SEND_HZ)
+        time.sleep(1 / AR_LOG_HZ)
 def save_csv():
     if not data_records:
         print("⚠ 記録なし")

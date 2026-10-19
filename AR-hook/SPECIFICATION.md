@@ -418,7 +418,9 @@ python3 test_accel_plot.py
 STEP = 0.10                          # キー操作 1 回あたりの移動量 (m)
 TAKEOFF_ALT = 0.50                   # 初期離陸高度 (m)
 TARGET_HEIGHT_ABOVE_TAKEOFF = 1.10   # 荷物追従時の標準目標高度 (m)
-SEND_HZ = 10                         # 誘導コマンド送信周期 (Hz)
+SEND_HZ = 10                         # 機体状態監視周期 (Hz)
+AR_MEASUREMENT_FPS = 40              # ARカメラ計測の要求FPS（カメラ能力に依存）
+AR_LOG_HZ = 40                       # AR計測CSVの記録周期 (Hz)
 
 # カメラ・マーカー設定
 CAMERA_WIDTH = 1640                  # カメラ解像度 幅
@@ -428,6 +430,8 @@ SQUARE_SIDE = 0.15                   # 荷物フレーム一辺 (m)
 CAMERA_RIGID_BODY_ID = 3             # Motive カメラ剛体 ID
 CAMERA_MOUNT_DIRECTION = 'front'     # 'front' (前向きテスト) / 'down' (下向き実機)
 ```
+
+Picamera2では `AR_MEASUREMENT_FPS` からフレーム時間を指定し、USBカメラでは同FPSと1フレームバッファを要求します。カメラや画像処理が要求FPSに届かない場合も処理は継続し、実測した検出FPSを毎秒 `[Tracker]` に表示します。`AR_LOG_HZ` はAR計測CSVの記録頻度を指定します。制御・テレメトリ監視の周期 `SEND_HZ` は独立して維持されます。実行ログにはMotive rigid body ID 1/2/3とAR ID1の姿勢角を度で表示します。
 
 ---
 **文書版数**: v2.0  
