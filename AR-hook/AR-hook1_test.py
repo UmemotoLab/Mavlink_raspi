@@ -651,7 +651,8 @@ def ar_marker_front_facing_reference_rotation():
 
 def ar_marker_relative_attitude_rpy(rotation, reference_rotation):
     relative_rotation = reference_rotation.T @ rotation
-    return rotation_matrix_to_euler_rpy(relative_rotation)
+    roll, pitch, yaw = rotation_matrix_to_euler_rpy(relative_rotation)
+    return pitch, roll, -yaw
 
 
 def _camera_to_ned_rotation_from_euler(roll_rad, pitch_rad, yaw_rad):
