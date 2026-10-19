@@ -14,25 +14,26 @@ ATTITUDE_COLUMNS = (
     "Motive_Pitch_rad",
     "Motive_Yaw_rad",
 )
-HAND_RECEIVED_COLUMNS = (
-    "Motive_Hand_Cam_X_m",
-    "Motive_Hand_Cam_Y_m",
-    "Motive_Hand_Cam_Z_m",
-)
 
 
 def main(argv: list[str] | None = None) -> int:
     return run_hand_plotter(
         argv,
-        title="Motive hand position (NED)",
+        title="Motive ID1 drone/hand marker position (NED)",
         suffix="motive_hand",
-        required_columns=(*POSITION_COLUMNS, *HAND_RECEIVED_COLUMNS),
+        required_columns=POSITION_COLUMNS,
         position_reader=lambda row: _finite_values(row, POSITION_COLUMNS),
         axis_labels=("N (North)", "E (East)", "D (Down)"),
-        validity_check=lambda row: _finite_values(
-            row, HAND_RECEIVED_COLUMNS
-        ) is not None,
         attitude_columns=ATTITUDE_COLUMNS,
+        attitude_validity_check=lambda row: (
+            row.get("Motive_Attitude_Received") == "1"
+            if "Motive_Attitude_Received" in row
+            else True
+        ),
+        attitude_title="Motive drone sensor (ID1) attitude",
+        attitude_availability_message=(
+            "このCSVにはMotiveの姿勢列がありません。位置グラフのみ作成しました。"
+        ),
     )
 
 

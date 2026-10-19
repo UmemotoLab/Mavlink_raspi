@@ -44,6 +44,7 @@ def _plot(
     axis_labels: Sequence[str],
     output_path: Path,
     attitudes: list[tuple[float, float, float] | None] | None,
+    attitude_title: str | None,
     show: bool,
 ) -> None:
     import matplotlib
@@ -90,7 +91,7 @@ def _plot(
             axis.grid(True, alpha=0.3)
             axis.legend(loc="best")
         attitude_axes[-1].set_xlabel("Time from start [s]")
-        attitude_figure.suptitle(f"{title} - Attitude")
+        attitude_figure.suptitle(attitude_title or f"{title} - Attitude")
         attitude_figure.tight_layout()
         attitude_figure.savefig(attitude_path, dpi=150)
         print(f"姿勢グラフを保存しました: {attitude_path}")
@@ -109,7 +110,9 @@ def run_hand_plotter(
     position_reader: PositionReader,
     axis_labels: Sequence[str],
     validity_check: ValidityCheck | None = None,
+    attitude_validity_check: ValidityCheck | None = None,
     attitude_columns: Sequence[str] | None = None,
+    attitude_title: str | None = None,
     attitude_availability_message: str | None = None,
 ) -> int:
     parser = argparse.ArgumentParser(description=f"{title}のCSV時系列グラフを作成します")
@@ -123,8 +126,6 @@ def run_hand_plotter(
     args = parser.parse_args(argv)
 
     columns = ["Time_s", *required_columns]
-    if attitude_columns is not None:
-        columns.extend(attitude_columns)
     try:
         rows = _read_csv(args.csv, columns)
     except (OSError, UnicodeError, csv.Error, ValueError) as exc:
@@ -132,8 +133,11 @@ def run_hand_plotter(
 
     times: list[float] = []
     positions: list[tuple[float, float, float] | None] = []
+    has_attitude_columns = attitude_columns is not None and (
+        not rows or all(column in rows[0] for column in attitude_columns)
+    )
     attitudes: list[tuple[float, float, float] | None] | None = (
-        [] if attitude_columns is not None else None
+        [] if has_attitude_columns else None
     )
     for row in rows:
         try:
@@ -148,7 +152,16 @@ def run_hand_plotter(
         times.append(timestamp)
         positions.append(position)
         if attitudes is not None:
-            angles = _finite_values(row, attitude_columns) if is_valid else None
+            attitude_is_valid = (
+                attitude_validity_check(row)
+                if attitude_validity_check is not None
+                else is_valid
+            )
+            angles = (
+                _finite_values(row, attitude_columns)
+                if attitude_is_valid
+                else None
+            )
             attitudes.append(angles)
 
     if not times or not any(position is not None for position in positions):
@@ -165,6 +178,7 @@ def run_hand_plotter(
             axis_labels=axis_labels,
             output_path=output_path,
             attitudes=attitudes,
+            attitude_title=attitude_title,
             show=not args.no_show,
         )
     except (OSError, ValueError, RuntimeError) as exc:

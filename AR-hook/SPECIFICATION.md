@@ -186,7 +186,7 @@ $$
 
 ## 7. CSV ログフォーマット仕様
 
-`AR-hook1_test.py` が `~/LOGS_Pixhawk6c/YYYYMMDD_HHMMSS_1.csv` に出力する 63 列のログ構成です。ワールド座標を記録するX/Y/Z列はN/E/D（北・東・下）の順です。
+`AR-hook1_test.py` が `~/LOGS_Pixhawk6c/YYYYMMDD_HHMMSS_1.csv` に出力する現行70列のログ構成です。ワールド座標を記録するX/Y/Z列はN/E/D（北・東・下）の順です。
 
 | 列番号 | カラム名 | 単位 | 説明 |
 |---|---|---|---|
@@ -201,7 +201,7 @@ $$
 | 18-20 | `Motive_Drone_X/Y/Z` | m | Motive ドローン真値座標 (ID1、NED) |
 | 21-23 | `Motive_Cargo_X/Y/Z` | m | Motive 荷物真値座標 (ID2-5、NED) |
 | 24-26 | `Motive_Rel_X/Y/Z` | m | 荷物座標系における相対位置真値 |
-| 27-29 | `Motive_Roll/Pitch/Yaw` | rad | Motive ドローン姿勢真値 |
+| 27-29 | `Motive_Roll_rad`, `Motive_Pitch_rad`, `Motive_Yaw_rad` | rad | Motive ID1センサのドローン姿勢真値 |
 | 30-32 | `Motive_Camera_X/Y/Z` | m | Motive カメラ剛体位置真値 (ID3、NED) |
 | 33 | `Motive_Camera_Received` | 0/1 | Motive カメラ剛体データ受信フラグ |
 | 34-37 | `Motive_Camera_QX/QY/QZ/QW` | - | Motiveカメラ剛体の生クォータニオン |
@@ -213,8 +213,15 @@ $$
 | 55-57 | `Hand_Cam_X/Y/Z` | m | カメラ座標系における手先 ID1 生値 |
 | 58-60 | `Motive_Cargo_Cam_X/Y/Z` | m | Motive 荷物真値のカメラ座標系逆投影値 |
 | 61-63 | `Motive_Hand_Cam_X/Y/Z` | m | Motive 手先真値のカメラ座標系逆投影値 |
+| 64-66 | `AR_Hand_Roll_Cam_rad`, `AR_Hand_Pitch_Cam_rad`, `AR_Hand_Yaw_Cam_rad` | rad | AR ID1マーカー姿勢（カメラ座標系） |
+| 67-69 | `AR_Hand_Roll_W_NED_rad`, `AR_Hand_Pitch_W_NED_rad`, `AR_Hand_Yaw_W_NED_rad` | rad | AR ID1マーカー姿勢（W=NED座標系） |
+| 70 | `Motive_Attitude_Received` | 0/1 | Motive UDP 15769からID1姿勢を受信したか |
 
 Motive SDKはID1・ID2・カメラID3の位置・クォータニオンを専用UDPポート15770で全設定済みPiへ配信する。比較スクリプトは各行の適用済み回転行列を使ってカメラ相対XYZをNED（北・東・下）へ変換する。
+
+`Motive_Roll_rad`、`Motive_Pitch_rad`、`Motive_Yaw_rad` はMotive UDPポート15769のID1姿勢データを受信したときだけ更新します。15770の姿勢受信スレッドはID1位置しか取り込まないため、15769から姿勢が届かない構成では列が初期値 `(0, 0, 0)` のままです。`Motive_Attitude_Received=0` は未受信として扱います。
+
+AR姿勢は、マーカー未検出の行では最後に検出した値を保持します。該当行の `ID1_Detected=0` を無効値として扱ってください。W姿勢はMotiveカメラ姿勢を優先し、未受信時は選択中のIMU姿勢から得た回転を使用します。
 
 ### 7.1 手先座標の時系列グラフ
 
@@ -226,7 +233,7 @@ python3 plot_hand_ar_camera.py <CSV_PATH>
 python3 plot_hand_ar_world.py <CSV_PATH>
 ```
 
-PNGは入力CSVと同じフォルダーに保存され、既定ではグラフ画面も表示されます。画面を表示せず保存だけ行う場合は `--no-show` を付けます。Motive版は手先位置（NED）に加えてRoll/Pitch/Yaw（度）のグラフも保存します。ARカメラ座標版は `Hand_Cam_Raw_X/Y/Z_m`、ARからW座標への変換版は保存済みカメラ姿勢行列を適用したNED位置を描画します。現行CSVにAR推定の手先姿勢角は記録されていないため、AR 2種類のスクリプトは位置グラフのみを作成します。Matplotlibが必要です。
+PNGは入力CSVと同じフォルダーに保存され、既定ではグラフ画面も表示されます。画面を表示せず保存だけ行う場合は `--no-show` を付けます。Motive版はID1ドローン／手先マーカー位置（NED）とMotive ID1センサ姿勢（Roll/Pitch/Yaw、度）を別々のグラフに保存します。ARカメラ座標版は `Hand_Cam_Raw_X/Y/Z_m` とマーカー姿勢（カメラ座標系）、ARからW座標への変換版は保存済みカメラ姿勢行列を適用したNED位置とCSVに記録したNED姿勢を描画します。AR姿勢角はArUco ID1のPnP回転ベクトルから算出したRoll/Pitch/Yaw（ラジアン保存、グラフは度表示）です。Matplotlibが必要です。
 
 ---
 
@@ -289,7 +296,7 @@ python3 camera-cal.py
 ---
 
 ### 8.5 ステップ 4: オプティカルオフセット校正 (`verify_displacement.py`)
-現行63列ログを2本読み込み、検出フラグ・有限なカメラ座標・受信済みのMotiveカメラ姿勢行列を使って解析します。Motive荷物位置がNED原点の `(0, 0, 0)` でも、Motiveカメラ座標への逆投影値が有効なら有効なサンプルとして扱います。旧ログでは姿勢行列がない場合に限り、旧方式の回転推定へフォールバックします。
+現行70列ログを2本読み込み、検出フラグ・有限なカメラ座標・受信済みのMotiveカメラ姿勢行列を使って解析します。Motive荷物位置がNED原点の `(0, 0, 0)` でも、Motiveカメラ座標への逆投影値が有効なら有効なサンプルとして扱います。旧ログでは姿勢行列がない場合に限り、旧方式の回転推定へフォールバックします。
 
 ```bash
 python3 verify_displacement.py <RUN1_LOG.csv> <RUN2_LOG.csv>

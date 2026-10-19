@@ -21,6 +21,11 @@ CAMERA_ROTATION_COLUMNS = tuple(
     for row in range(3)
     for column in range(3)
 )
+ATTITUDE_COLUMNS = (
+    "AR_Hand_Roll_W_NED_rad",
+    "AR_Hand_Pitch_W_NED_rad",
+    "AR_Hand_Yaw_W_NED_rad",
+)
 
 
 def _ar_hand_world_ned(row: dict[str, str]):
@@ -63,8 +68,11 @@ def main(argv: list[str] | None = None) -> int:
         position_reader=_ar_hand_world_ned,
         axis_labels=("N (North)", "E (East)", "D (Down)"),
         validity_check=lambda row: row.get("Motive_Camera_Received") == "1",
+        attitude_validity_check=lambda row: row.get("ID1_Detected", "1") == "1",
+        attitude_columns=ATTITUDE_COLUMNS,
+        attitude_title="AR marker (ID1) attitude in world NED frame",
         attitude_availability_message=(
-            "AR推定の手先姿勢角はこのCSVに保存されていないため、位置だけを描画しました。"
+            "このCSVにAR姿勢列がありません。位置グラフのみ作成しました。"
         ),
     )
 

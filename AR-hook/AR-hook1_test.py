@@ -135,6 +135,8 @@ cargo_cam_raw = [float('nan'), float('nan'), float('nan')]
 hand_cam_raw = [float('nan'), float('nan'), float('nan')]
 motive_cargo_cam = [float('nan'), float('nan'), float('nan')]
 motive_hand_cam = [float('nan'), float('nan'), float('nan')]
+ar_hand_attitude_cam = [float('nan'), float('nan'), float('nan')]
+ar_hand_attitude_world = [float('nan'), float('nan'), float('nan')]
 
 # ───── 新規追加: Motive UDP受信スレッド ─────
 import socket, struct
@@ -598,6 +600,63 @@ def local_xyz_to_gps(x, y, z):
     lon = REF_LON + y / (111319.5 * math.cos(math.radians(REF_LAT)))
     alt = REF_ALT - z
     return lat, lon, alt
+
+
+def rotation_matrix_to_euler_rpy(rotation):
+    pitch = math.asin(max(-1.0, min(1.0, -float(rotation[2, 0]))))
+    if abs(math.cos(pitch)) > 1e-6:
+        roll = math.atan2(float(rotation[2, 1]), float(rotation[2, 2]))
+        yaw = math.atan2(float(rotation[1, 0]), float(rotation[0, 0]))
+    else:
+        roll = math.atan2(-float(rotation[1, 2]), float(rotation[1, 1]))
+        yaw = 0.0
+    return roll, pitch, yaw
+
+
+def _camera_to_ned_rotation_from_euler(roll_rad, pitch_rad, yaw_rad):
+    cr, sr = math.cos(roll_rad), math.sin(roll_rad)
+    cp, sp = math.cos(pitch_rad), math.sin(pitch_rad)
+    cy, sy = math.cos(yaw_rad), math.sin(yaw_rad)
+    R_body_to_ned = np.array([
+        [cp*cy,  sr*sp*cy - cr*sy,  cr*sp*cy + sr*sy],
+        [cp*sy,  sr*sp*sy + cr*cy,  cr*sp*sy - sr*cy],
+        [-sp,    sr*cp,            cr*cp]
+    ], dtype=np.float32)
+    R_cv_to_body = np.array([
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0]
+    ], dtype=np.float32)
+    return R_body_to_ned @ R_cv_to_body
+
+
+def _active_camera_to_ned_rotation():
+    with io_lock:
+        if CAMERA_ORIENTATION_SOURCE == "motive":
+            camera_received = motive_camera_received
+            R_camera_to_ned = R_cam_to_world.copy()
+            motive_attitude_received_local = motive_attitude_received
+            roll = motive_roll_rad
+            pitch = motive_pitch_rad
+            yaw = motive_yaw_rad
+        else:
+            camera_received = False
+            R_camera_to_ned = None
+            motive_attitude_received_local = False
+            roll = current_roll_rad
+            pitch = current_pitch_rad
+            yaw = (current_yaw_rad + math.pi) % (2 * math.pi)
+
+        if camera_received:
+            return R_camera_to_ned
+        if CAMERA_ORIENTATION_SOURCE == "motive" and not motive_attitude_received_local:
+            roll = current_roll_rad
+            pitch = current_pitch_rad
+            yaw = (current_yaw_rad + math.pi) % (2 * math.pi)
+
+    return _camera_to_ned_rotation_from_euler(roll, pitch, yaw)
+
+
 # ───── カメラ座標系から世界座標系（北・東・下）への座標変換 ─────
 _debug_cargo_log_time = 0.0  # デバッグログ用タイムスタンプ
 
@@ -651,27 +710,10 @@ def camera_to_world_xyz(tvec, roll_rad, pitch_rad, yaw_rad, gps_drone):
     前向きカメラ座標系の相対ベクトル [x_cam, y_cam, z_cam] を、
     機体姿勢（Roll, Pitch, Yaw）の3D回転行列を用いて世界座標系（North-East-Down）の目標値に変換します。
     """
-    # 1. カメラ座標系 -> 機体ボディ座標系（FRD: Front-Right-Down）へのマウントマッピング修正
-    # 前向きカメラの場合：
-    #   機体前方 (X_body) = カメラ光軸奥 (Z_cam) -> tvec[2]
-    #   機体右方 (Y_body) = カメラ画像右 (X_cam) -> tvec[0]
-    #   機体下方 (Z_body) = カメラ画像下 (Y_cam) -> tvec[1]
-    p_body = np.array([tvec[2], tvec[0], tvec[1]], dtype=np.float32)
-    
-    # 2. ロール、ピッチ、ヨーの回転行列を計算
-    cr, sr = math.cos(roll_rad), math.sin(roll_rad)
-    cp, sp = math.cos(pitch_rad), math.sin(pitch_rad)
-    cy, sy = math.cos(yaw_rad), math.sin(yaw_rad)
-    
-    # R = Rz(yaw) * Ry(pitch) * Rx(roll)
-    R_body_to_ned = np.array([
-        [cp*cy,  sr*sp*cy - cr*sy,  cr*sp*cy + sr*sy],
-        [cp*sy,  sr*sp*sy + cr*cy,  cr*sp*sy - sr*cy],
-        [-sp,    sr*cp,            cr*cp]
-    ], dtype=np.float32)
-    
-    # 機体ボディ座標から地球座標（NED）に変換
-    p_ned = R_body_to_ned.dot(p_body)
+    R_camera_to_ned = _camera_to_ned_rotation_from_euler(
+        roll_rad, pitch_rad, yaw_rad
+    )
+    p_ned = R_camera_to_ned.dot(np.asarray(tvec, dtype=np.float32))
     
     target_x = gps_drone['x'] + p_ned[0]
     target_y = gps_drone['y'] + p_ned[1]
@@ -701,18 +743,22 @@ def my_estimatePoseSingleMarkers(corners, marker_size, camera_matrix, distortion
         tvecs.append(tvec)
     return rvecs, tvecs
 
-def estimate_square_center_from_marker(corner, marker_id, marker_size, camera_matrix, distortion_coeff):
+def estimate_square_pose_from_marker(corner, marker_id, marker_size, camera_matrix, distortion_coeff):
     rvecs, tvecs = my_estimatePoseSingleMarkers([corner], marker_size, camera_matrix, distortion_coeff)
     rvec = rvecs[0].reshape(3)
     tvec = tvecs[0].reshape(3)
-    # ID1 (ドローン側) はここで特別扱いしない。
-    # ここでは常にマーカー位置（または頂点オフセット適用後の中心推定）を返す。
     offset = MARKER_CENTER_OFFSETS.get(marker_id)
     if offset is None:
-        # マーカーが正方形の頂点リストにない場合は、そのまま tvec を返す（例: ID1など）
-        return tvec
+        return tvec, rvec
     R, _ = cv2.Rodrigues(rvec)
-    return tvec + R.dot(offset)
+    return tvec + R.dot(offset), rvec
+
+
+def estimate_square_center_from_marker(corner, marker_id, marker_size, camera_matrix, distortion_coeff):
+    center, _ = estimate_square_pose_from_marker(
+        corner, marker_id, marker_size, camera_matrix, distortion_coeff
+    )
+    return center
 
 # ───── 状態監視スレッド ─────
 def monitor_vehicle(m):
@@ -791,6 +837,7 @@ def camera_tracker_loop(m, show_window=False):
     global dist_id1_to_cargo_x, dist_id1_to_cargo_y, dist_id1_to_cargo_z
     global cargo_center_cam_x, cargo_center_cam_y
     global cargo_cam_raw, hand_cam_raw, motive_cargo_cam, motive_hand_cam
+    global ar_hand_attitude_cam, ar_hand_attitude_world
     global _coord_source_log
     
     print(f"カメラ初期化中（解像度: {CAMERA_WIDTH}x{CAMERA_HEIGHT}）...")
@@ -857,12 +904,13 @@ def camera_tracker_loop(m, show_window=False):
             has_cargo = False
             has_id1 = False
             dist_x, dist_y, dist_z = float('nan'), float('nan'), float('nan')
+            id1_cam = None
+            id1_rvec_cam = None
             
             if ids is not None:
                 obj_points = []
                 img_points = []
                 detected_ids = []
-                id1_cam = None
                 for i, corner in enumerate(corners):
                     marker_id = int(ids[i][0])
                     # ID2-5: 荷物の頂点として中心を推定
@@ -880,8 +928,13 @@ def camera_tracker_loop(m, show_window=False):
                         detected_ids.append(marker_id)
                     # ID1: ドローン側マーカー（補正用）
                     elif marker_id == ID_CENTER_MARKER:
-                        # ID1のカメラ座標系位置を取得しておく
-                        id1_cam = estimate_square_center_from_marker(corner, marker_id, MARKER_SIZE, camera_matrix, distortion_coeff)
+                        id1_cam, id1_rvec_cam = estimate_square_pose_from_marker(
+                            corner,
+                            marker_id,
+                            MARKER_SIZE,
+                            camera_matrix,
+                            distortion_coeff,
+                        )
 
                 used_last_center = False
                 center_cam = None
@@ -914,6 +967,17 @@ def camera_tracker_loop(m, show_window=False):
 
                 if id1_cam is not None:
                     has_id1 = True
+                    R_cam_marker, _ = cv2.Rodrigues(id1_rvec_cam)
+                    R_cam_marker = HAND_ROT_OFFSET @ R_cam_marker
+                    attitude_cam = rotation_matrix_to_euler_rpy(R_cam_marker)
+                    R_camera_to_ned = _active_camera_to_ned_rotation()
+                    attitude_world = rotation_matrix_to_euler_rpy(
+                        R_camera_to_ned @ R_cam_marker
+                    )
+                    with io_lock:
+                        id1_detected = True
+                        ar_hand_attitude_cam = list(attitude_cam)
+                        ar_hand_attitude_world = list(attitude_world)
 
                 # カメラ座標系検出値の生値を保存 (CSV記録用および生マーカー間相対計算用)
                 c_cam_raw_val = [float('nan'), float('nan'), float('nan')]
@@ -1281,6 +1345,7 @@ def record_data():
             m_roll = motive_roll_rad
             m_pitch = motive_pitch_rad
             m_yaw = motive_yaw_rad
+            m_att_rcv = 1 if motive_attitude_received else 0
             
             # ✅ カメラ Motive データのログ取得
             m_cam_x = motive_camera_x
@@ -1307,6 +1372,8 @@ def record_data():
             h_cam_raw = hand_cam_raw.copy()
             m_c_cam = motive_cargo_cam.copy()
             m_h_cam = motive_hand_cam.copy()
+            ar_att_cam = ar_hand_attitude_cam.copy()
+            ar_att_world = ar_hand_attitude_world.copy()
             
         data_records.append([
             time.time(), 
@@ -1338,7 +1405,10 @@ def record_data():
             c_cam_raw[0], c_cam_raw[1], c_cam_raw[2],
             h_cam_raw[0], h_cam_raw[1], h_cam_raw[2],
             m_c_cam[0], m_c_cam[1], m_c_cam[2],
-            m_h_cam[0], m_h_cam[1], m_h_cam[2]
+            m_h_cam[0], m_h_cam[1], m_h_cam[2],
+            ar_att_cam[0], ar_att_cam[1], ar_att_cam[2],
+            ar_att_world[0], ar_att_world[1], ar_att_world[2],
+            m_att_rcv
         ])
         time.sleep(1 / SEND_HZ)
 def save_csv():
@@ -1378,7 +1448,11 @@ def save_csv():
             'Hand_Cam_Raw_X_m', 'Hand_Cam_Raw_Y_m', 'Hand_Cam_Raw_Z_m',
             # ✅ カメラ座標系 Motive真値（逆投影）
             'Motive_Cargo_Cam_X_m', 'Motive_Cargo_Cam_Y_m', 'Motive_Cargo_Cam_Z_m',
-            'Motive_Hand_Cam_X_m', 'Motive_Hand_Cam_Y_m', 'Motive_Hand_Cam_Z_m'
+            'Motive_Hand_Cam_X_m', 'Motive_Hand_Cam_Y_m', 'Motive_Hand_Cam_Z_m',
+            # ✅ AR ID1マーカー姿勢（rvecから算出したRoll/Pitch/Yaw）
+            'AR_Hand_Roll_Cam_rad', 'AR_Hand_Pitch_Cam_rad', 'AR_Hand_Yaw_Cam_rad',
+            'AR_Hand_Roll_W_NED_rad', 'AR_Hand_Pitch_W_NED_rad', 'AR_Hand_Yaw_W_NED_rad',
+            'Motive_Attitude_Received'
         ])
         writer.writerows(data_records)
     print(f"\n✓ CSV保存完了: {path} ({len(data_records)} 行)")
