@@ -27,18 +27,33 @@ from rtcm_monitor import (  # noqa: E402
     rtcm3_frame_msg_type,
     rtcm3_verify_frame,
 )
-from verify_rtcm_tcp import verify_rtcm_stream  # noqa: E402
+from verify_rtcm_tcp import (  # noqa: E402
+    MAX_FRAME_LEN,
+    REQUIRED_TYPES,
+    analyze_frames,
+    verify_rtcm_stream,
+)
 import mavlink_bridge as mb  # noqa: E402
 
 CONFIG = os.path.join(RTK_DIR, "rover_config.json")
 BRIDGE = os.path.join(RTK_DIR, "mavlink_bridge.py")
 VERIFY = os.path.join(RTK_DIR, "verify_rtcm_tcp.py")
 EXPECTED = [1005, 1006, 1074, 1084, 1094, 1124, 1230]
+MSM7 = [1077, 1087, 1097, 1127]
 
 
-def build_rtcm_frame(msg_type, extra=b"\x00\x01\x02"):
-    """CRC-24Q が正しい合成 RTCM3 フレームを作る。"""
-    payload = bytes([(msg_type >> 4) & 0xFF, ((msg_type & 0x0F) << 4) & 0xF0]) + extra
+def build_rtcm_frame(msg_type, extra=b"\x00\x01\x02", payload_len=None):
+    """CRC-24Q が正しい合成 RTCM3 フレームを作る。
+
+    ``payload_len`` を指定すると、そのペイロード長（フレーム全長は +6 byte）
+    にゼロ詰めする。720/721 byte 境界のテストに使う。
+    """
+    head = bytes([(msg_type >> 4) & 0xFF, ((msg_type & 0x0F) << 4) & 0xF0])
+    payload = head + extra
+    if payload_len is not None:
+        if not 2 <= payload_len <= 1023:
+            raise ValueError(f"payload_len out of range: {payload_len}")
+        payload = payload[:payload_len].ljust(payload_len, b"\x00")
     n = len(payload)
     header = bytes([0xD3, (n >> 8) & 0x03, n & 0xFF])
     crc = rtcm3_crc24q(header + payload)
@@ -74,7 +89,7 @@ def test_crc_detects_corruption():
     assert not rtcm3_verify_frame(bytes(bad)), "corrupted frame accepted"
 
 
-def _serve_frames(server, frames, stop):
+def _serve_chunks(server, chunks, stop, interval=0.01):
     conn = None
     try:
         server.settimeout(0.2)
@@ -87,9 +102,9 @@ def _serve_frames(server, frames, stop):
             return
         conn.settimeout(0.2)
         while not stop.is_set():
-            for frame in frames:
-                conn.sendall(frame)
-                time.sleep(0.01)
+            for chunk in chunks:
+                conn.sendall(chunk)
+                time.sleep(interval)
     except OSError:
         pass
     finally:
@@ -98,25 +113,134 @@ def _serve_frames(server, frames, stop):
         server.close()
 
 
-def test_verify_rtcm_tcp_against_local_server():
-    frames = [build_rtcm_frame(t) for t in EXPECTED]
+def _verify_with_server(chunks, duration=1.5, interval=0.01):
+    """ローカル TCP サーバから chunks を送り、検証結果を返す。"""
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("127.0.0.1", 0))
     server.listen(1)
     port = server.getsockname()[1]
     stop = threading.Event()
-    th = threading.Thread(target=_serve_frames, args=(server, frames, stop), daemon=True)
+    th = threading.Thread(
+        target=_serve_chunks, args=(server, chunks, stop, interval), daemon=True
+    )
     th.start()
     try:
-        result = verify_rtcm_stream("127.0.0.1", port, duration=2.0)
+        return verify_rtcm_stream("127.0.0.1", port, duration=duration)
     finally:
         stop.set()
         th.join(timeout=2.0)
-    assert result["ok"], result
+
+
+def test_verify_rtcm_tcp_against_local_server():
+    frames = [build_rtcm_frame(t) for t in EXPECTED]
+    result = _verify_with_server(frames)
+    assert result["ok"], result["reasons"]
     assert result["missing_types"] == [], result
+    assert result["crc_failed"] == 0, result
+    assert result["msm7_count"] == 0, result
     for t in EXPECTED:
         assert result["type_counter"][str(t)] > 0, (t, result)
+        assert result["type_max_len"][t] > 0, (t, result)
+
+
+def test_verify_rtcm_tcp_split_chunks():
+    """TCP が 3 byte ずつ分割されても 7 タイプを再構成できること。"""
+    stream = b"".join(build_rtcm_frame(t) for t in EXPECTED)
+    chunks = [stream[i:i + 3] for i in range(0, len(stream), 3)]
+    result = _verify_with_server(chunks)
+    assert result["ok"], result["reasons"]
+    assert result["crc_failed"] == 0, result
+    assert result["total_frames"] >= len(EXPECTED), result
+    for t in EXPECTED:
+        assert result["type_counts"].get(t, 0) > 0, (t, result)
+
+
+def test_verify_rtcm_tcp_multiple_frames_per_chunk():
+    """1 回の send/recv に複数フレームが入っていても全件数えられること。"""
+    stream = b"".join(build_rtcm_frame(t) for t in EXPECTED)
+    result = _verify_with_server([stream], interval=0.05)
+    assert result["ok"], result["reasons"]
+    assert result["crc_failed"] == 0, result
+    for t in EXPECTED:
+        assert result["type_counts"].get(t, 0) > 0, (t, result)
+
+
+def test_verify_analysis_accepts_required_types():
+    result = analyze_frames([build_rtcm_frame(t) for t in EXPECTED])
+    assert result["ok"], result["reasons"]
+    assert result["missing_types"] == [], result
+    assert result["total_frames"] == len(EXPECTED), result
+    assert result["crc_ok"] == len(EXPECTED), result
+    assert result["crc_failed"] == 0, result
+    assert result["msm7_count"] == 0, result
+    assert result["unknown_count"] == 0, result
+    assert result["oversize_count"] == 0, result
+    assert tuple(REQUIRED_TYPES) == tuple(EXPECTED), REQUIRED_TYPES
+    for t in EXPECTED:
+        assert result["type_counts"][t] == 1, (t, result)
+        assert result["type_max_len"][t] == len(build_rtcm_frame(t)), (t, result)
+
+
+def test_verify_analysis_rejects_missing_type():
+    frames = [build_rtcm_frame(t) for t in EXPECTED if t != 1230]
+    result = analyze_frames(frames)
+    assert not result["ok"], result
+    assert result["missing_types"] == [1230], result
+    assert result["required_counts"]["1230"] == 0, result
+
+
+def test_verify_analysis_excludes_crc_bad_frames():
+    frames = [build_rtcm_frame(t) for t in EXPECTED]
+    bad = bytearray(build_rtcm_frame(1005))
+    bad[-1] ^= 0xFF
+    bad_msm7 = bytearray(build_rtcm_frame(1077))
+    bad_msm7[-2] ^= 0x01
+    result = analyze_frames(frames + [bytes(bad), bytes(bad_msm7)])
+    assert not result["ok"], result
+    assert result["crc_failed"] == 2, result
+    assert result["crc_ok"] == len(EXPECTED), result
+    assert result["total_frames"] == len(EXPECTED), result
+    # CRC 不正フレームのタイプは正常件数にも MSM7 にも数えない
+    assert result["type_counts"][1005] == 1, result
+    assert result["msm7_count"] == 0, result
+    assert result["frames_extracted"] == len(EXPECTED) + 2, result
+
+
+def test_verify_analysis_rejects_msm7():
+    frames = ([build_rtcm_frame(t) for t in EXPECTED]
+              + [build_rtcm_frame(t) for t in MSM7])
+    result = analyze_frames(frames)
+    assert not result["ok"], result
+    assert result["msm7_counts"] == {t: 1 for t in MSM7}, result
+    assert result["msm7_count"] == len(MSM7), result
+    # MSM7 を unknown と混同しない
+    assert result["unknown_count"] == 0, result
+
+
+def test_verify_analysis_unknown_is_separate():
+    frames = [build_rtcm_frame(t) for t in EXPECTED] + [build_rtcm_frame(999)]
+    result = analyze_frames(frames)
+    assert result["ok"], result["reasons"]  # unknown は失敗条件ではない
+    assert result["unknown_counts"] == {999: 1}, result
+    assert result["unknown_count"] == 1, result
+    assert result["msm7_count"] == 0, result
+
+
+def test_verify_analysis_frame_length_limit():
+    required = [build_rtcm_frame(t) for t in EXPECTED]
+    boundary = required + [build_rtcm_frame(999, payload_len=MAX_FRAME_LEN - 6)]
+    result = analyze_frames(boundary)
+    assert result["ok"], result["reasons"]
+    assert result["max_frame_len"] == MAX_FRAME_LEN, result
+    assert result["oversize_count"] == 0, result
+
+    oversized = required + [build_rtcm_frame(999, payload_len=MAX_FRAME_LEN - 5)]
+    result = analyze_frames(oversized)
+    assert not result["ok"], result
+    assert result["oversize_count"] == 1, result
+    assert result["max_frame_len"] == MAX_FRAME_LEN + 1, result
+    assert any("720" in r for r in result["reasons"]), result
 
 
 def test_fragmentation_single():
@@ -174,6 +298,42 @@ def test_no_base_only_modules_copied():
 def _run(args):
     return subprocess.run([sys.executable] + args, capture_output=True,
                           text=True, timeout=30)
+
+
+def _write_capture(frames):
+    fd, path = tempfile.mkstemp(suffix=".rtcm3")
+    with os.fdopen(fd, "wb") as f:
+        f.write(b"".join(frames))
+    return path
+
+
+def test_verify_cli_file_exit_codes():
+    corrupted = bytearray(build_rtcm_frame(1005))
+    corrupted[-1] ^= 0xFF
+    cases = [
+        ("pass", [build_rtcm_frame(t) for t in EXPECTED], 0),
+        ("missing", [build_rtcm_frame(t) for t in EXPECTED if t != 1230], 1),
+        ("crc", [build_rtcm_frame(t) for t in EXPECTED] + [bytes(corrupted)], 1),
+        ("msm7", [build_rtcm_frame(t) for t in EXPECTED]
+         + [build_rtcm_frame(1077)], 1),
+        ("oversize", [build_rtcm_frame(t) for t in EXPECTED]
+         + [build_rtcm_frame(999, payload_len=MAX_FRAME_LEN - 5)], 1),
+    ]
+    for name, frames, expected in cases:
+        path = _write_capture(frames)
+        try:
+            r = _run([VERIFY, "--file", path])
+        finally:
+            os.unlink(path)
+        assert r.returncode == expected, (name, r.returncode, r.stdout, r.stderr)
+        assert "CRC-24Q NG frames" in r.stdout, (name, r.stdout)
+        assert "MSM7" in r.stdout and "Unknown" in r.stdout, (name, r.stdout)
+        assert "Max Frame Length" in r.stdout, (name, r.stdout)
+        assert "1005" in r.stdout and "1230" in r.stdout, (name, r.stdout)
+        if expected == 0:
+            assert "✅ PASS" in r.stdout, r.stdout
+        else:
+            assert "❌ FAIL" in r.stdout, r.stdout
 
 
 def test_cli_help():
