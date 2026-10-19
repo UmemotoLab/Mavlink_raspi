@@ -267,6 +267,59 @@ def test_fragmentation_multi_and_limit():
     assert mb.fragment_rtcm_frame(b"x" * 721, seq=0) == [], "5 fragments must be rejected"
 
 
+def test_rtcm_frame_gate():
+    for msg_type in EXPECTED:
+        assert mb.rtcm_frame_reject_reason(build_rtcm_frame(msg_type)) is None
+
+    bad_crc = bytearray(build_rtcm_frame(1005))
+    bad_crc[-1] ^= 0xFF
+    assert mb.rtcm_frame_reject_reason(bytes(bad_crc)) == mb.RTCM_REJECT_CRC
+
+    for msg_type in MSM7:
+        assert mb.rtcm_frame_reject_reason(
+            build_rtcm_frame(msg_type)) == mb.RTCM_REJECT_MSM7
+
+    assert mb.rtcm_frame_reject_reason(
+        build_rtcm_frame(999)) == mb.RTCM_REJECT_UNKNOWN
+    assert mb.rtcm_frame_reject_reason(
+        build_rtcm_frame(1075)) == mb.RTCM_REJECT_UNKNOWN  # MSM5 も未許可
+
+    # 720 byte は許可、721 byte は許可タイプでも拒否
+    assert mb.rtcm_frame_reject_reason(
+        build_rtcm_frame(1230, payload_len=mb.MAX_RTCM_FRAME_LEN - 6)) is None
+    assert mb.rtcm_frame_reject_reason(
+        build_rtcm_frame(1230, payload_len=mb.MAX_RTCM_FRAME_LEN - 5)
+    ) == mb.RTCM_REJECT_OVERSIZE
+
+
+def test_rtcm_rejection_counters():
+    stats = mb.new_rtcm_stats()
+    assert stats["accepted"] == 0 and stats["fragments"] == 0
+    mb.record_rtcm_rejection(stats, mb.RTCM_REJECT_CRC)
+    mb.record_rtcm_rejection(stats, mb.RTCM_REJECT_CRC)
+    mb.record_rtcm_rejection(stats, mb.RTCM_REJECT_MSM7)
+    mb.record_rtcm_rejection(stats, mb.RTCM_REJECT_INCOMPLETE)
+    stats["accepted"] = 3
+    stats["fragments"] = 5
+
+    line = mb.format_rtcm_stats(stats)
+    for expected in (
+        "[RTCM Stats]", "accepted=3", "fragments=5", "rejected=4",
+        "crc_invalid=2", "msm7=1", "unknown=0", "oversize=0", "incomplete=1",
+    ):
+        assert expected in line, (expected, line)
+
+
+def test_incomplete_frame_detection():
+    partial = bytearray(build_rtcm_frame(1005)[:7])
+    assert list(mb.extract_rtcm_frames(partial)) == []
+    assert mb.is_incomplete_rtcm(partial), partial
+
+    noise = bytearray(b"\x00\x01\x02")
+    assert list(mb.extract_rtcm_frames(noise)) == []
+    assert not mb.is_incomplete_rtcm(noise), noise
+
+
 def test_bridge_source_contract():
     src = open(BRIDGE, encoding="utf-8").read()
     assert "gps_rtcm_data_encode" in src
@@ -448,8 +501,18 @@ def test_bridge_pty_end_to_end():
 
     from pymavlink import mavutil
 
-    frames = [build_rtcm_frame(t) for t in EXPECTED]
-    frames.append(build_rtcm_frame(1074, b"\x05" * 397))  # 複数断片になる 400 byte 級
+    allowed_frames = [build_rtcm_frame(t) for t in EXPECTED]
+    allowed_frames.append(build_rtcm_frame(1074, b"\x05" * 397))  # 複数断片
+
+    bad_crc = bytearray(build_rtcm_frame(1005))
+    bad_crc[-1] ^= 0xFF
+    rejected_frames = [
+        bytes(bad_crc),                                            # CRC 不正
+        build_rtcm_frame(1077),                                    # MSM7
+        build_rtcm_frame(999),                                     # unknown
+        build_rtcm_frame(1230, payload_len=mb.MAX_RTCM_FRAME_LEN - 5),  # 721 byte
+    ]
+    partial_frame = build_rtcm_frame(1006, payload_len=600)[:20]   # 不完全
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -461,9 +524,10 @@ def test_bridge_pty_end_to_end():
         conn, _ = server.accept()
         try:
             for _ in range(3):
-                for frame in frames:
+                for frame in allowed_frames + rejected_frames:
                     conn.sendall(frame)
                 time.sleep(0.7)
+            conn.sendall(partial_frame)
         finally:
             conn.close()
             server.close()
@@ -528,11 +592,25 @@ def test_bridge_pty_end_to_end():
     rtcm_path = os.path.join(tmp, [n for n in names if n.endswith(".rtcm3")][0])
     csv_path = os.path.join(tmp, [n for n in names if n.endswith(".csv")][0])
     assert os.path.getsize(rtcm_path) > 0, "RTCM log is empty"
+    parser = Rtcm3StreamParser(verify_crc=True)
+    with open(rtcm_path, "rb") as f:
+        logged = parser.feed(f.read())
+    assert logged, "RTCM log has no complete frame"
+    assert parser.stats["crc_failed"] == 0, parser.stats
+    assert set(logged) == set(allowed_frames), "rejected frame was logged"
     rows = open(csv_path, encoding="utf-8").read().strip().splitlines()
     assert len(rows) >= 2, rows
     assert any(r.split(",")[2] == "6" for r in rows[1:]), rows
     assert "[FIX]" in out and "[RTCM Injected]" in out, out
-    assert set(rebuilt.values()) == set(frames), "MAVLink roundtrip mismatch"
+    assert set(rebuilt.values()) == set(allowed_frames), "MAVLink roundtrip mismatch"
+
+    stats_lines = [ln for ln in out.splitlines() if ln.startswith("[RTCM Stats]")]
+    assert stats_lines, out
+    stats_line = stats_lines[-1]
+    assert "accepted=" in stats_line, stats_line
+    for reason in mb.RTCM_REJECT_REASONS:
+        assert f"{reason}=" in stats_line, stats_line
+        assert f"{reason}=0" not in stats_line, stats_line
 
 
 if __name__ == "__main__":

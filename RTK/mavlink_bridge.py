@@ -45,6 +45,8 @@ from typing import List, Optional, Tuple
 import serial
 from pymavlink import mavutil
 
+from rtcm_monitor import rtcm3_frame_msg_type, rtcm3_verify_frame
+
 FIX_NAMES = {
     0: "NO_GPS",
     1: "NO_FIX",
@@ -73,6 +75,24 @@ MAX_RTCM_PAYLOAD = 180
 MAX_RTCM_FRAGS = 4
 
 EXPECTED_RTCM_TYPES = {1005, 1006, 1074, 1084, 1094, 1124, 1230}
+MSM7_RTCM_TYPES = {1077, 1087, 1097, 1127}
+
+# 保存・注入を許可する最大フレーム長（180 byte x 4 断片）
+MAX_RTCM_FRAME_LEN = MAX_RTCM_PAYLOAD * MAX_RTCM_FRAGS
+
+# 拒否理由（カウンターのキー）
+RTCM_REJECT_CRC = "crc_invalid"
+RTCM_REJECT_MSM7 = "msm7"
+RTCM_REJECT_UNKNOWN = "unknown"
+RTCM_REJECT_OVERSIZE = "oversize"
+RTCM_REJECT_INCOMPLETE = "incomplete"
+RTCM_REJECT_REASONS = (
+    RTCM_REJECT_CRC,
+    RTCM_REJECT_MSM7,
+    RTCM_REJECT_UNKNOWN,
+    RTCM_REJECT_OVERSIZE,
+    RTCM_REJECT_INCOMPLETE,
+)
 
 
 def load_config(path: Optional[str]) -> dict:
@@ -145,6 +165,60 @@ def fragment_rtcm_frame(
         data = chunk + b"\x00" * (max_size - len(chunk))
         out.append((flags, len(chunk), data))
     return out
+
+
+def rtcm_frame_reject_reason(frame: bytes) -> Optional[str]:
+    """フレームが保存・注入不可なら理由を、許可なら None を返す。
+
+    判定順: 長さ → CRC-24Q → MSM7 → 許可タイプ。
+    すべての条件を満たす RTCM3 フレームだけが Pixhawk 行きになる。
+    """
+    if len(frame) > MAX_RTCM_FRAME_LEN:
+        return RTCM_REJECT_OVERSIZE
+    if not rtcm3_verify_frame(frame):
+        return RTCM_REJECT_CRC
+    msg_type = rtcm3_frame_msg_type(frame)
+    if msg_type in MSM7_RTCM_TYPES:
+        return RTCM_REJECT_MSM7
+    if msg_type not in EXPECTED_RTCM_TYPES:
+        return RTCM_REJECT_UNKNOWN
+    return None
+
+
+def new_rtcm_stats() -> dict:
+    """RTCM 受理・拒否カウンターを初期化する。"""
+    return {
+        "accepted": 0,
+        "fragments": 0,
+        "rejected": {reason: 0 for reason in RTCM_REJECT_REASONS},
+    }
+
+
+def record_rtcm_rejection(stats: dict, reason: str) -> None:
+    """拒否理由別カウンターを 1 件進める。"""
+    stats["rejected"][reason] = stats["rejected"].get(reason, 0) + 1
+
+
+def format_rtcm_stats(stats: dict) -> str:
+    """拒否理由別カウンターを 1 行で出力可能な形式にする。"""
+    rejected = stats.get("rejected", {})
+    details = ", ".join(
+        f"{reason}={rejected.get(reason, 0)}" for reason in RTCM_REJECT_REASONS
+    )
+    return (
+        f"[RTCM Stats] accepted={stats.get('accepted', 0)} "
+        f"fragments={stats.get('fragments', 0)} "
+        f"rejected={sum(rejected.values())} ({details})"
+    )
+
+
+def is_incomplete_rtcm(buf: bytearray) -> bool:
+    """extract_rtcm_frames が残したバッファが未完了フレームか判定する。
+
+    抽出後のバッファが 0xD3 始まりなら、ヘッダまたはペイロードの受信が
+    途中で途切れている（それ以外は先頭の非 RTCM バイトが残るだけ）。
+    """
+    return bool(buf) and buf[0] == 0xD3
 
 
 def open_logs(log_dir: str):
@@ -393,6 +467,7 @@ def main() -> int:
     last_log_time = 0.0
     last_fix_type = None
     stop_event = threading.Event()
+    rtcm_stats = new_rtcm_stats()
 
     # 起動時フェイルセーフ確認フラグ
     fs_checked = False
@@ -511,8 +586,6 @@ def main() -> int:
     # 3. TCP RTCM -> MAVLink GPS_RTCM_DATA -> Serial (Base -> Pixhawk) + Write .rtcm3
     def rtcm_tcp_to_mavlink():
         seq = 0
-        injected_frames = 0
-        oversized_frames = 0
 
         while not stop_event.is_set():
             try:
@@ -529,17 +602,18 @@ def main() -> int:
                             break
                         buf.extend(chunk)
                         for frame in extract_rtcm_frames(buf):
+                            reason = rtcm_frame_reject_reason(frame)
+                            if reason is not None:
+                                record_rtcm_rejection(rtcm_stats, reason)
+                                continue
+
                             if rtcm_file is not None:
                                 rtcm_file.write(frame)
                                 rtcm_file.flush()
 
                             frags = fragment_rtcm_frame(frame, seq)
                             if not frags:
-                                oversized_frames += 1
-                                print(f"[RTCM WARN] {len(frame)}-byte frame needs > "
-                                      f"{MAX_RTCM_FRAGS} fragments; dropped "
-                                      f"(total={oversized_frames})")
-                                seq = (seq + 1) % 32
+                                record_rtcm_rejection(rtcm_stats, RTCM_REJECT_OVERSIZE)
                                 continue
 
                             for flags, flen, data in frags:
@@ -549,10 +623,15 @@ def main() -> int:
                                 if len(frags) > 1:
                                     time.sleep(0.003)
 
+                            rtcm_stats["fragments"] += len(frags)
                             seq = (seq + 1) % 32
-                            injected_frames += 1
-                            if injected_frames % 50 == 1:
-                                print(f"[RTCM Injected] Total {injected_frames} frames -> Pixhawk TELEM1")
+                            rtcm_stats["accepted"] += 1
+                            if rtcm_stats["accepted"] % 50 == 1:
+                                print(f"[RTCM Injected] Total {rtcm_stats['accepted']} "
+                                      f"frames -> Pixhawk TELEM1")
+                    if is_incomplete_rtcm(buf):
+                        record_rtcm_rejection(rtcm_stats, RTCM_REJECT_INCOMPLETE)
+                    buf.clear()
             except socket.timeout:
                 if stop_event.is_set():
                     break
@@ -592,6 +671,7 @@ def main() -> int:
             pass
         for t in threads:
             t.join(timeout=2.0)
+        print(format_rtcm_stats(rtcm_stats))
         if csv_file is not None:
             csv_file.close()
         if rtcm_file is not None:
