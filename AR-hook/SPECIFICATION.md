@@ -8,6 +8,7 @@
 - **ArUco マーカーによる高精度位置推定**: 正方形 4 頂点マーカー（PnP 推定）および手先/機体基準マーカーのリアルタイム追跡
 - **マルチソース姿勢・座標変換パイプライン**: Motive カメラ剛体姿勢（ID=3）、Motive 機体姿勢（ID=1）、Pixhawk IMU 磁気センサーによる柔軟な座標系変換
 - **自動オプティカルオフセット＆6DoF キャリブレーション**: カメラ光学中心と剛体マーカー間の並進・回転誤差（`camera_optical_offset.npz`）の自動同定・適用
+- **物体固定ARマーカー姿勢校正**: ARマーカー群とMotive剛体間の固定6DoF変換を校正し、カメラの移動・姿勢変更後も再利用
 - **Motive ↔ MAVLink GPS ブリッジ**: モーションキャプチャ座標を MAVLink `GPS_INPUT` に変換して Pixhawk EKF3 へ 15Hz 注入
 - **多目的ログ収集と解析ツール群**: 変位誤差解析、6DoF 最適化、真値同期精度評価（MAE / RMSE / SD）、リアルタイム加速度プロット
 
@@ -34,7 +35,9 @@ AR-hook/
 ├── camera_optical_offset.npz   # オプティカルオフセット・回転誤差パラメータファイル
 ├── send_GPS3.py                # Motive座標 → ArduPilot GPS_INPUT 送信ブリッジ（15Hz）
 ├── setup_ELRS_5.py             # Pixhawk EKF3・センサー融合パラメータ設定スクリプト
-├── verify_displacement.py      # 2つのCSVログから変位誤差検証＆光学オフセット自動校正
+├── verify_displacement.py      # 2つのCSVログから変位誤差検証＆カメラ光学オフセット自動校正
+├── calibrate_marker_pose_offsets.py # ARマーカー群とMotive剛体の固定姿勢校正
+├── marker_pose_calibration.py  # 姿勢オフセット変換・検証処理
 ├── verify_accuracy.py          # 1つのログファイルからMotive真値とAR推定値の精度評価 (MAE/RMSE)
 ├── verify_accuracy_2csv.py     # ARログとMotive生ログの2ファイル時間同期＆軌道比較評価
 ├── test_accel_plot.py          # MAVLink 加速度センサーのリアルタイム GUI/コンソール描画
@@ -191,11 +194,25 @@ $$
 - `cargo_offset` / `cargo_rot_offset`: 荷物中心の 6DoF 補正パラメータ
 - `hand_offset` / `hand_rot_offset`: 手先（ID1）の 6DoF 補正パラメータ
 
+### 6.4 物体に固定したARマーカー群の姿勢オフセット
+
+カメラの位置・姿勢を変えても再利用できる補正には、カメラ座標内の固定XYZ補正ではなく、ARマーカー座標系から対応するMotive剛体座標系への固定剛体変換を使います。校正値は `marker_pose_offsets.json` に保存し、AR-hook起動時に読み込まれます。
+
+対応は `hand` がAR ID1とMotive RB1、`cargo` がAR ID2〜5から推定した荷物群フレームとMotive RB2です。校正用CSVでは、ARとMotiveの両方が追跡され、AR姿勢・カメラ姿勢・Motive姿勢のタイムスタンプが許容範囲内にあるサンプルだけを使います。各サンプルの相対姿勢をクォータニオンで平均し、位置・角度の外れ値を除外します。
+
+```bash
+python calibrate_marker_pose_offsets.py <校正用_AR-hook_CSV>
+```
+
+各対象で最低20件の有効サンプルが必要です。出力ファイルが既にある場合は上書きせず停止します。意図して再校正する場合だけ `--force` を付けます。校正後にAR-hookを再起動すると位置・姿勢への補正が有効になります。既存の `camera_optical_offset.npz` はカメラ光学中心とMotive RB3間の別の補正であり、このマーカー校正とは区別されます。カメラとRB3のマーカーが相対的に動いた場合は、カメラ側の補正も再校正してください。
+
+校正CSVは新しい列（`AR_Hand_*_NED`, `AR_Cargo_*_NED`, `Motive_RB*_Pose_*`）を含む必要があります。既存の古いCSVには必要な姿勢・時刻列がないため、そのままでは校正に使えません。マーカーまたは対象物への取り付け位置を変えた場合は再校正が必要です。
+
 ---
 
 ## 7. CSV ログフォーマット仕様
 
-`AR-hook1_test.py` が `~/LOGS_Pixhawk6c/YYYYMMDD_HHMMSS_1.csv` に出力する現行94列のログ構成です。ワールド座標を記録するX/Y/Z列はN/E/D（北・東・下）の順です。
+`AR-hook1_test.py` が `~/LOGS_Pixhawk6c/YYYYMMDD_HHMMSS_1.csv` に出力するログです。ワールド座標を記録するX/Y/Z列はN/E/D（北・東・下）の順です。既存列に加え、AR校正用のNED姿勢・時刻とMotive剛体ごとの位置・姿勢パケット時刻を末尾に記録します。
 
 | 列番号 | カラム名 | 単位 | 説明 |
 |---|---|---|---|
@@ -234,6 +251,11 @@ $$
 | 87-90 | `Motive_RB3_QX/QY/QZ/QW` | - | Motive剛体ID3の正規化済み生クォータニオン |
 | 91-93 | `Motive_RB3_Roll/Pitch/Yaw_NED_rad` | rad | Motive剛体ID3のNED姿勢 |
 | 94 | `Motive_RB3_Attitude_Received` | 0/1 | Motive剛体ID3姿勢の受信フラグ |
+| 95-103 | `Motive_RB1_X/Y/Z_NED_m`, `Pose_QX/QY/QZ/QW`, `Pose_Time_s`, `Pose_Received` | m / - / s / 0/1 | RB1の同一姿勢パケットに含まれるNED位置・正規化クォータニオン・送信時刻・受信フラグ |
+| 104-112 | `Motive_RB2_X/Y/Z_NED_m`, `Pose_QX/QY/QZ/QW`, `Pose_Time_s`, `Pose_Received` | m / - / s / 0/1 | RB2の同一姿勢パケットに含まれるNED位置・正規化クォータニオン・送信時刻・受信フラグ |
+| 113-121 | `Motive_RB3_X/Y/Z_NED_m`, `Pose_QX/QY/QZ/QW`, `Pose_Time_s`, `Pose_Received` | m / - / s / 0/1 | RB3の同一姿勢パケットに含まれるNED位置・正規化クォータニオン・送信時刻・受信フラグ |
+| 122-131 | `AR_Hand_X/Y/Z_NED_m`, `QX/QY/QZ/QW_NED`, `Pose_Time_s`, `Camera_Pose_Time_s`, `Pose_Received` | m / - / s / 0/1 | 校正に使うAR ID1のNED姿勢とAR・カメラ姿勢時刻 |
+| 132-141 | `AR_Cargo_X/Y/Z_NED_m`, `QX/QY/QZ/QW_NED`, `Pose_Time_s`, `Camera_Pose_Time_s`, `Pose_Received` | m / - / s / 0/1 | 校正に使うAR ID2-5の荷物群フレームNED姿勢と時刻 |
 
 座標系の定義は、Motiveワールドを右手系（X=北、Y=上、Z=東）、Wを右手系NED（X=北、Y=東、Z=下）とします。変換は
 `C_WM = [[1,0,0],[0,0,1],[0,-1,0]] = Rx(-90°)` です。位置は `p_W = C_WM p_M + t` とし、Motiveの剛体姿勢クォータニオン（active rotation、成分順`(x,y,z,w)`）は、基底変換を左右から適用して `q_W = q_WM ⊗ q_M ⊗ inverse(q_WM)` とします。ここで `q_WM` は `C_WM` に対応するクォータニオンです。Euler表示はZYX（yaw-pitch-roll）回転順で、値の並びはRoll, Pitch, Yawです。

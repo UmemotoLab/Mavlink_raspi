@@ -5,6 +5,12 @@ from pathlib import Path
 import numpy as np
 import cv2
 from cv2 import aruco
+from marker_pose_calibration import (
+    apply_pose_offset,
+    load_marker_pose_offsets,
+    quaternion_to_rotation_matrix_xyzw,
+    rotation_matrix_to_quaternion_xyzw,
+)
 # pyrefly: ignore [missing-import]
 from pymavlink import mavutil
 import pytz
@@ -94,6 +100,17 @@ if OFFSET_PARAMS_FILE.exists():
     except Exception as e:
         print(f"⚠ オフセットファイル {OFFSET_PARAMS_FILE.name} のロードに失敗しました ({e})。デフォルト値を使用します。")
 
+MARKER_POSE_OFFSET_FILE = Path(__file__).parent / "marker_pose_offsets.json"
+MARKER_POSE_OFFSETS = (
+    load_marker_pose_offsets(MARKER_POSE_OFFSET_FILE)
+    if MARKER_POSE_OFFSET_FILE.exists()
+    else {}
+)
+if MARKER_POSE_OFFSETS:
+    print(f"✓ ARマーカーとMotive剛体の固定姿勢オフセットをロードしました: {MARKER_POSE_OFFSET_FILE.name}")
+else:
+    print(f"ℹ 固定姿勢オフセットなし（未校正）: {MARKER_POSE_OFFSET_FILE.name}")
+
 # ───── 基準点設定 ─────
 # Motive SDKの固定GPS基準点と一致させ、異なるCSV間でNED原点を共有します。
 REF_LAT, REF_LON, REF_ALT = 36.0757800, 136.2132900, 0.0
@@ -167,6 +184,32 @@ motive_rigid_body_attitudes_ned = {
 motive_rigid_body_attitude_received = {
     rigid_body_id: False
     for rigid_body_id in MOTIVE_RIGID_BODY_IDS
+}
+motive_rigid_body_positions_ned = {
+    rigid_body_id: [float('nan')] * 3
+    for rigid_body_id in MOTIVE_RIGID_BODY_IDS
+}
+motive_rigid_body_pose_quaternions = {
+    rigid_body_id: [float('nan')] * 4
+    for rigid_body_id in MOTIVE_RIGID_BODY_IDS
+}
+motive_rigid_body_pose_times_s = {
+    rigid_body_id: float('nan')
+    for rigid_body_id in MOTIVE_RIGID_BODY_IDS
+}
+motive_rigid_body_pose_received = {
+    rigid_body_id: False
+    for rigid_body_id in MOTIVE_RIGID_BODY_IDS
+}
+ar_marker_pose_log = {
+    name: {
+        "position_ned": [float('nan')] * 3,
+        "quaternion_ned": [float('nan')] * 4,
+        "timestamp_s": float('nan'),
+        "camera_timestamp_s": float('nan'),
+        "received": False,
+    }
+    for name in ("hand", "cargo")
 }
 
 # ✅ Cargo Motive Position & Orientation (ID2-5マーカー)
@@ -284,6 +327,23 @@ def quaternion_to_rotation_matrix(qx, qy, qz, qw):
         [2*(qx*qy + qw*qz),         1 - 2*(qx**2 + qz**2),   2*(qy*qz - qw*qx)],
         [2*(qx*qz - qw*qy),         2*(qy*qz + qw*qx),       1 - 2*(qx**2 + qy**2)]
     ], dtype=np.float32)
+
+
+def _apply_marker_pose_offset(name, position_camera, rotation_camera):
+    offset = MARKER_POSE_OFFSETS.get(name)
+    position = np.asarray(position_camera, dtype=np.float64)
+    rotation = np.asarray(rotation_camera, dtype=np.float64)
+    if offset is None:
+        return position.astype(np.float32), rotation.astype(np.float32)
+    offset_position, offset_quaternion = offset
+    quaternion = rotation_matrix_to_quaternion_xyzw(rotation)
+    corrected_position, corrected_quaternion = apply_pose_offset(
+        position, quaternion, offset_position, offset_quaternion
+    )
+    corrected_rotation = quaternion_to_rotation_matrix_xyzw(
+        corrected_quaternion
+    )
+    return corrected_position.astype(np.float32), corrected_rotation.astype(np.float32)
 
 
 def rotation_matrix_to_quaternion_xyzw(rotation):
@@ -567,6 +627,16 @@ def motive_rigid_body_pose_udp_listener():
             alt = alt_mm / 1000.0
 
             position_ned = gps_to_local_xyz(lat, lon, alt)
+            with io_lock:
+                motive_rigid_body_positions_ned[rigid_body_id] = list(position_ned)
+                motive_rigid_body_pose_quaternions[rigid_body_id] = [
+                    qx / quat_norm,
+                    qy / quat_norm,
+                    qz / quat_norm,
+                    qw / quat_norm,
+                ]
+                motive_rigid_body_pose_times_s[rigid_body_id] = timestamp
+                motive_rigid_body_pose_received[rigid_body_id] = True
             if rigid_body_id == 1:
                 with io_lock:
                     motive_drone_x, motive_drone_y, motive_drone_z = position_ned
@@ -1036,9 +1106,15 @@ def camera_tracker_loop(m, show_window=False):
             detected_ids = [] if ids is None else [int(marker_id) for marker_id in ids.flatten()]
             has_cargo = False
             has_id1 = False
+            used_last_center = False
             dist_x, dist_y, dist_z = float('nan'), float('nan'), float('nan')
+            center_cam = None
+            rvec_cargo = None
             id1_cam = None
             id1_rvec_cam = None
+            raw_id1_cam = None
+            R_cam_marker = None
+            R_cam_cargo = None
             
             if ids is not None:
                 obj_points = []
@@ -1099,8 +1175,19 @@ def camera_tracker_loop(m, show_window=False):
 
                 if id1_cam is not None:
                     has_id1 = True
+                    raw_id1_cam = id1_cam.copy()
                     R_cam_marker, _ = cv2.Rodrigues(id1_rvec_cam)
                     R_cam_marker = HAND_ROT_OFFSET @ R_cam_marker
+                    id1_cam = (
+                        HAND_ROT_OFFSET.dot(id1_cam)
+                        + np.array(
+                            [HAND_OFFSET_CAM_X, HAND_OFFSET_CAM_Y, HAND_OFFSET_CAM_Z],
+                            dtype=np.float32,
+                        )
+                    )
+                    id1_cam, R_cam_marker = _apply_marker_pose_offset(
+                        "hand", id1_cam, R_cam_marker
+                    )
                     R_front_reference = ar_marker_front_facing_reference_rotation()
                     attitude_cam = ar_marker_relative_attitude_rpy(
                         R_cam_marker, R_front_reference
@@ -1129,16 +1216,27 @@ def camera_tracker_loop(m, show_window=False):
                 if center_cam is not None:
                     raw_center_cam = center_cam.copy()
                     c_cam_raw_val = [float(center_cam[0]), float(center_cam[1]), float(center_cam[2])]
-                    # 回転・並進オフセット適用 (カメラから荷物中心への6DOFオフセット, ワールド目標算出用)
-                    center_cam = CARGO_ROT_OFFSET.dot(center_cam) + np.array([CARGO_OFFSET_CAM_X, CARGO_OFFSET_CAM_Y, CARGO_OFFSET_CAM_Z], dtype=np.float32)
+                    R_cam_cargo, _ = cv2.Rodrigues(rvec_cargo)
+                    R_cam_cargo = CARGO_ROT_OFFSET @ R_cam_cargo
+                    center_cam = (
+                        CARGO_ROT_OFFSET.dot(center_cam)
+                        + np.array(
+                            [CARGO_OFFSET_CAM_X, CARGO_OFFSET_CAM_Y, CARGO_OFFSET_CAM_Z],
+                            dtype=np.float32,
+                        )
+                    )
+                    center_cam, R_cam_cargo = _apply_marker_pose_offset(
+                        "cargo", center_cam, R_cam_cargo
+                    )
+                    rvec_cargo, _ = cv2.Rodrigues(R_cam_cargo)
 
                 h_cam_raw_val = [float('nan'), float('nan'), float('nan')]
-                raw_id1_cam = None
                 if id1_cam is not None:
-                    raw_id1_cam = id1_cam.copy()
-                    h_cam_raw_val = [float(id1_cam[0]), float(id1_cam[1]), float(id1_cam[2])]
-                    # 回転・並進オフセット適用 (カメラから手先への6DOFオフセット, ワールド目標算出用)
-                    id1_cam = HAND_ROT_OFFSET.dot(id1_cam) + np.array([HAND_OFFSET_CAM_X, HAND_OFFSET_CAM_Y, HAND_OFFSET_CAM_Z], dtype=np.float32)
+                    h_cam_raw_val = [
+                        float(raw_id1_cam[0]),
+                        float(raw_id1_cam[1]),
+                        float(raw_id1_cam[2]),
+                    ]
                     ar_hand_camera = tuple(float(value) for value in id1_cam)
 
                 # Motiveデータのカメラ座標系への逆投影真値の算出
@@ -1162,6 +1260,59 @@ def camera_tracker_loop(m, show_window=False):
                     hand_cam_raw = h_cam_raw_val
                     motive_cargo_cam = m_cargo_cam_val
                     motive_hand_cam = m_hand_cam_val
+
+                with io_lock:
+                    calibration_camera_received = motive_camera_received
+                    calibration_camera_rotation = R_cam_to_world.copy()
+                    calibration_camera_position = t_cam_world.copy()
+                    calibration_camera_time = motive_camera_pose_time_s
+
+                ar_pose_updates = {}
+                if calibration_camera_received:
+                    for name, detected, marker_position, marker_rotation in (
+                        ("hand", has_id1, id1_cam, R_cam_marker),
+                        (
+                            "cargo",
+                            has_cargo and not used_last_center,
+                            center_cam,
+                            R_cam_cargo,
+                        ),
+                    ):
+                        if (
+                            detected
+                            and marker_position is not None
+                            and marker_rotation is not None
+                        ):
+                            position_ned = (
+                                calibration_camera_rotation
+                                @ np.asarray(marker_position, dtype=np.float64)
+                                + calibration_camera_position
+                            )
+                            rotation_ned = (
+                                calibration_camera_rotation
+                                @ np.asarray(marker_rotation, dtype=np.float64)
+                            )
+                            ar_pose_updates[name] = {
+                                "position_ned": position_ned.tolist(),
+                                "quaternion_ned": list(
+                                    rotation_matrix_to_quaternion_xyzw(rotation_ned)
+                                ),
+                                "timestamp_s": time.time(),
+                                "camera_timestamp_s": calibration_camera_time,
+                                "received": True,
+                            }
+                with io_lock:
+                    for name in ar_marker_pose_log:
+                        ar_marker_pose_log[name] = ar_pose_updates.get(
+                            name,
+                            {
+                                "position_ned": [float('nan')] * 3,
+                                "quaternion_ned": [float('nan')] * 4,
+                                "timestamp_s": float('nan'),
+                                "camera_timestamp_s": float('nan'),
+                                "received": False,
+                            },
+                        )
 
                 if has_cargo:
                     # ✅ テレメトリおよび姿勢（Roll, Pitch, Yaw）データの取得
@@ -1586,6 +1737,27 @@ def record_data():
                     1 if motive_rigid_body_attitude_received[rigid_body_id] else 0,
                 )
             ]
+            motive_pose_calibration_log = [
+                component
+                for rigid_body_id in MOTIVE_RIGID_BODY_IDS
+                for component in (
+                    *motive_rigid_body_positions_ned[rigid_body_id],
+                    *motive_rigid_body_pose_quaternions[rigid_body_id],
+                    motive_rigid_body_pose_times_s[rigid_body_id],
+                    1 if motive_rigid_body_pose_received[rigid_body_id] else 0,
+                )
+            ]
+            ar_pose_log_values = [
+                component
+                for name in ("hand", "cargo")
+                for component in (
+                    *ar_marker_pose_log[name]["position_ned"],
+                    *ar_marker_pose_log[name]["quaternion_ned"],
+                    ar_marker_pose_log[name]["timestamp_s"],
+                    ar_marker_pose_log[name]["camera_timestamp_s"],
+                    1 if ar_marker_pose_log[name]["received"] else 0,
+                )
+            ]
             
         data_records.append([
             time.time(), 
@@ -1621,7 +1793,9 @@ def record_data():
             ar_att_cam[0], ar_att_cam[1], ar_att_cam[2],
             ar_att_world[0], ar_att_world[1], ar_att_world[2],
             m_att_rcv,
-            *motive_pose_log
+            *motive_pose_log,
+            *motive_pose_calibration_log,
+            *ar_pose_log_values,
         ])
         time.sleep(1 / AR_LOG_HZ)
 def save_csv():
@@ -1678,6 +1852,37 @@ def save_csv():
                     f'Motive_RB{rigid_body_id}_Pitch_NED_rad',
                     f'Motive_RB{rigid_body_id}_Yaw_NED_rad',
                     f'Motive_RB{rigid_body_id}_Attitude_Received',
+                )
+            ],
+            *[
+                column
+                for rigid_body_id in MOTIVE_RIGID_BODY_IDS
+                for column in (
+                    f'Motive_RB{rigid_body_id}_X_NED_m',
+                    f'Motive_RB{rigid_body_id}_Y_NED_m',
+                    f'Motive_RB{rigid_body_id}_Z_NED_m',
+                    f'Motive_RB{rigid_body_id}_Pose_QX',
+                    f'Motive_RB{rigid_body_id}_Pose_QY',
+                    f'Motive_RB{rigid_body_id}_Pose_QZ',
+                    f'Motive_RB{rigid_body_id}_Pose_QW',
+                    f'Motive_RB{rigid_body_id}_Pose_Time_s',
+                    f'Motive_RB{rigid_body_id}_Pose_Received',
+                )
+            ],
+            *[
+                column
+                for name in ("Hand", "Cargo")
+                for column in (
+                    f'AR_{name}_X_NED_m',
+                    f'AR_{name}_Y_NED_m',
+                    f'AR_{name}_Z_NED_m',
+                    f'AR_{name}_QX_NED',
+                    f'AR_{name}_QY_NED',
+                    f'AR_{name}_QZ_NED',
+                    f'AR_{name}_QW_NED',
+                    f'AR_{name}_Pose_Time_s',
+                    f'AR_{name}_Camera_Pose_Time_s',
+                    f'AR_{name}_Pose_Received',
                 )
             ]
         ])
