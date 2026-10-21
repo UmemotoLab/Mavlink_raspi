@@ -211,6 +211,8 @@ motive_rigid_body_pose_history = {
 }
 ar_marker_pose_log = {
     name: {
+        "pre_offset_position_ned": [float('nan')] * 3,
+        "pre_offset_quaternion_ned": [float('nan')] * 4,
         "position_ned": [float('nan')] * 3,
         "quaternion_ned": [float('nan')] * 4,
         "timestamp_s": float('nan'),
@@ -1297,6 +1299,8 @@ def camera_tracker_loop(m, show_window=False):
                             dtype=np.float32,
                         )
                     )
+                    hand_pre_offset_position_cam = id1_cam.copy()
+                    hand_pre_offset_rotation_cam = R_cam_marker.copy()
                     id1_cam, R_cam_marker = _apply_marker_pose_offset(
                         "hand", id1_cam, R_cam_marker
                     )
@@ -1347,6 +1351,8 @@ def camera_tracker_loop(m, show_window=False):
                             dtype=np.float32,
                         )
                     )
+                    cargo_pre_offset_position_cam = center_cam.copy()
+                    cargo_pre_offset_rotation_cam = R_cam_cargo.copy()
                     center_cam, R_cam_cargo = _apply_marker_pose_offset(
                         "cargo", center_cam, R_cam_cargo
                     )
@@ -1390,11 +1396,27 @@ def camera_tracker_loop(m, show_window=False):
                         calibration_camera_position,
                         calibration_camera_time,
                     ) = frame_camera_pose
-                    for name, detected, marker_position, marker_rotation in (
-                        ("hand", has_id1, id1_cam, R_cam_marker),
+                    for (
+                        name,
+                        detected,
+                        pre_offset_position,
+                        pre_offset_rotation,
+                        marker_position,
+                        marker_rotation,
+                    ) in (
+                        (
+                            "hand",
+                            has_id1,
+                            hand_pre_offset_position_cam if has_id1 else None,
+                            hand_pre_offset_rotation_cam if has_id1 else None,
+                            id1_cam,
+                            R_cam_marker,
+                        ),
                         (
                             "cargo",
                             has_cargo and not used_last_center,
+                            cargo_pre_offset_position_cam if center_cam is not None else None,
+                            cargo_pre_offset_rotation_cam if center_cam is not None else None,
                             center_cam,
                             R_cam_cargo,
                         ),
@@ -1404,6 +1426,15 @@ def camera_tracker_loop(m, show_window=False):
                             and marker_position is not None
                             and marker_rotation is not None
                         ):
+                            pre_offset_position_ned = (
+                                calibration_camera_rotation
+                                @ np.asarray(pre_offset_position, dtype=np.float64)
+                                + calibration_camera_position
+                            )
+                            pre_offset_rotation_ned = (
+                                calibration_camera_rotation
+                                @ np.asarray(pre_offset_rotation, dtype=np.float64)
+                            )
                             position_ned = (
                                 calibration_camera_rotation
                                 @ np.asarray(marker_position, dtype=np.float64)
@@ -1414,6 +1445,12 @@ def camera_tracker_loop(m, show_window=False):
                                 @ np.asarray(marker_rotation, dtype=np.float64)
                             )
                             ar_pose_updates[name] = {
+                                "pre_offset_position_ned": pre_offset_position_ned.tolist(),
+                                "pre_offset_quaternion_ned": list(
+                                    rotation_matrix_to_quaternion_xyzw(
+                                        pre_offset_rotation_ned
+                                    )
+                                ),
                                 "position_ned": position_ned.tolist(),
                                 "quaternion_ned": list(
                                     rotation_matrix_to_quaternion_xyzw(rotation_ned)
@@ -1427,6 +1464,8 @@ def camera_tracker_loop(m, show_window=False):
                         ar_marker_pose_log[name] = ar_pose_updates.get(
                             name,
                             {
+                                "pre_offset_position_ned": [float('nan')] * 3,
+                                "pre_offset_quaternion_ned": [float('nan')] * 4,
                                 "position_ned": [float('nan')] * 3,
                                 "quaternion_ned": [float('nan')] * 4,
                                 "timestamp_s": float('nan'),
@@ -1893,6 +1932,14 @@ def record_data():
                     1 if ar_marker_pose_log[name]["received"] else 0,
                 )
             ]
+            ar_pose_pre_offset_log_values = [
+                component
+                for name in ("hand", "cargo")
+                for component in (
+                    *ar_marker_pose_log[name]["pre_offset_position_ned"],
+                    *ar_marker_pose_log[name]["pre_offset_quaternion_ned"],
+                )
+            ]
             
         data_records.append([
             time.time(), 
@@ -1931,6 +1978,7 @@ def record_data():
             *motive_pose_log,
             *motive_pose_calibration_log,
             *ar_pose_log_values,
+            *ar_pose_pre_offset_log_values,
         ])
         time.sleep(1 / AR_LOG_HZ)
 def save_csv():
@@ -2019,7 +2067,20 @@ def save_csv():
                     f'AR_{name}_Camera_Pose_Time_s',
                     f'AR_{name}_Pose_Received',
                 )
-            ]
+            ],
+            *[
+                column
+                for name in ("Hand", "Cargo")
+                for column in (
+                    f'AR_{name}_PreOffset_X_NED_m',
+                    f'AR_{name}_PreOffset_Y_NED_m',
+                    f'AR_{name}_PreOffset_Z_NED_m',
+                    f'AR_{name}_PreOffset_QX_NED',
+                    f'AR_{name}_PreOffset_QY_NED',
+                    f'AR_{name}_PreOffset_QZ_NED',
+                    f'AR_{name}_PreOffset_QW_NED',
+                )
+            ],
         ])
         writer.writerows(data_records)
     print(f"\n✓ CSV保存完了: {path} ({len(data_records)} 行)")

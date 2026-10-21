@@ -260,6 +260,8 @@ python calibrate_marker_pose_offsets.py <校正用_AR-hook_CSV>
 | 113-121 | `Motive_RB3_X/Y/Z_NED_m`, `Pose_QX/QY/QZ/QW`, `Pose_Time_s`, `Pose_Received` | m / - / s / 0/1 | RB3の同一姿勢パケットに含まれるNED位置・正規化クォータニオン・送信時刻・受信フラグ |
 | 122-131 | `AR_Hand_X/Y/Z_NED_m`, `QX/QY/QZ/QW_NED`, `Pose_Time_s`, `Camera_Pose_Time_s`, `Pose_Received` | m / - / s / 0/1 | 校正に使うAR ID1のNED姿勢とAR・カメラ姿勢時刻 |
 | 132-141 | `AR_Cargo_X/Y/Z_NED_m`, `QX/QY/QZ/QW_NED`, `Pose_Time_s`, `Camera_Pose_Time_s`, `Pose_Received` | m / - / s / 0/1 | 校正に使うAR ID2-5の荷物群フレームNED姿勢と時刻 |
+| 142-148 | `AR_Hand_PreOffset_X/Y/Z_NED_m`, `PreOffset_QX/QY/QZ/QW_NED` | m / - | HANDカメラ基礎補正後、再利用可能なマーカー姿勢オフセット適用前のAR ID1姿勢 |
+| 149-155 | `AR_Cargo_PreOffset_X/Y/Z_NED_m`, `PreOffset_QX/QY/QZ/QW_NED` | m / - | CARGOカメラ基礎補正後、再利用可能なマーカー姿勢オフセット適用前のAR ID2-5荷物群姿勢 |
 
 座標系の定義は、Motiveワールドを右手系（X=北、Y=上、Z=東）、Wを右手系NED（X=北、Y=東、Z=下）とします。変換は
 `C_WM = [[1,0,0],[0,0,1],[0,-1,0]] = Rx(-90°)` です。位置は `p_W = C_WM p_M + t` とし、Motiveの剛体姿勢クォータニオン（active rotation、成分順`(x,y,z,w)`）は、基底変換を左右から適用して `q_W = q_WM ⊗ q_M ⊗ inverse(q_WM)` とします。ここで `q_WM` は `C_WM` に対応するクォータニオンです。Euler表示はZYX（yaw-pitch-roll）回転順で、値の並びはRoll, Pitch, Yawです。
@@ -283,6 +285,17 @@ python3 plot_hand_ar_world.py <CSV_PATH>
 ```
 
 PNGは入力CSVと同じフォルダーに保存され、既定ではグラフ画面も表示されます。画面を表示せず保存だけ行う場合は `--no-show` を付けます。Motive版はID1ドローン／手先マーカー位置（NED）とMotive ID1センサ姿勢（Roll/Pitch/Yaw、度）を別々のグラフに保存します。ARカメラ座標版は `Hand_Cam_Raw_X/Y/Z_m` とカメラ座標系のマーカー姿勢を、ARからW座標への変換版は保存済みカメラ姿勢行列を適用したNED位置と絶対NED姿勢を描画します。姿勢角はZYX順で変換した後、Roll/Pitch/Yaw（ラジアン保存、グラフは度表示）として表示します。Matplotlibが必要です。
+
+#### AR姿勢オフセットの前後比較
+
+修正版AR-hookで取得したCSVから、hand（AR ID1/RB1）とcargo（AR ID2-5/RB2）それぞれのNED位置・姿勢を、再利用可能なマーカー姿勢オフセット適用前、適用後、Motiveの3系列で比較できます。HAND/CARGOのカメラ基礎補正は両方のAR系列に適用済みです。Motive値はCSVのAR撮影時刻に合わせて補間します。位置と姿勢のPNGを対象ごとに保存します。
+
+```bash
+python3 plot_pose_offset_comparison.py <CSV_PATH> --no-show
+python3 plot_pose_offset_comparison.py <CSV_PATH> --target hand
+```
+
+横軸の範囲は`plot_pose_offset_comparison.py`冒頭の`PLOT_X_RANGE_S`、縦軸は`POSITION_Y_RANGES_M`と`ATTITUDE_Y_RANGES_DEG`で設定します。各範囲は`(下限, 上限)`で指定し、`None`にすると自動範囲です。既定ではhand/cargoの両方を描画し、位置はm、姿勢はZYX順のRoll/Pitch/Yawを度で表示します。姿勢オフセット適用前列が記録されていない旧CSVは利用できないため、修正版AR-hookで新しいCSVを取得してください。
 
 ---
 
