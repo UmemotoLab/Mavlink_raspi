@@ -1252,6 +1252,7 @@ def camera_tracker_loop(m, show_window=False):
                     motive_attitudes = {
                         rigid_body_id: (
                             motive_rigid_body_attitudes_ned[rigid_body_id].copy(),
+                            motive_rigid_body_quaternions[rigid_body_id].copy(),
                             motive_rigid_body_attitude_received[rigid_body_id],
                         )
                         for rigid_body_id in MOTIVE_RIGID_BODY_IDS
@@ -1276,13 +1277,20 @@ def camera_tracker_loop(m, show_window=False):
                         or motive_rigid_body_attitude_received[1]
                     )
                 motive_attitude_text = " | ".join(
-                    f"RB{rigid_body_id} NED RPY[deg]="
+                    f"RB{rigid_body_id} assumed-NED-RPY[deg]="
                     + (
                         ",".join(f"{math.degrees(angle):.1f}" for angle in attitude)
                         if received
                         else "N/A"
                     )
-                    for rigid_body_id, (attitude, received) in motive_attitudes.items()
+                    + " q_xyzw(norm)="
+                    + (
+                        "[" + ",".join(f"{component:+.5f}" for component in quaternion) + "]"
+                        if received
+                        else "N/A"
+                    )
+                    for rigid_body_id, (attitude, quaternion, received)
+                    in motive_attitudes.items()
                 )
                 ar_cam_text = ",".join(
                     f"{math.degrees(angle):.1f}" for angle in ar_attitude_cam_log
