@@ -2,11 +2,13 @@
 # -*- coding: utf-8 -*-
 import os,sys,select,time,math,threading,termios,tty,csv,datetime,signal
 from pathlib import Path
+from bisect import bisect_right
 import numpy as np
 import cv2
 from cv2 import aruco
 from marker_pose_calibration import (
     apply_pose_offset,
+    interpolate_pose,
     load_marker_pose_offsets,
     quaternion_to_rotation_matrix_xyzw,
     rotation_matrix_to_quaternion_xyzw,
@@ -173,6 +175,8 @@ motive_yaw_rad = 0.0
 motive_attitude_received = False
 motive_drone_pos_received = False
 MOTIVE_RIGID_BODY_IDS = (1, 2, CAMERA_RIGID_BODY_ID)
+MOTIVE_POSE_HISTORY_SECONDS = 10.0
+MOTIVE_POSE_INTERPOLATION_MAX_GAP_S = 0.1
 motive_rigid_body_quaternions = {
     rigid_body_id: [float('nan')] * 4
     for rigid_body_id in MOTIVE_RIGID_BODY_IDS
@@ -199,6 +203,10 @@ motive_rigid_body_pose_times_s = {
 }
 motive_rigid_body_pose_received = {
     rigid_body_id: False
+    for rigid_body_id in MOTIVE_RIGID_BODY_IDS
+}
+motive_rigid_body_pose_history = {
+    rigid_body_id: []
     for rigid_body_id in MOTIVE_RIGID_BODY_IDS
 }
 ar_marker_pose_log = {
@@ -409,6 +417,53 @@ def _camera_rotation_from_motive(qx, qy, qz, qw):
             [0.0,  0.0, 1.0]
         ], dtype=np.float32)
     return R_body_to_ned @ R_cv_to_body @ CAMERA_ROT_OFFSET
+
+
+def _store_motive_pose_history(rigid_body_id, timestamp, position_ned, quaternion):
+    sample = (
+        float(timestamp),
+        tuple(float(value) for value in position_ned),
+        tuple(float(value) for value in quaternion),
+    )
+    with io_lock:
+        history = motive_rigid_body_pose_history[rigid_body_id]
+        index = bisect_right([entry[0] for entry in history], sample[0])
+        history.insert(index, sample)
+        cutoff = history[-1][0] - MOTIVE_POSE_HISTORY_SECONDS
+        first_valid = bisect_right([entry[0] for entry in history], cutoff)
+        del history[:first_valid]
+
+
+def _camera_pose_at_frame_time(frame_timestamp_s):
+    with io_lock:
+        samples = list(motive_rigid_body_pose_history[CAMERA_RIGID_BODY_ID])
+    pose = interpolate_pose(
+        samples,
+        frame_timestamp_s,
+        max_gap_s=MOTIVE_POSE_INTERPOLATION_MAX_GAP_S,
+    )
+    if pose is None:
+        return None
+
+    position_ned, quaternion = pose
+    rotation = _camera_rotation_from_motive(*quaternion)
+    position_ned = position_ned + rotation @ CAMERA_OPTICAL_OFFSET
+    sample_times = [sample[0] for sample in samples]
+    insertion = bisect_right(sample_times, frame_timestamp_s)
+    pose_timestamp_s = (
+        frame_timestamp_s
+        if insertion and insertion < len(sample_times)
+        else sample_times[max(0, min(insertion, len(sample_times) - 1))]
+    )
+    return rotation, position_ned, pose_timestamp_s
+
+
+def _camera_sensor_timestamp_to_unix(sensor_timestamp_ns):
+    sensor_timestamp_s = float(sensor_timestamp_ns) / 1_000_000_000.0
+    if not math.isfinite(sensor_timestamp_s) or sensor_timestamp_s < 0:
+        raise ValueError("Picamera2 SensorTimestamp is invalid")
+    return sensor_timestamp_s + time.time() - time.monotonic()
+
 
 def _apply_motive_camera_pose(position_ned, qx, qy, qz, qw, timestamp):
     global motive_camera_x, motive_camera_y, motive_camera_z
@@ -627,14 +682,20 @@ def motive_rigid_body_pose_udp_listener():
             alt = alt_mm / 1000.0
 
             position_ned = gps_to_local_xyz(lat, lon, alt)
+            normalized_quaternion = (
+                qx / quat_norm,
+                qy / quat_norm,
+                qz / quat_norm,
+                qw / quat_norm,
+            )
+            _store_motive_pose_history(
+                rigid_body_id, timestamp, position_ned, normalized_quaternion
+            )
             with io_lock:
                 motive_rigid_body_positions_ned[rigid_body_id] = list(position_ned)
-                motive_rigid_body_pose_quaternions[rigid_body_id] = [
-                    qx / quat_norm,
-                    qy / quat_norm,
-                    qz / quat_norm,
-                    qw / quat_norm,
-                ]
+                motive_rigid_body_pose_quaternions[rigid_body_id] = list(
+                    normalized_quaternion
+                )
                 motive_rigid_body_pose_times_s[rigid_body_id] = timestamp
                 motive_rigid_body_pose_received[rigid_body_id] = True
             if rigid_body_id == 1:
@@ -831,7 +892,7 @@ def _active_camera_to_ned_rotation():
 # ───── カメラ座標系から世界座標系（北・東・下）への座標変換 ─────
 _debug_cargo_log_time = 0.0  # デバッグログ用タイムスタンプ
 
-def camera_to_world_xyz_motive(tvec, debug=False):
+def camera_to_world_xyz_motive(tvec, debug=False, camera_pose=None):
     """
     【推奨】Motive で計測したカメラ位置・姿勢を用いて
     OpenCV カメラ座標系のベクトルを NED ワールド座標に変換する。
@@ -852,10 +913,14 @@ def camera_to_world_xyz_motive(tvec, debug=False):
       2. CAMERA_MOUNT_DIRECTION（'front' または 'down'）が実際のカメラ取り付けと一致しているか
     """
     global _debug_cargo_log_time
-    with io_lock:
-        received = motive_camera_received
-        R = R_cam_to_world.copy()
-        t = t_cam_world.copy()
+    if camera_pose is not None:
+        R, t, _ = camera_pose
+        received = True
+    else:
+        with io_lock:
+            received = motive_camera_received
+            R = R_cam_to_world.copy()
+            t = t_cam_world.copy()
 
     if not received:
         return None  # データ未受信のためフォールバックへ
@@ -1086,6 +1151,8 @@ def camera_tracker_loop(m, show_window=False):
     last_print_time = time.monotonic()
     fps_window_started = last_print_time
     fps_frame_count = 0
+    warned_missing_sensor_timestamp = False
+    last_camera_pose_match_warning = 0.0
     try:
         while running:
             ar_cargo_ned = None
@@ -1093,13 +1160,58 @@ def camera_tracker_loop(m, show_window=False):
             ar_hand_camera = None
             # フレーム取得
             if picam2:
-                img = picam2.capture_array()
-                ret = True
+                request = picam2.capture_request()
+                try:
+                    img = request.make_array("main")
+                    metadata = request.get_metadata()
+                    sensor_timestamp_ns = metadata.get("SensorTimestamp")
+                    if sensor_timestamp_ns is None:
+                        frame_timestamp_s = time.time()
+                        if not warned_missing_sensor_timestamp:
+                            print(
+                                "⚠ Picamera2のSensorTimestampがありません。"
+                                "フレーム取得時刻を代用するため、校正時刻の精度が低下します。"
+                            )
+                            warned_missing_sensor_timestamp = True
+                    else:
+                        frame_timestamp_s = _camera_sensor_timestamp_to_unix(
+                            sensor_timestamp_ns
+                        )
+                    ret = True
+                finally:
+                    request.release()
             else:
                 ret, img = cap.read()
+                frame_timestamp_s = time.time()
+                if not warned_missing_sensor_timestamp:
+                    print(
+                        "⚠ USBカメラはOpenCVのフレーム取得完了時刻を使用します。"
+                        "撮影時刻との遅延が残るため、精密校正にはPicamera2を使用してください。"
+                    )
+                    warned_missing_sensor_timestamp = True
             if not ret or img is None:
                 time.sleep(0.01)
                 continue
+            frame_camera_pose = _camera_pose_at_frame_time(frame_timestamp_s)
+            if (
+                frame_camera_pose is None
+                and time.monotonic() - last_camera_pose_match_warning >= 5.0
+            ):
+                with io_lock:
+                    camera_history = motive_rigid_body_pose_history[
+                        CAMERA_RIGID_BODY_ID
+                    ]
+                    latest_camera_timestamp = (
+                        camera_history[-1][0] if camera_history else float("nan")
+                    )
+                print(
+                    "⚠ 撮影時刻に対応するMotive RB3姿勢を補間できません。"
+                    f"frame={frame_timestamp_s:.6f}s, "
+                    f"latest_RB3={latest_camera_timestamp:.6f}s, "
+                    f"許容サンプル間隔={MOTIVE_POSE_INTERPOLATION_MAX_GAP_S:.3f}s。"
+                    "時計同期とMotiveカメラ剛体の受信を確認してください。"
+                )
+                last_camera_pose_match_warning = time.monotonic()
             fps_frame_count += 1
             # マーカー検出
             corners, ids, rejected = detector.detectMarkers(img)
@@ -1192,19 +1304,29 @@ def camera_tracker_loop(m, show_window=False):
                     attitude_cam = ar_marker_relative_attitude_rpy(
                         R_cam_marker, R_front_reference
                     )
-                    R_camera_to_ned = _active_camera_to_ned_rotation()
-                    camera_to_ned_q = rotation_matrix_to_quaternion_xyzw(
-                        R_camera_to_ned
-                    )
-                    marker_to_camera_q = rotation_matrix_to_quaternion_xyzw(
-                        R_cam_marker
-                    )
-                    marker_to_ned_q = _quaternion_multiply_xyzw(
-                        camera_to_ned_q, marker_to_camera_q
-                    )
-                    attitude_world = rotation_matrix_to_euler_rpy(
-                        quaternion_to_rotation_matrix(*marker_to_ned_q)
-                    )
+                    if CAMERA_ORIENTATION_SOURCE == "motive":
+                        R_camera_to_ned = (
+                            frame_camera_pose[0]
+                            if frame_camera_pose is not None
+                            else None
+                        )
+                    else:
+                        R_camera_to_ned = _active_camera_to_ned_rotation()
+                    if R_camera_to_ned is None:
+                        attitude_world = [float("nan")] * 3
+                    else:
+                        camera_to_ned_q = rotation_matrix_to_quaternion_xyzw(
+                            R_camera_to_ned
+                        )
+                        marker_to_camera_q = rotation_matrix_to_quaternion_xyzw(
+                            R_cam_marker
+                        )
+                        marker_to_ned_q = _quaternion_multiply_xyzw(
+                            camera_to_ned_q, marker_to_camera_q
+                        )
+                        attitude_world = rotation_matrix_to_euler_rpy(
+                            quaternion_to_rotation_matrix(*marker_to_ned_q)
+                        )
                     with io_lock:
                         id1_detected = True
                         ar_hand_attitude_cam = list(attitude_cam)
@@ -1261,14 +1383,13 @@ def camera_tracker_loop(m, show_window=False):
                     motive_cargo_cam = m_cargo_cam_val
                     motive_hand_cam = m_hand_cam_val
 
-                with io_lock:
-                    calibration_camera_received = motive_camera_received
-                    calibration_camera_rotation = R_cam_to_world.copy()
-                    calibration_camera_position = t_cam_world.copy()
-                    calibration_camera_time = motive_camera_pose_time_s
-
                 ar_pose_updates = {}
-                if calibration_camera_received:
+                if frame_camera_pose is not None:
+                    (
+                        calibration_camera_rotation,
+                        calibration_camera_position,
+                        calibration_camera_time,
+                    ) = frame_camera_pose
                     for name, detected, marker_position, marker_rotation in (
                         ("hand", has_id1, id1_cam, R_cam_marker),
                         (
@@ -1297,7 +1418,7 @@ def camera_tracker_loop(m, show_window=False):
                                 "quaternion_ned": list(
                                     rotation_matrix_to_quaternion_xyzw(rotation_ned)
                                 ),
-                                "timestamp_s": time.time(),
+                                "timestamp_s": frame_timestamp_s,
                                 "camera_timestamp_s": calibration_camera_time,
                                 "received": True,
                             }
@@ -1334,7 +1455,15 @@ def camera_tracker_loop(m, show_window=False):
                     if CAMERA_ORIENTATION_SOURCE == "motive":
                         # Motiveカメラ rigid body による直接変換を優先
                         # debug=True にするとカメラ傾き補正の検証ログが2秒ごとに出力されます
-                        result_motive_cargo = camera_to_world_xyz_motive(center_cam, debug=False)
+                        result_motive_cargo = (
+                            camera_to_world_xyz_motive(
+                                center_cam,
+                                debug=False,
+                                camera_pose=frame_camera_pose,
+                            )
+                            if frame_camera_pose is not None
+                            else None
+                        )
                         if result_motive_cargo is not None:
                             cargo_x, cargo_y, cargo_z = result_motive_cargo
                             coord_source = "Motive-Camera"
@@ -1375,7 +1504,13 @@ def camera_tracker_loop(m, show_window=False):
                     # ─── ドローン誘導目標のワールド座標を算出 ───
                     if CAMERA_ORIENTATION_SOURCE == "motive":
                         # Motiveカメラ rigid body による直接変換を優先
-                        result_motive_target = camera_to_world_xyz_motive(tvec_error)
+                        result_motive_target = (
+                            camera_to_world_xyz_motive(
+                                tvec_error, camera_pose=frame_camera_pose
+                            )
+                            if frame_camera_pose is not None
+                            else None
+                        )
                         if result_motive_target is not None:
                             target_x, target_y, target_z = result_motive_target
                         else:

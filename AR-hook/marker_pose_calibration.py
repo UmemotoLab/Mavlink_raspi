@@ -1,6 +1,7 @@
 """Rigid pose-offset helpers for AR marker frames and Motive rigid bodies."""
 import json
 import math
+from bisect import bisect_left
 from pathlib import Path
 
 import numpy as np
@@ -23,6 +24,63 @@ def normalized_quaternion_xyzw(quaternion):
     if not math.isfinite(norm) or norm == 0.0:
         raise ValueError("quaternion must be finite and nonzero")
     return tuple(value / norm for value in quaternion)
+
+
+def interpolate_pose(samples, timestamp_s, max_gap_s=0.1):
+    """Interpolate (timestamp, position, xyzw quaternion) samples at a timestamp."""
+    if (
+        not math.isfinite(timestamp_s)
+        or not math.isfinite(max_gap_s)
+        or max_gap_s <= 0
+    ):
+        raise ValueError("timestamp and max_gap_s must be finite and positive")
+    if not samples:
+        return None
+
+    timestamps = [sample[0] for sample in samples]
+    index = bisect_left(timestamps, timestamp_s)
+    if index < len(samples) and timestamps[index] == timestamp_s:
+        _, position, quaternion = samples[index]
+        return np.asarray(position, dtype=np.float64), normalized_quaternion_xyzw(quaternion)
+    if len(samples) < 2:
+        return None
+    if index == 0 or index == len(samples):
+        return None
+
+    before_time, before_position, before_quaternion = samples[index - 1]
+    after_time, after_position, after_quaternion = samples[index]
+    interval = after_time - before_time
+    if interval <= 0 or interval > max_gap_s:
+        return None
+
+    fraction = (timestamp_s - before_time) / interval
+    position = (
+        np.asarray(before_position, dtype=np.float64) * (1.0 - fraction)
+        + np.asarray(after_position, dtype=np.float64) * fraction
+    )
+    before_quaternion = np.asarray(
+        normalized_quaternion_xyzw(before_quaternion), dtype=np.float64
+    )
+    after_quaternion = np.asarray(
+        normalized_quaternion_xyzw(after_quaternion), dtype=np.float64
+    )
+    dot = float(np.dot(before_quaternion, after_quaternion))
+    if dot < 0.0:
+        after_quaternion = -after_quaternion
+        dot = -dot
+    dot = min(1.0, dot)
+    if dot > 0.9995:
+        quaternion = before_quaternion + fraction * (
+            after_quaternion - before_quaternion
+        )
+    else:
+        angle = math.acos(dot)
+        sin_angle = math.sin(angle)
+        quaternion = (
+            math.sin((1.0 - fraction) * angle) / sin_angle * before_quaternion
+            + math.sin(fraction * angle) / sin_angle * after_quaternion
+        )
+    return position, normalized_quaternion_xyzw(quaternion)
 
 
 def quaternion_to_rotation_matrix_xyzw(quaternion):

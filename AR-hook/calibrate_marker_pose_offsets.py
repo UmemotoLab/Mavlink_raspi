@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from marker_pose_calibration import (
+    interpolate_pose,
     motive_quaternion_to_ned_xyzw,
     normalized_quaternion_xyzw,
     relative_pose,
@@ -102,10 +103,10 @@ def collect_calibration_samples(path, max_time_delta_s):
     with path.open("r", newline="", encoding="utf-8-sig") as csv_file:
         reader = csv.DictReader(csv_file)
         columns = set(reader.fieldnames or ())
+        rows = list(reader)
         missing = []
         for name, (rigid_body_id, ar_prefix) in CALIBRATION_TARGETS.items():
             required = {
-                "Time_s",
                 f"{ar_prefix}_Pose_Time_s",
                 f"{ar_prefix}_Camera_Pose_Time_s",
                 f"{ar_prefix}_Pose_Received",
@@ -117,6 +118,10 @@ def collect_calibration_samples(path, max_time_delta_s):
                     f"{ar_prefix}_{component}_NED"
                     for component in ("QX", "QY", "QZ", "QW")
                 ),
+            }
+            missing.extend(sorted(required - columns))
+        for rigid_body_id in {target[0] for target in CALIBRATION_TARGETS.values()}:
+            required = {
                 f"Motive_RB{rigid_body_id}_Pose_Time_s",
                 f"Motive_RB{rigid_body_id}_Pose_Received",
                 *(
@@ -135,66 +140,89 @@ def collect_calibration_samples(path, max_time_delta_s):
                 + ", ".join(missing)
             )
 
-        for row in reader:
-            for name, (rigid_body_id, ar_prefix) in CALIBRATION_TARGETS.items():
-                try:
-                    if row.get(f"{ar_prefix}_Pose_Received") != "1":
-                        rejected_by_target[name] += 1
-                        continue
-                    if row.get(f"Motive_RB{rigid_body_id}_Pose_Received") != "1":
-                        rejected_by_target[name] += 1
-                        continue
+    pose_samples_by_body = {}
+    for rigid_body_id in {target[0] for target in CALIBRATION_TARGETS.values()}:
+        samples_by_timestamp = {}
+        for row in rows:
+            if row.get(f"Motive_RB{rigid_body_id}_Pose_Received") != "1":
+                continue
+            try:
+                timestamp = float(
+                    row[f"Motive_RB{rigid_body_id}_Pose_Time_s"]
+                )
+                if not math.isfinite(timestamp):
+                    continue
+                position = _values(
+                    row,
+                    [
+                        f"Motive_RB{rigid_body_id}_{axis}_NED_m"
+                        for axis in ("X", "Y", "Z")
+                    ],
+                )
+                quaternion = normalized_quaternion_xyzw(_values(
+                    row,
+                    [
+                        f"Motive_RB{rigid_body_id}_Pose_Q{component}"
+                        for component in ("X", "Y", "Z", "W")
+                    ],
+                ))
+                samples_by_timestamp[timestamp] = (position, quaternion)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                continue
+        pose_samples_by_body[rigid_body_id] = [
+            (timestamp, *pose)
+            for timestamp, pose in sorted(samples_by_timestamp.items())
+        ]
 
-                    ar_time = float(row[f"{ar_prefix}_Pose_Time_s"])
-                    camera_time = float(row[f"{ar_prefix}_Camera_Pose_Time_s"])
-                    rb_time = float(row[f"Motive_RB{rigid_body_id}_Pose_Time_s"])
-                    if (
-                        not math.isfinite(ar_time)
-                        or not math.isfinite(camera_time)
-                        or not math.isfinite(rb_time)
-                        or abs(ar_time - rb_time) > max_time_delta_s
-                        or abs(ar_time - camera_time) > max_time_delta_s
-                    ):
-                        rejected_by_target[name] += 1
-                        continue
-
-                    ar_position = _values(
-                        row,
-                        [f"{ar_prefix}_{axis}_NED_m" for axis in ("X", "Y", "Z")],
-                    )
-                    ar_quaternion = normalized_quaternion_xyzw(_values(
-                        row,
-                        [f"{ar_prefix}_{component}_NED" for component in ("QX", "QY", "QZ", "QW")],
-                    ))
-                    rb_position = _values(
-                        row,
-                        [
-                            f"Motive_RB{rigid_body_id}_{axis}_NED_m"
-                            for axis in ("X", "Y", "Z")
-                        ],
-                    )
-                    rb_quaternion_motive = _values(
-                        row,
-                        [
-                            f"Motive_RB{rigid_body_id}_Pose_Q{component}"
-                            for component in ("X", "Y", "Z", "W")
-                        ],
-                    )
-                    rb_quaternion_ned = motive_quaternion_to_ned_xyzw(
-                        rb_quaternion_motive
-                    )
-                    relative_translation, relative_quaternion = relative_pose(
-                        rb_position,
-                        rb_quaternion_ned,
-                        ar_position,
-                        ar_quaternion,
-                    )
-                    samples_by_target[name].append(
-                        (relative_translation, relative_quaternion)
-                    )
-                except (KeyError, TypeError, ValueError, OverflowError):
+    for row in rows:
+        for name, (rigid_body_id, ar_prefix) in CALIBRATION_TARGETS.items():
+            try:
+                if row.get(f"{ar_prefix}_Pose_Received") != "1":
                     rejected_by_target[name] += 1
                     continue
+
+                ar_time = float(row[f"{ar_prefix}_Pose_Time_s"])
+                camera_time = float(row[f"{ar_prefix}_Camera_Pose_Time_s"])
+                if (
+                    not math.isfinite(ar_time)
+                    or not math.isfinite(camera_time)
+                    or abs(ar_time - camera_time) > max_time_delta_s
+                ):
+                    rejected_by_target[name] += 1
+                    continue
+
+                ar_position = _values(
+                    row,
+                    [f"{ar_prefix}_{axis}_NED_m" for axis in ("X", "Y", "Z")],
+                )
+                ar_quaternion = normalized_quaternion_xyzw(_values(
+                    row,
+                    [f"{ar_prefix}_{component}_NED" for component in ("QX", "QY", "QZ", "QW")],
+                ))
+                rb_pose = interpolate_pose(
+                    pose_samples_by_body[rigid_body_id],
+                    ar_time,
+                    max_gap_s=max_time_delta_s,
+                )
+                if rb_pose is None:
+                    rejected_by_target[name] += 1
+                    continue
+                rb_position, rb_quaternion_motive = rb_pose
+                rb_quaternion_ned = motive_quaternion_to_ned_xyzw(
+                    rb_quaternion_motive
+                )
+                relative_translation, relative_quaternion = relative_pose(
+                    rb_position,
+                    rb_quaternion_ned,
+                    ar_position,
+                    ar_quaternion,
+                )
+                samples_by_target[name].append(
+                    (relative_translation, relative_quaternion)
+                )
+            except (KeyError, TypeError, ValueError, OverflowError):
+                rejected_by_target[name] += 1
+                continue
 
     return samples_by_target, rejected_by_target
 
@@ -234,7 +262,11 @@ def main(argv=None):
 
     if not args.csv_path.is_file():
         parser.error(f"CSVファイルが見つかりません: {args.csv_path}")
-    if args.max_time_delta_ms <= 0 or args.min_samples < 1:
+    if (
+        not math.isfinite(args.max_time_delta_ms)
+        or args.max_time_delta_ms <= 0
+        or args.min_samples < 1
+    ):
         parser.error("時間差と最低サンプル数は正の値にしてください")
     if args.output.exists() and not args.force:
         parser.error(
@@ -255,7 +287,7 @@ def main(argv=None):
             parser.error(
                 f"{name} (Motive RB{rigid_body_id}) の有効サンプルが不足しています: "
                 f"{len(samples[name])}/{args.min_samples}。"
-                "両方の剛体とARマーカー群を同時に追跡できるデータが必要です。"
+                "AR撮影時刻を挟むMotive姿勢サンプルが継続して記録されたCSVが必要です。"
             )
         result = _robust_pose_mean(samples[name])
         if result["inlier_count"] < args.min_samples:
