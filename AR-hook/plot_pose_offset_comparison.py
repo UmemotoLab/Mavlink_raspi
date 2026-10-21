@@ -17,7 +17,7 @@ from marker_pose_calibration import (
 PLOT_X_RANGE_S = (None, None)
 POSE_INTERPOLATION_MAX_GAP_S = 0.1
 POSITION_Y_RANGES_M = {
-    "hand": {"N": (None, None), "E": (None, None), "D": (None, None)},
+    "hand": {"N": (-1, 1), "E": (-1, 1), "D": (-1, 1)},
     "cargo": {"N": (None, None), "E": (None, None), "D": (None, None)},
 }
 ATTITUDE_Y_RANGES_DEG = {
@@ -38,6 +38,7 @@ TARGETS = {
     "cargo": ("Cargo", 2, "cargo / AR ID2-5 vs Motive RB2"),
 }
 POSITION_AXES = ("N", "E", "D")
+POSITION_COLUMNS = ("X", "Y", "Z")
 ATTITUDE_AXES = ("Roll", "Pitch", "Yaw")
 
 
@@ -118,8 +119,8 @@ def _series_for_target(rows, target_key, start_time):
         position = _finite_values(
             row,
             [
-                f"Motive_RB{rigid_body_id}_{axis}_NED_m"
-                for axis in POSITION_AXES
+                f"Motive_RB{rigid_body_id}_{component}_NED_m"
+                for component in POSITION_COLUMNS
             ],
         )
         quaternion = _finite_values(
@@ -167,8 +168,8 @@ def _series_for_target(rows, target_key, start_time):
             _finite_values(
                 row,
                 [
-                    f"AR_{prefix}_PreOffset_{axis}_NED_m"
-                    for axis in POSITION_AXES
+                    f"AR_{prefix}_PreOffset_{component}_NED_m"
+                    for component in POSITION_COLUMNS
                 ],
             )
             if ar_valid
@@ -177,7 +178,10 @@ def _series_for_target(rows, target_key, start_time):
         after_position = (
             _finite_values(
                 row,
-                [f"AR_{prefix}_{axis}_NED_m" for axis in POSITION_AXES],
+                [
+                    f"AR_{prefix}_{component}_NED_m"
+                    for component in POSITION_COLUMNS
+                ],
             )
             if ar_valid
             else None
