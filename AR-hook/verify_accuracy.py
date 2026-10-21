@@ -33,6 +33,57 @@ def wrap_angle_rad(angle):
     """角度を [-pi, pi] の範囲に正規化"""
     return (angle + math.pi) % (2 * math.pi) - math.pi
 
+
+def euler_zyx_to_quaternion_xyzw(roll, pitch, yaw):
+    half_roll, half_pitch, half_yaw = roll / 2, pitch / 2, yaw / 2
+    cr, sr = math.cos(half_roll), math.sin(half_roll)
+    cp, sp = math.cos(half_pitch), math.sin(half_pitch)
+    cy, sy = math.cos(half_yaw), math.sin(half_yaw)
+    return (
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+        cr * cp * cy + sr * sp * sy,
+    )
+
+
+def quaternion_angular_error_deg(reference, measured):
+    def normalized(quaternion):
+        norm = math.sqrt(sum(value * value for value in quaternion))
+        if not math.isfinite(norm) or norm == 0.0:
+            raise ValueError("姿勢クォータニオンが有限値でないか、ゼロです")
+        return tuple(value / norm for value in quaternion)
+
+    reference = normalized(reference)
+    measured = normalized(measured)
+    inverse_reference = (-reference[0], -reference[1], -reference[2], reference[3])
+    relative = (
+        inverse_reference[3] * measured[0]
+        + inverse_reference[0] * measured[3]
+        + inverse_reference[1] * measured[2]
+        - inverse_reference[2] * measured[1],
+        inverse_reference[3] * measured[1]
+        - inverse_reference[0] * measured[2]
+        + inverse_reference[1] * measured[3]
+        + inverse_reference[2] * measured[0],
+        inverse_reference[3] * measured[2]
+        + inverse_reference[0] * measured[1]
+        - inverse_reference[1] * measured[0]
+        + inverse_reference[2] * measured[3],
+        inverse_reference[3] * measured[3]
+        - inverse_reference[0] * measured[0]
+        - inverse_reference[1] * measured[1]
+        - inverse_reference[2] * measured[2],
+    )
+    relative_norm = math.sqrt(sum(value * value for value in relative))
+    relative = tuple(value / relative_norm for value in relative)
+    angle = 2 * math.atan2(
+        math.sqrt(relative[0] ** 2 + relative[1] ** 2 + relative[2] ** 2),
+        abs(relative[3]),
+    )
+    return math.degrees(angle)
+
+
 def get_latest_csv(directory):
     """指定されたディレクトリから最新のCSVファイルを検索"""
     path = Path(directory)
@@ -111,6 +162,7 @@ def main():
     mot_cargo_x, mot_cargo_y, mot_cargo_z = [], [], []
     mot_rel_x, mot_rel_y, mot_rel_z = [], [], []
     mot_roll, mot_pitch, mot_yaw = [], [], []
+    mot_attitude_received = []
     
     def get_v(row, *keys):
         for k in keys:
@@ -178,6 +230,10 @@ def main():
                 mot_roll.append(float(get_v(row, 'Motive_Roll_rad', 'Motive_Roll') or 0))
                 mot_pitch.append(float(get_v(row, 'Motive_Pitch_rad', 'Motive_Pitch') or 0))
                 mot_yaw.append(float(get_v(row, 'Motive_Yaw_rad', 'Motive_Yaw') or 0))
+                attitude_received = get_v(row, 'Motive_Attitude_Received')
+                mot_attitude_received.append(
+                    int(attitude_received) if attitude_received is not None else 1
+                )
             except (ValueError, KeyError) as e:
                 # 変換エラーや一部欠損行はスキップ
                 continue
@@ -226,6 +282,8 @@ def main():
     err_drone_x, err_drone_y, err_drone_z, err_drone_3d = [], [], [], []
     err_rel_dx, err_rel_dy, err_rel_dz, err_rel_3d = [], [], [], []
     err_roll, err_pitch, err_yaw = [], [], []
+    err_attitude_deg = []
+    attitude_error_series = [float('nan')] * len(times)
     
     indices_valid = []  # 有効なインデックスを記録
     
@@ -254,9 +312,20 @@ def main():
             err_rel_3d.append(math.sqrt(rdx**2 + rdy**2 + rdz**2))
         
         # ✅ 3. ドローン姿勢誤差 (Pixhawk IMU vs Motive ID1センサ真値)
-        err_roll.append(wrap_angle_rad(pix_roll[i] - mot_roll[i]))
-        err_pitch.append(wrap_angle_rad(pix_pitch[i] - mot_pitch[i]))
-        err_yaw.append(wrap_angle_rad(pix_yaw[i] - mot_yaw[i]))
+        if mot_attitude_received[i]:
+            err_roll.append(wrap_angle_rad(pix_roll[i] - mot_roll[i]))
+            err_pitch.append(wrap_angle_rad(pix_pitch[i] - mot_pitch[i]))
+            err_yaw.append(wrap_angle_rad(pix_yaw[i] - mot_yaw[i]))
+            error_deg = quaternion_angular_error_deg(
+                euler_zyx_to_quaternion_xyzw(
+                    mot_roll[i], mot_pitch[i], mot_yaw[i]
+                ),
+                euler_zyx_to_quaternion_xyzw(
+                    pix_roll[i], pix_pitch[i], pix_yaw[i]
+                ),
+            )
+            err_attitude_deg.append(error_deg)
+            attitude_error_series[i] = error_deg
     
     print(f"\n有効なドローン位置データ: {len(err_drone_3d)} / {len(times)} ({len(err_drone_3d)/len(times)*100:.1f}%)")
     
@@ -289,6 +358,9 @@ def main():
     roll_mae, roll_rmse, roll_std = calculate_metrics(err_roll)
     pitch_mae, pitch_rmse, pitch_std = calculate_metrics(err_pitch)
     yaw_mae, yaw_rmse, yaw_std = calculate_metrics(err_yaw)
+    attitude_mae, attitude_rmse, attitude_std = calculate_metrics(
+        err_attitude_deg
+    )
     
     # コンソール表示 (日本語)
     print("\n" + "="*70)
@@ -314,6 +386,7 @@ def main():
     print(f"  Roll      - MAE: {math.degrees(roll_mae):7.2f}, RMSE: {math.degrees(roll_rmse):7.2f}, SD: {math.degrees(roll_std):7.2f}")
     print(f"  Pitch     - MAE: {math.degrees(pitch_mae):7.2f}, RMSE: {math.degrees(pitch_rmse):7.2f}, SD: {math.degrees(pitch_std):7.2f}")
     print(f"  Yaw       - MAE: {math.degrees(yaw_mae):7.2f}, RMSE: {math.degrees(yaw_rmse):7.2f}, SD: {math.degrees(yaw_std):7.2f}")
+    print(f"  Quaternion相対回転角 - MAE: {attitude_mae:7.2f}, RMSE: {attitude_rmse:7.2f}, SD: {attitude_std:7.2f}")
     print("="*70)
     
     # グラフ生成 (Matplotlibが利用可能かつデータがある場合)
@@ -321,7 +394,7 @@ def main():
         output_plot_path = csv_path.parent / f"{csv_path.stem}_accuracy_report.png"
         print(f"\n📊 グラフ画像を生成中: {output_plot_path.name}")
         
-        fig, axs = plt.subplots(4, 1, figsize=(12, 14), sharex=True)
+        fig, axs = plt.subplots(5, 1, figsize=(12, 16), sharex=True)
         
         # 有効なインデックスでフィルタリング
         time_sec_valid = [time_sec[i] for i in indices_valid]
@@ -386,6 +459,14 @@ def main():
         axs[3].set_title('✅ Drone Yaw Angle (Pixhawk IMU vs Motive ID1 Sensor)', fontsize=12, fontweight='bold')
         axs[3].grid(True, alpha=0.3)
         axs[3].legend(loc='best')
+
+        # 5. 3D姿勢の相対回転誤差
+        axs[4].plot(time_sec, attitude_error_series, 'm-', label='Quaternion Relative Rotation Error')
+        axs[4].set_xlabel('Time elapsed [s]', fontsize=11)
+        axs[4].set_ylabel('Angle [deg]', fontsize=11)
+        axs[4].set_title('✅ Drone 3D Attitude Error (Quaternion)', fontsize=12, fontweight='bold')
+        axs[4].grid(True, alpha=0.3)
+        axs[4].legend(loc='best')
         
         plt.tight_layout()
         plt.savefig(output_plot_path, dpi=150)

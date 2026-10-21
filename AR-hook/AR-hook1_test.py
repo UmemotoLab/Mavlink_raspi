@@ -95,10 +95,8 @@ if OFFSET_PARAMS_FILE.exists():
         print(f"⚠ オフセットファイル {OFFSET_PARAMS_FILE.name} のロードに失敗しました ({e})。デフォルト値を使用します。")
 
 # ───── 基準点設定 ─────
-# 初期値: Motive UDP から最初に受信したパケットで自動上書きされます。
-# 「原点に置く」必要はありません。北向きだけ合わせれば自動で相対座標系が構築されます。
+# Motive SDKの固定GPS基準点と一致させ、異なるCSV間でNED原点を共有します。
 REF_LAT, REF_LON, REF_ALT = 36.0757800, 136.2132900, 0.0
-motive_origin_set = False   # True になったら REF_* は固定（二度と書き換えない）
 TARGET_HEIGHT_ABOVE_TAKEOFF = 1.10
 CSV_DIR = Path.home() / "LOGS_Pixhawk6c"
 CSV_DIR.mkdir(exist_ok=True)
@@ -203,7 +201,45 @@ motive_rel_x = float('nan')
 motive_rel_y = float('nan')
 motive_rel_z = float('nan')
 
-def quaternion_to_euler_ned(qx, qy, qz, qw):    # Motive(X=北,Z=東,Y=上左手系) -> NED右手系変換済みquat
+MOTIVE_TO_NED_ROTATION = np.array([
+    [1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [0.0, -1.0, 0.0],
+], dtype=np.float32)
+MOTIVE_TO_NED_QUATERNION_XYZW = (
+    -math.sqrt(0.5), 0.0, 0.0, math.sqrt(0.5)
+)
+
+
+def _quaternion_multiply_xyzw(left, right):
+    lx, ly, lz, lw = left
+    rx, ry, rz, rw = right
+    return (
+        lw * rx + lx * rw + ly * rz - lz * ry,
+        lw * ry - lx * rz + ly * rw + lz * rx,
+        lw * rz + lx * ry - ly * rx + lz * rw,
+        lw * rw - lx * rx - ly * ry - lz * rz,
+    )
+
+
+def _motive_quaternion_to_ned_xyzw(qx, qy, qz, qw):
+    quaternion_norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    if not math.isfinite(quaternion_norm) or quaternion_norm == 0:
+        raise ValueError("Motive quaternion must be finite and nonzero")
+    motive_quaternion = tuple(
+        component / quaternion_norm for component in (qx, qy, qz, qw)
+    )
+    frame_x, frame_y, frame_z, frame_w = MOTIVE_TO_NED_QUATERNION_XYZW
+    inverse_frame_quaternion = (-frame_x, -frame_y, -frame_z, frame_w)
+    return _quaternion_multiply_xyzw(
+        _quaternion_multiply_xyzw(
+            MOTIVE_TO_NED_QUATERNION_XYZW, motive_quaternion
+        ),
+        inverse_frame_quaternion,
+    )
+
+
+def quaternion_to_euler_ned(qx, qy, qz, qw):
     roll  = math.atan2(2*(qw*qx+qy*qz), 1-2*(qx**2+qy**2))
     pitch = math.asin(max(-1,min(1, 2*(qw*qy-qz*qx))))
     yaw   = math.atan2(2*(qw*qz+qx*qy), 1-2*(qy**2+qz**2))
@@ -227,11 +263,8 @@ def _store_motive_rigid_body_attitude(rigid_body_id, qx, qy, qz, qw):
     if not math.isfinite(quat_norm) or quat_norm == 0:
         raise ValueError(f"invalid rigid-body quaternion for ID {rigid_body_id}")
     raw_quaternion = [component / quat_norm for component in (qx, qy, qz, qw)]
-    ned_quaternion = (
-        raw_quaternion[0],
-        raw_quaternion[2],
-        -raw_quaternion[1],
-        raw_quaternion[3],
+    ned_quaternion = _motive_quaternion_to_ned_xyzw(
+        *raw_quaternion
     )
     attitude_ned = quaternion_to_euler_ned(*ned_quaternion)
 
@@ -252,14 +285,57 @@ def quaternion_to_rotation_matrix(qx, qy, qz, qw):
         [2*(qx*qz - qw*qy),         2*(qy*qz + qw*qx),       1 - 2*(qx**2 + qy**2)]
     ], dtype=np.float32)
 
+
+def rotation_matrix_to_quaternion_xyzw(rotation):
+    """Convert a proper rotation matrix to a normalized (x, y, z, w) quaternion."""
+    trace = float(np.trace(rotation))
+    if trace > 0.0:
+        scale = math.sqrt(trace + 1.0) * 2.0
+        quaternion = (
+            (rotation[2, 1] - rotation[1, 2]) / scale,
+            (rotation[0, 2] - rotation[2, 0]) / scale,
+            (rotation[1, 0] - rotation[0, 1]) / scale,
+            0.25 * scale,
+        )
+    elif rotation[0, 0] > rotation[1, 1] and rotation[0, 0] > rotation[2, 2]:
+        scale = math.sqrt(
+            1.0 + rotation[0, 0] - rotation[1, 1] - rotation[2, 2]
+        ) * 2.0
+        quaternion = (
+            0.25 * scale,
+            (rotation[0, 1] + rotation[1, 0]) / scale,
+            (rotation[0, 2] + rotation[2, 0]) / scale,
+            (rotation[2, 1] - rotation[1, 2]) / scale,
+        )
+    elif rotation[1, 1] > rotation[2, 2]:
+        scale = math.sqrt(
+            1.0 + rotation[1, 1] - rotation[0, 0] - rotation[2, 2]
+        ) * 2.0
+        quaternion = (
+            (rotation[0, 1] + rotation[1, 0]) / scale,
+            0.25 * scale,
+            (rotation[1, 2] + rotation[2, 1]) / scale,
+            (rotation[0, 2] - rotation[2, 0]) / scale,
+        )
+    else:
+        scale = math.sqrt(
+            1.0 + rotation[2, 2] - rotation[0, 0] - rotation[1, 1]
+        ) * 2.0
+        quaternion = (
+            (rotation[0, 2] + rotation[2, 0]) / scale,
+            (rotation[1, 2] + rotation[2, 1]) / scale,
+            0.25 * scale,
+            (rotation[1, 0] - rotation[0, 1]) / scale,
+        )
+    norm = math.sqrt(sum(component * component for component in quaternion))
+    if not math.isfinite(norm) or norm == 0.0:
+        raise ValueError("rotation matrix did not produce a valid quaternion")
+    return tuple(component / norm for component in quaternion)
+
+
 def _camera_rotation_from_motive(qx, qy, qz, qw):
-    quat_norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
-    if not math.isfinite(quat_norm) or quat_norm == 0:
-        raise ValueError("カメラ姿勢クォータニオンが不正です")
-    qx, qy, qz, qw = (
-        component / quat_norm for component in (qx, qy, qz, qw)
-    )
-    R_body_to_ned = quaternion_to_rotation_matrix(qx, qz, -qy, qw)
+    ned_quaternion = _motive_quaternion_to_ned_xyzw(qx, qy, qz, qw)
+    R_body_to_ned = quaternion_to_rotation_matrix(*ned_quaternion)
     if CAMERA_MOUNT_DIRECTION == 'front':
         R_cv_to_body = np.array([
             [0.0, 0.0, 1.0],
@@ -273,19 +349,6 @@ def _camera_rotation_from_motive(qx, qy, qz, qw):
             [0.0,  0.0, 1.0]
         ], dtype=np.float32)
     return R_body_to_ned @ R_cv_to_body @ CAMERA_ROT_OFFSET
-
-def _set_motive_origin_if_needed(lat, lon, alt, rigid_body_id):
-    global REF_LAT, REF_LON, REF_ALT, motive_origin_set
-    with io_lock:
-        if motive_origin_set:
-            return
-        REF_LAT = lat
-        REF_LON = lon
-        REF_ALT = alt
-        motive_origin_set = True
-    print(f"[Motive] 動的原点を設定しました: "
-          f"lat={lat:.7f}  lon={lon:.7f}  alt={alt:.3f}m  "
-          f"(rigid_body_id={rigid_body_id})")
 
 def _apply_motive_camera_pose(position_ned, qx, qy, qz, qw, timestamp):
     global motive_camera_x, motive_camera_y, motive_camera_z
@@ -321,7 +384,6 @@ def motive_udp_listener():
     global motive_camera_qx, motive_camera_qy, motive_camera_qz, motive_camera_qw
     global R_cam_to_world, t_cam_world
     global motive_rel_x, motive_rel_y, motive_rel_z
-    global REF_LAT, REF_LON, REF_ALT, motive_origin_set
     
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -355,7 +417,6 @@ def motive_udp_listener():
                 lat = lat_e7 / 1e7
                 lon = lon_e7 / 1e7
                 alt = alt_mm / 1000.0
-                _set_motive_origin_if_needed(lat, lon, alt, rigid_body_id)
                 position = gps_to_local_xyz(lat, lon, alt)
                 with io_lock:
                     if rigid_body_id == 1:
@@ -374,13 +435,6 @@ def motive_udp_listener():
                 lat = unpacked[1] / 1e7
                 lon = unpacked[2] / 1e7
                 alt = unpacked[3] / 1000.0
-
-                # ── 動的原点の自動設定 ──────────────────────────────────────────
-                # 最初に届いた任意の rigid body の GPS 座標を NED 原点にする。
-                # Motive マーカーを実験空間の「原点」に置く必要がなくなります。
-                # 北向きの初期姿勢だけ合わせれば軸方向は正しく保たれます。
-                _set_motive_origin_if_needed(lat, lon, alt, rigid_body_id)
-                # ───────────────────────────────────────────────────────────────
 
                 mx, my, mz = gps_to_local_xyz(lat, lon, alt)
                 
@@ -436,25 +490,16 @@ def motive_udp_listener():
                         dp_world = np.array([motive_drone_x - motive_cargo_x,
                                              motive_drone_y - motive_cargo_y,
                                              motive_drone_z - motive_cargo_z])
-                        # NEDからSED (South, West, Down) に変換
-                        dp_sed = np.array([-dp_world[0], -dp_world[1], dp_world[2]])
-                        
-                        # 荷物の姿勢をNEDクオータニオンに変換
-                        nc_qx = motive_cargo_qx
-                        nc_qy = motive_cargo_qz
-                        nc_qz = -motive_cargo_qy
-                        nc_qw = motive_cargo_qw
-                        
-                        # 回転行列（荷物ボディ座標系 -> SED: 南向きを基準にするためZ軸まわりに180度回転）
-                        # R_c_sed = R_z(pi) * R_c_ned (1行目と2行目の符号を反転)
-                        R_c = np.array([
-                            [-(1 - 2*(nc_qy**2 + nc_qz**2)),   -2*(nc_qx*nc_qy - nc_qw*nc_qz),   -2*(nc_qx*nc_qz + nc_qw*nc_qy)],
-                            [-2*(nc_qx*nc_qy + nc_qw*nc_qz),   -(1 - 2*(nc_qx**2 + nc_qz**2)),   -2*(nc_qy*nc_qz - nc_qw*nc_qx)],
-                            [2*(nc_qx*nc_qz - nc_qw*nc_qy),   2*(nc_qy*nc_qz + nc_qw*nc_qx),   1 - 2*(nc_qx**2 + nc_qy**2)]
-                        ], dtype=np.float32)
-                        
-                        # 荷物ローカル座標系への逆回転 (R_c^T)
-                        dp_cargo = R_c.T.dot(dp_sed)
+                        cargo_quaternion_ned = _motive_quaternion_to_ned_xyzw(
+                            motive_cargo_qx,
+                            motive_cargo_qy,
+                            motive_cargo_qz,
+                            motive_cargo_qw,
+                        )
+                        R_ned_from_cargo = quaternion_to_rotation_matrix(
+                            *cargo_quaternion_ned
+                        )
+                        dp_cargo = R_ned_from_cargo.T @ dp_world
                         motive_rel_x = float(dp_cargo[0])
                         motive_rel_y = float(dp_cargo[1])
                         motive_rel_z = float(dp_cargo[2])
@@ -520,7 +565,7 @@ def motive_rigid_body_pose_udp_listener():
             lat = lat_e7 / 1e7
             lon = lon_e7 / 1e7
             alt = alt_mm / 1000.0
-            _set_motive_origin_if_needed(lat, lon, alt, rigid_body_id)
+
             position_ned = gps_to_local_xyz(lat, lon, alt)
             if rigid_body_id == 1:
                 with io_lock:
@@ -638,6 +683,7 @@ def local_xyz_to_gps(x, y, z):
 
 
 def rotation_matrix_to_euler_rpy(rotation):
+    """Extract intrinsic ZYX yaw-pitch-roll as (roll, pitch, yaw) in radians."""
     pitch = math.asin(max(-1.0, min(1.0, -float(rotation[2, 0]))))
     if abs(math.cos(pitch)) > 1e-6:
         roll = math.atan2(float(rotation[2, 1]), float(rotation[2, 2]))
@@ -655,9 +701,17 @@ def ar_marker_front_facing_reference_rotation():
 
 
 def ar_marker_relative_attitude_rpy(rotation, reference_rotation):
-    relative_rotation = reference_rotation.T @ rotation
-    roll, pitch, yaw = rotation_matrix_to_euler_rpy(relative_rotation)
-    return pitch, roll, -yaw
+    rotation_q = rotation_matrix_to_quaternion_xyzw(rotation)
+    reference_q = rotation_matrix_to_quaternion_xyzw(reference_rotation)
+    inverse_reference_q = (
+        -reference_q[0], -reference_q[1], -reference_q[2], reference_q[3]
+    )
+    relative_q = _quaternion_multiply_xyzw(
+        inverse_reference_q, rotation_q
+    )
+    return rotation_matrix_to_euler_rpy(
+        quaternion_to_rotation_matrix(*relative_q)
+    )
 
 
 def _camera_to_ned_rotation_from_euler(roll_rad, pitch_rad, yaw_rad):
@@ -1052,9 +1106,17 @@ def camera_tracker_loop(m, show_window=False):
                         R_cam_marker, R_front_reference
                     )
                     R_camera_to_ned = _active_camera_to_ned_rotation()
-                    attitude_world = ar_marker_relative_attitude_rpy(
-                        R_camera_to_ned @ R_cam_marker,
-                        R_camera_to_ned @ R_front_reference,
+                    camera_to_ned_q = rotation_matrix_to_quaternion_xyzw(
+                        R_camera_to_ned
+                    )
+                    marker_to_camera_q = rotation_matrix_to_quaternion_xyzw(
+                        R_cam_marker
+                    )
+                    marker_to_ned_q = _quaternion_multiply_xyzw(
+                        camera_to_ned_q, marker_to_camera_q
+                    )
+                    attitude_world = rotation_matrix_to_euler_rpy(
+                        quaternion_to_rotation_matrix(*marker_to_ned_q)
                     )
                     with io_lock:
                         id1_detected = True
@@ -1277,7 +1339,7 @@ def camera_tracker_loop(m, show_window=False):
                         or motive_rigid_body_attitude_received[1]
                     )
                 motive_attitude_text = " | ".join(
-                    f"RB{rigid_body_id} assumed-NED-RPY[deg]="
+                    f"RB{rigid_body_id} NED-RPY[deg]="
                     + (
                         ",".join(f"{math.degrees(angle):.1f}" for angle in attitude)
                         if received

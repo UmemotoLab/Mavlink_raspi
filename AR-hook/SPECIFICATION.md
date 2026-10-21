@@ -51,7 +51,7 @@ AR-hook/
 | 座標系 | 説明 | 原点 | 軸定義 |
 |---|---|---|---|
 | **GPS / グローバル座標系** | 緯度・経度・高度 (WGS84) | 基準点 (`REF_LAT`, `REF_LON`, `REF_ALT`) | 度 (deg), メートル (m) |
-| **ローカルワールド座標系 (NED)** | 北・東・下 (North-East-Down) | GPS 基準点またはMotive動的原点 | X(北), Y(東), Z(下) |
+| **ローカルワールド座標系 (NED)** | 北・東・下 (North-East-Down) | 固定 GPS 基準点 (`REF_LAT`, `REF_LON`, `REF_ALT`) | X(北), Y(東), Z(下) |
 | **機体ボディ座標系 (FRD)** | 機体前・右・下 (Front-Right-Down) | ドローン重心 | X(前), Y(右), Z(下) |
 | **OpenCV カメラ座標系** | カメラ光学視点 | カメラ光学中心 | X(右), Y(下), Z(光軸前) |
 | **荷物ローカル座標系** | 荷物中心基準 | 荷物中心 | X(右), Y(上), Z(垂直上) |
@@ -100,11 +100,20 @@ REF_ALT = 0.0          # 基準高度 (m)
 | 31-38 | `float64` | `d` | Unix Timestamp | 秒 (Motive 送信時刻) |
 
 ### 4.3 Motive クォータニオンから NED への変換
-Motive（左手系: $X=\text{北}, Y=\text{上}, Z=\text{東}$）から航空工学標準 NED（右手系: $X=\text{北}, Y=\text{東}, Z=\text{下}$）への変換:
+MotiveとWは右手系です。Motiveワールドは $X=\text{北}, Y=\text{上}, Z=\text{東}$、W=NEDは $X=\text{北}, Y=\text{東}, Z=\text{下}$ とし、座標基底回転を次で定義します。
 $$
-q_{ned} = [q_x,\ q_z,\ -q_y,\ q_w]
+C_{WM} = R_x(-90^\circ) =
+\begin{bmatrix}
+1&0&0\\
+0&0&1\\
+0&-1&0
+\end{bmatrix}
 $$
-オイラー角の算出:
+NatNetのクォータニオンは $(q_x,q_y,q_z,q_w)$ 順です。姿勢を同じ回転のままNED基底で表現するには、Hamilton積で基底回転を共役適用します。
+$$
+q_{NED} = q_{WM} \otimes q_{Motive} \otimes q_{WM}^{-1}
+$$
+位置は $p_{NED} = C_{WM}p_{Motive} + t$ で変換します。原点が同一なら $t=0$ です。Euler角はNEDへ変換した回転からZYX順で抽出し、Roll/Pitch/Yawの順で表示します。
 $$
 \text{Roll} = \text{atan2}(2(q_w q_x + q_y q_z),\ 1 - 2(q_x^2 + q_y^2))
 $$
@@ -226,13 +235,16 @@ $$
 | 91-93 | `Motive_RB3_Roll/Pitch/Yaw_NED_rad` | rad | Motive剛体ID3のNED姿勢 |
 | 94 | `Motive_RB3_Attitude_Received` | 0/1 | Motive剛体ID3姿勢の受信フラグ |
 
-Motive SDKはID1・ID2・カメラID3の位置・クォータニオンを専用UDPポート15770で全設定済みPiへ配信します。15769の23バイトGPSパケットにはクォータニオンが含まれないため、姿勢記録には15770の41バイト姿勢パケットを使用します。SDK側の送信間隔制御はIP単位で共有されていたため、同一IPに複数剛体を送るとフレーム内で最初の剛体以外が抑止される問題がありました。現在はIPと剛体IDの組ごとに送信間隔を管理します。比較スクリプトは各行の適用済み回転行列を使ってカメラ相対XYZをNED（北・東・下）へ変換します。
+座標系の定義は、Motiveワールドを右手系（X=北、Y=上、Z=東）、Wを右手系NED（X=北、Y=東、Z=下）とします。変換は
+`C_WM = [[1,0,0],[0,0,1],[0,-1,0]] = Rx(-90°)` です。位置は `p_W = C_WM p_M + t` とし、Motiveの剛体姿勢クォータニオン（active rotation、成分順`(x,y,z,w)`）は、基底変換を左右から適用して `q_W = q_WM ⊗ q_M ⊗ inverse(q_WM)` とします。ここで `q_WM` は `C_WM` に対応するクォータニオンです。Euler表示はZYX（yaw-pitch-roll）回転順で、値の並びはRoll, Pitch, Yawです。
 
-`Motive_RB1/2/3_*` はIDごとの姿勢パケットを記録します。`Motive_Roll/Pitch/Yaw_rad` はID1の姿勢をNED基準で記録し、Yawは北向きが0、東向きが正です。Yawの範囲は−π〜+π（−180°〜+180°）で、±180°をまたぐと折り返します。各受信フラグは、記録開始後に該当IDの姿勢を一度でも受信したかを示します。受信開始前のクォータニオンと角度はNaNです。
+Motive SDKはID1・ID2・カメラID3の位置・クォータニオンを専用UDPポート15770で全設定済みPiへ配信します。15769の23バイトGPSパケットにはクォータニオンが含まれないため、姿勢記録には15770の41バイト姿勢パケットを使用します。SDK側の送信間隔制御はIP単位で共有されていたため、同一IPに複数剛体を送るとフレーム内で最初の剛体以外が抑止される問題がありました。現在はIPと剛体IDの組ごとに送信間隔を管理します。比較スクリプトは各行の適用済みカメラ→NED回転行列でカメラ相対位置をNEDへ変換します。
 
-実行中のTrackerログには、各剛体の正規化済みクォータニオン（`q_xyzw`）と、現行コードのNED変換を前提としたRPY角を併記します。`assumed-NED-RPY` は変換規約を実機で照合するための診断表示であり、座標変換が検証済みであることを示すものではありません。
+Motive SDKと受信側は同じ固定GPS基準点（緯度36.0757800°, 経度136.2132900°, 高度0m）をNED原点として使います。異なるCSV間でMotiveの絶対位置を比較できます。`Motive_RB1/2/3_*` はIDごとの姿勢パケットを記録します。`Motive_RB*_QX/QY/QZ/QW` は受信した剛体クォータニオンを正規化して保存します。RPYは上記のW=NED基底変換後、ZYX順から抽出します。`Motive_Roll/Pitch/Yaw_rad` はID1の姿勢で、Yawは北向きが0、東向きが正です。Yawの範囲は−π〜+π（−180°〜+180°）で、±180°をまたぐと折り返します。各受信フラグは、記録開始後に該当IDの姿勢を一度でも受信したかを示します。受信開始前のクォータニオンと角度はNaNです。
 
-AR姿勢は正面向きのID1マーカー姿勢を基準（Roll/Pitch/Yaw = 0）にした相対角です。Motiveと比較しやすいよう、AR出力ではPnP相対角のRollとPitchを入れ替え、Yawの符号を反転します（右回転が正）。正面を向いた合成画像ではすべて0度になります。マーカー未検出の行では最後に検出した値を保持するため、該当行の `ID1_Detected=0` を無効値として扱ってください。W姿勢も同じ基準と符号です。
+実行中のTrackerログには、各剛体の正規化済みクォータニオン（`q_xyzw`）と、NEDへ基底変換したRPY角を併記します。
+
+ARカメラ姿勢はOpenCV PnPのマーカー→カメラ姿勢から得るカメラ基準のRoll/Pitch/Yawです。W姿勢は `R_W_marker = R_W_camera R_camera_marker` でNEDへ変換後にZYX順でEuler化した絶対姿勢です。以前のRoll/Pitch入替え・Yaw符号反転は行いません。したがってW姿勢はカメラが向く方向にも依存し、正面マーカー姿勢で常に0になる相対角ではありません。マーカー未検出の行では最後に検出した値を保持するため、該当行の `ID1_Detected=0` を無効値として扱ってください。
 
 ### 7.1 手先座標の時系列グラフ
 
@@ -244,7 +256,7 @@ python3 plot_hand_ar_camera.py <CSV_PATH>
 python3 plot_hand_ar_world.py <CSV_PATH>
 ```
 
-PNGは入力CSVと同じフォルダーに保存され、既定ではグラフ画面も表示されます。画面を表示せず保存だけ行う場合は `--no-show` を付けます。Motive版はID1ドローン／手先マーカー位置（NED）とMotive ID1センサ姿勢（Roll/Pitch/Yaw、度）を別々のグラフに保存します。ARカメラ座標版は `Hand_Cam_Raw_X/Y/Z_m` とマーカー姿勢（カメラ座標系）、ARからW座標への変換版は保存済みカメラ姿勢行列を適用したNED位置とCSVに記録したNED姿勢を描画します。AR姿勢角は正面向きで0となる相対Roll/Pitch/Yaw（ラジアン保存、グラフは度表示）です。Matplotlibが必要です。
+PNGは入力CSVと同じフォルダーに保存され、既定ではグラフ画面も表示されます。画面を表示せず保存だけ行う場合は `--no-show` を付けます。Motive版はID1ドローン／手先マーカー位置（NED）とMotive ID1センサ姿勢（Roll/Pitch/Yaw、度）を別々のグラフに保存します。ARカメラ座標版は `Hand_Cam_Raw_X/Y/Z_m` とカメラ座標系のマーカー姿勢を、ARからW座標への変換版は保存済みカメラ姿勢行列を適用したNED位置と絶対NED姿勢を描画します。姿勢角はZYX順で変換した後、Roll/Pitch/Yaw（ラジアン保存、グラフは度表示）として表示します。Matplotlibが必要です。
 
 ---
 
@@ -382,13 +394,13 @@ python3 AR-hook1_test.py
 ### 8.7 ステップ 6: 精度検証と評価ツールの活用
 
 #### 1. 単一ログの精度評価 (`verify_accuracy.py`)
-最新の飛行ログ（または指定 CSV）から Motive 真値と AR 推定値の誤差統計（MAE, RMSE, SD）を算出・プロットします。
+最新の飛行ログ（または指定 CSV）から Motive 真値と AR 推定値の誤差統計（MAE, RMSE, SD）を算出・プロットします。Motive姿勢受信済みの行だけを使い、ZYX姿勢クォータニオン間の相対回転角も評価します。
 ```bash
 python3 verify_accuracy.py [CSV_FILE_PATH]
 ```
 
 #### 2. 2 ファイル同期比較 (`verify_accuracy_2csv.py`)
-AR ログと Motive 生ログのタイムスタンプを自動同期し、詳細な軌道・姿勢誤差を比較します。
+AR ログと Motive 生ログのタイムスタンプを自動同期し、NED位置の平均値・平均差分と姿勢誤差を比較します。姿勢はZYXのEuler角からクォータニオンに変換し、Motiveクォータニオンとの相対回転角を評価します。現行CSVの列名と旧形式の列名の両方に対応します。
 ```bash
 python3 verify_accuracy_2csv.py <AR_LOG.csv> <MOTIVE_LOG.csv>
 ```

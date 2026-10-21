@@ -29,19 +29,91 @@ def wrap_angle_rad(angle):
     """角度を [-pi, pi] の範囲に正規化"""
     return (angle + math.pi) % (2 * math.pi) - math.pi
 
+
+MOTIVE_TO_NED_ROTATION = np.array([
+    [1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [0.0, -1.0, 0.0],
+])
+MOTIVE_TO_NED_QUATERNION_XYZW = (
+    -math.sqrt(0.5), 0.0, 0.0, math.sqrt(0.5)
+)
+
+
+def quaternion_multiply_xyzw(left, right):
+    """Hamilton product for active rotations stored as (x, y, z, w)."""
+    lx, ly, lz, lw = left
+    rx, ry, rz, rw = right
+    return (
+        lw * rx + lx * rw + ly * rz - lz * ry,
+        lw * ry - lx * rz + ly * rw + lz * rx,
+        lw * rz + lx * ry - ly * rx + lz * rw,
+        lw * rw - lx * rx - ly * ry - lz * rz,
+    )
+
+
+def motive_quaternion_to_ned_xyzw(qx, qy, qz, qw):
+    norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    if not math.isfinite(norm) or norm == 0:
+        raise ValueError("Motive quaternion must be finite and nonzero")
+    motive_q = tuple(component / norm for component in (qx, qy, qz, qw))
+    frame_q = MOTIVE_TO_NED_QUATERNION_XYZW
+    inverse_frame_q = (-frame_q[0], -frame_q[1], -frame_q[2], frame_q[3])
+    return quaternion_multiply_xyzw(
+        quaternion_multiply_xyzw(frame_q, motive_q),
+        inverse_frame_q,
+    )
+
+
 def quaternion_to_euler_ned(qx, qy, qz, qw):
-    """Motive左手系クオータニオンをNED右手系に変換してからロール、ピッチ、ヨー（ラジアン）を算出"""
-    # Motive(X=北, Y=上, Z=東, 左手系) -> NED(X=北, Y=東, Z=下, 右手系)
-    # ned_qx = motive_qx, ned_qy = motive_qz, ned_qz = -motive_qy, ned_qw = motive_qw
-    ned_qx = qx
-    ned_qy = qz
-    ned_qz = -qy
-    ned_qw = qw
+    """Convert the Motive quaternion basis to NED, then extract ZYX Euler angles."""
+    ned_qx, ned_qy, ned_qz, ned_qw = motive_quaternion_to_ned_xyzw(
+        qx, qy, qz, qw
+    )
 
     roll  = math.atan2(2*(ned_qw*ned_qx + ned_qy*ned_qz), 1 - 2*(ned_qx**2 + ned_qy**2))
     pitch = math.asin(max(-1, min(1, 2*(ned_qw*ned_qy - ned_qz*ned_qx))))
     yaw   = math.atan2(2*(ned_qw*ned_qz + ned_qx*ned_qy), 1 - 2*(ned_qy**2 + ned_qz**2))
     return roll, pitch, yaw
+
+
+def euler_zyx_to_quaternion_xyzw(roll, pitch, yaw):
+    """Convert intrinsic ZYX Euler angles (roll, pitch, yaw) to xyzw."""
+    half_roll = roll / 2.0
+    half_pitch = pitch / 2.0
+    half_yaw = yaw / 2.0
+    cr, sr = math.cos(half_roll), math.sin(half_roll)
+    cp, sp = math.cos(half_pitch), math.sin(half_pitch)
+    cy, sy = math.cos(half_yaw), math.sin(half_yaw)
+    return (
+        sr * cp * cy - cr * sp * sy,
+        cr * sp * cy + sr * cp * sy,
+        cr * cp * sy - sr * sp * cy,
+        cr * cp * cy + sr * sp * sy,
+    )
+
+
+def quaternion_angular_error_deg(reference_xyzw, measured_xyzw):
+    """Return the shortest relative rotation angle between two orientations."""
+    reference_norm = math.sqrt(sum(value * value for value in reference_xyzw))
+    measured_norm = math.sqrt(sum(value * value for value in measured_xyzw))
+    if (
+        not math.isfinite(reference_norm)
+        or not math.isfinite(measured_norm)
+        or reference_norm == 0.0
+        or measured_norm == 0.0
+    ):
+        raise ValueError("orientation quaternion must be finite and nonzero")
+    reference = tuple(value / reference_norm for value in reference_xyzw)
+    measured = tuple(value / measured_norm for value in measured_xyzw)
+    inverse_reference = (-reference[0], -reference[1], -reference[2], reference[3])
+    relative = quaternion_multiply_xyzw(inverse_reference, measured)
+    angle = 2.0 * math.atan2(
+        math.sqrt(relative[0] ** 2 + relative[1] ** 2 + relative[2] ** 2),
+        abs(relative[3]),
+    )
+    return math.degrees(angle)
+
 
 def get_rotation_matrix(r, p, y):
     """Roll, Pitch, Yaw (ラジアン) から回転行列を計算 (R = Rz(yaw) * Ry(pitch) * Rx(roll))"""
@@ -67,6 +139,17 @@ def calculate_metrics(errors):
     std_dev = np.std(errors_np)
     
     return mae, rmse, std_dev
+
+
+def _csv_float(row, *column_names, default=None):
+    for column_name in column_names:
+        value = row.get(column_name)
+        if value is not None and value.strip():
+            return float(value)
+    if default is not None:
+        return default
+    raise KeyError(column_names[0])
+
 
 def get_latest_file(directory, pattern):
     """指定されたディレクトリからパターンに一致する最新のファイルを検索"""
@@ -122,22 +205,34 @@ def main():
 
     # CSVの読み込み
     ar_records = []
-    with open(ar_path, 'r', encoding='utf-8') as f:
+    with open(ar_path, 'r', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
         for row in reader:
             try:
                 ar_records.append({
-                    'Time': float(row['Time']),
-                    'GPS_X': float(row['GPS_X']),
-                    'GPS_Y': float(row['GPS_Y']),
-                    'GPS_Z': float(row['GPS_Z']),
-                    'Cargo_X': float(row['Cargo_X']) if row['Cargo_X'] else float('nan'),
-                    'Cargo_Y': float(row['Cargo_Y']) if row['Cargo_Y'] else float('nan'),
-                    'Cargo_Z': float(row['Cargo_Z']) if row['Cargo_Z'] else float('nan'),
+                    'Time': _csv_float(row, 'Time_s', 'Time'),
+                    'GPS_X': _csv_float(row, 'GPS_Drone_X_m', 'GPS_X'),
+                    'GPS_Y': _csv_float(row, 'GPS_Drone_Y_m', 'GPS_Y'),
+                    'GPS_Z': _csv_float(row, 'GPS_Drone_Z_m', 'GPS_Z'),
+                    'Cargo_X': _csv_float(
+                        row, 'Est_Cargo_X_m', 'Cargo_X', default=float('nan')
+                    ),
+                    'Cargo_Y': _csv_float(
+                        row, 'Est_Cargo_Y_m', 'Cargo_Y', default=float('nan')
+                    ),
+                    'Cargo_Z': _csv_float(
+                        row, 'Est_Cargo_Z_m', 'Cargo_Z', default=float('nan')
+                    ),
                     'Cargo_Detected': int(row['Cargo_Detected']),
-                    'Pix_Roll': float(row['Pixhawk_Roll']),
-                    'Pix_Pitch': float(row['Pixhawk_Pitch']),
-                    'Pix_Yaw': float(row['Pixhawk_Yaw']),
+                    'Pix_Roll': _csv_float(
+                        row, 'Pixhawk_Roll_rad', 'Pixhawk_Roll'
+                    ),
+                    'Pix_Pitch': _csv_float(
+                        row, 'Pixhawk_Pitch_rad', 'Pixhawk_Pitch'
+                    ),
+                    'Pix_Yaw': _csv_float(
+                        row, 'Pixhawk_Yaw_rad', 'Pixhawk_Yaw'
+                    ),
                 })
             except (ValueError, KeyError):
                 continue
@@ -154,12 +249,11 @@ def main():
                 pos = [float(row['pos_x']), float(row['pos_y']), float(row['pos_z'])]
                 quat = [float(row['quat_x']), float(row['quat_y']), float(row['quat_z']), float(row['quat_w'])]
                 
-                # Motive(X=北, Y=上, Z=東) -> ENU (East=Z, North=X, Up=Y)
-                enu_pos = [pos[2], pos[0], pos[1]]
+                ned_pos = MOTIVE_TO_NED_ROTATION @ np.asarray(pos)
 
                 record = {
                     'Time': t_sec,
-                    'pos': enu_pos,
+                    'pos': ned_pos,
                     'quat': quat
                 }
 
@@ -290,6 +384,15 @@ def main():
         # Motiveオイラー角計算
         mqx, mqy, mqz, mqw = mot_drone['quat']
         mot_roll, mot_pitch, mot_yaw = quaternion_to_euler_ned(mqx, mqy, mqz, mqw)
+        motive_attitude_ned = motive_quaternion_to_ned_xyzw(
+            mqx, mqy, mqz, mqw
+        )
+        pixhawk_attitude_ned = euler_zyx_to_quaternion_xyzw(
+            ar['Pix_Roll'], ar['Pix_Pitch'], ar['Pix_Yaw']
+        )
+        attitude_error_deg = quaternion_angular_error_deg(
+            motive_attitude_ned, pixhawk_attitude_ned
+        )
         
         # --- 姿勢の角度変位の計算 ---
         # ヨーの変位量（初期位置からの変化量）
@@ -327,10 +430,12 @@ def main():
             # 1. 記録時姿勢 (Pixhawk) でのボディ座標系相対位置の逆算
             R_rec = get_rotation_matrix(ar['Pix_Roll'], ar['Pix_Pitch'], ar['Pix_Yaw'])
             
-            # ワールド相対 (ENU)
-            dp_enu = np.array([ar['Cargo_X'] - ar['GPS_X'], ar['Cargo_Y'] - ar['GPS_Y'], ar['Cargo_Z'] - ar['GPS_Z']])
-            # ENU -> NED
-            dp_ned = np.array([dp_enu[1], dp_enu[0], -dp_enu[2]])
+            # AR位置はCSVに記録済みのNEDで扱います。
+            dp_ned = np.array([
+                ar['Cargo_X'] - ar['GPS_X'],
+                ar['Cargo_Y'] - ar['GPS_Y'],
+                ar['Cargo_Z'] - ar['GPS_Z'],
+            ])
             # 逆回転により機体ボディ相対座標を復元
             p_body = R_rec.T.dot(dp_ned)
             
@@ -346,11 +451,7 @@ def main():
             
             # 新しい姿勢でNED変換
             p_ned_new = R_new.dot(p_body)
-            # NED -> ENU
-            dp_enu_new = np.array([p_ned_new[1], p_ned_new[0], -p_ned_new[2]])
-            
-            # 再投影された荷物の絶対位置 (ENU)
-            cargo_reprojected = gps_pos + dp_enu_new
+            cargo_reprojected = gps_pos + p_ned_new
             
             # 3. 荷物位置誤差の計算 (Motive荷物位置がある場合)
             if mot_cargo is not None:
@@ -368,6 +469,7 @@ def main():
             'pix_yaw': ar['Pix_Yaw'],
             'mot_yaw': mot_yaw,
             'yaw_err': wrap_angle_rad(ar['Pix_Yaw'] - mot_yaw),
+            'attitude_error_deg': attitude_error_deg,
             'yaw_disp_err': yaw_disp_error,
             'ar_cum_dist': ar_cum_dist,
             'mot_cum_dist': mot_cum_dist,
@@ -397,10 +499,22 @@ def main():
     d_3d_mae, d_3d_rmse, d_3d_sd = calculate_metrics(drone_err_3d)
     
     print(f"■ ドローン絶対位置誤差 [m]:")
-    print(f"  X (East)  - MAE: {d_x_mae:7.4f}, RMSE: {d_x_rmse:7.4f}, SD: {d_x_sd:7.4f}")
-    print(f"  Y (North) - MAE: {d_y_mae:7.4f}, RMSE: {d_y_rmse:7.4f}, SD: {d_y_sd:7.4f}")
-    print(f"  Z (Up)    - MAE: {d_z_mae:7.4f}, RMSE: {d_z_rmse:7.4f}, SD: {d_z_sd:7.4f}")
+    print(f"  X (North) - MAE: {d_x_mae:7.4f}, RMSE: {d_x_rmse:7.4f}, SD: {d_x_sd:7.4f}")
+    print(f"  Y (East)  - MAE: {d_y_mae:7.4f}, RMSE: {d_y_rmse:7.4f}, SD: {d_y_sd:7.4f}")
+    print(f"  Z (Down)  - MAE: {d_z_mae:7.4f}, RMSE: {d_z_rmse:7.4f}, SD: {d_z_sd:7.4f}")
     print(f"  3D Total  - MAE: {d_3d_mae:7.4f}, RMSE: {d_3d_rmse:7.4f}, SD: {d_3d_sd:7.4f}")
+    mean_gps_pos = np.mean([r['gps_pos'] for r in results], axis=0)
+    mean_motive_pos = np.mean([r['mot_drone_pos'] for r in results], axis=0)
+    mean_drone_error = np.mean([r['drone_pos_err'] for r in results], axis=0)
+    print(
+        "  平均位置 N/E/D [m] - "
+        f"AR=({mean_gps_pos[0]:.4f}, {mean_gps_pos[1]:.4f}, {mean_gps_pos[2]:.4f}), "
+        f"Motive=({mean_motive_pos[0]:.4f}, {mean_motive_pos[1]:.4f}, {mean_motive_pos[2]:.4f})"
+    )
+    print(
+        "  平均差分 AR-Motive N/E/D [m] - "
+        f"({mean_drone_error[0]:.4f}, {mean_drone_error[1]:.4f}, {mean_drone_error[2]:.4f})"
+    )
     print("-" * 70)
 
     # 2. ドローン移動距離誤差
@@ -424,10 +538,15 @@ def main():
     
     y_mae, y_rmse, y_sd = calculate_metrics(yaw_err_deg)
     yd_mae, yd_rmse, yd_sd = calculate_metrics(yaw_disp_err_deg)
+    attitude_errors_deg = [r['attitude_error_deg'] for r in results]
+    attitude_mae, attitude_rmse, attitude_sd = calculate_metrics(
+        attitude_errors_deg
+    )
     
     print(f"■ ドローンヨー角度誤差 [deg]:")
     print(f"  絶対ヨー角誤差   - MAE: {y_mae:7.2f}, RMSE: {y_rmse:7.2f}, SD: {y_sd:7.2f}")
     print(f"  初期からの変位差 - MAE: {yd_mae:7.2f}, RMSE: {yd_rmse:7.2f}, SD: {yd_sd:7.2f}")
+    print(f"  クォータニオン相対回転誤差 - MAE: {attitude_mae:7.2f}, RMSE: {attitude_rmse:7.2f}, SD: {attitude_sd:7.2f}")
     print("-" * 70)
 
     # 4. 荷物位置誤差
@@ -441,13 +560,35 @@ def main():
         c_y_mae, c_y_rmse, c_y_sd = calculate_metrics(cargo_err_y)
         c_z_mae, c_z_rmse, c_z_sd = calculate_metrics(cargo_err_z)
         c_3d_mae, c_3d_rmse, c_3d_sd = calculate_metrics(cargo_err_3d)
+        valid_cargo_results = [
+            result for result in results
+            if not np.isnan(result['cargo_pos_err_3d'])
+        ]
+        mean_ar_cargo = np.mean(
+            [result['cargo_reproj'] for result in valid_cargo_results], axis=0
+        )
+        mean_motive_cargo = np.mean(
+            [result['mot_cargo_pos'] for result in valid_cargo_results], axis=0
+        )
+        mean_cargo_error = np.mean(
+            [result['cargo_pos_err'] for result in valid_cargo_results], axis=0
+        )
         
         print(f"■ 荷物絶対位置推定誤差（検出時） [m]:")
         print(f"  有効検出サンプル数: {len(cargo_err_3d)}")
-        print(f"  X (East)  - MAE: {c_x_mae:7.4f}, RMSE: {c_x_rmse:7.4f}, SD: {c_x_sd:7.4f}")
-        print(f"  Y (North) - MAE: {c_y_mae:7.4f}, RMSE: {c_y_rmse:7.4f}, SD: {c_y_sd:7.4f}")
-        print(f"  Z (Up)    - MAE: {c_z_mae:7.4f}, RMSE: {c_z_rmse:7.4f}, SD: {c_z_sd:7.4f}")
+        print(f"  X (North) - MAE: {c_x_mae:7.4f}, RMSE: {c_x_rmse:7.4f}, SD: {c_x_sd:7.4f}")
+        print(f"  Y (East)  - MAE: {c_y_mae:7.4f}, RMSE: {c_y_rmse:7.4f}, SD: {c_y_sd:7.4f}")
+        print(f"  Z (Down)  - MAE: {c_z_mae:7.4f}, RMSE: {c_z_rmse:7.4f}, SD: {c_z_sd:7.4f}")
         print(f"  3D Total  - MAE: {c_3d_mae:7.4f}, RMSE: {c_3d_rmse:7.4f}, SD: {c_3d_sd:7.4f}")
+        print(
+            "  平均位置 N/E/D [m] - "
+            f"AR=({mean_ar_cargo[0]:.4f}, {mean_ar_cargo[1]:.4f}, {mean_ar_cargo[2]:.4f}), "
+            f"Motive=({mean_motive_cargo[0]:.4f}, {mean_motive_cargo[1]:.4f}, {mean_motive_cargo[2]:.4f})"
+        )
+        print(
+            "  平均差分 AR-Motive N/E/D [m] - "
+            f"({mean_cargo_error[0]:.4f}, {mean_cargo_error[1]:.4f}, {mean_cargo_error[2]:.4f})"
+        )
     else:
         print("■ 荷物絶対位置推定誤差: 有効な荷物Motive同期データがありません")
     print("="*70)
@@ -460,10 +601,10 @@ def main():
         fig, axs = plt.subplots(4, 1, figsize=(12, 14), sharex=True)
         
         # 1. ドローン位置の時系列比較
-        axs[0].plot(times, [r['gps_pos'][0] for r in results], 'r--', label='AR GPS X (East)', alpha=0.8)
-        axs[0].plot(times, [r['mot_drone_pos'][0] for r in results], 'r-', label='Motive ID1 X (East) [True]', alpha=0.8)
-        axs[0].plot(times, [r['gps_pos'][1] for r in results], 'b--', label='AR GPS Y (North)', alpha=0.8)
-        axs[0].plot(times, [r['mot_drone_pos'][1] for r in results], 'b-', label='Motive ID1 Y (North) [True]', alpha=0.8)
+        axs[0].plot(times, [r['gps_pos'][0] for r in results], 'r--', label='AR GPS X (North)', alpha=0.8)
+        axs[0].plot(times, [r['mot_drone_pos'][0] for r in results], 'r-', label='Motive ID1 X (North) [True]', alpha=0.8)
+        axs[0].plot(times, [r['gps_pos'][1] for r in results], 'b--', label='AR GPS Y (East)', alpha=0.8)
+        axs[0].plot(times, [r['mot_drone_pos'][1] for r in results], 'b-', label='Motive ID1 Y (East) [True]', alpha=0.8)
         axs[0].set_ylabel('Position [m]', fontsize=10)
         axs[0].set_title(f'Drone Position Comparison (Sensor Mode: {mode_name})', fontsize=12, fontweight='bold')
         axs[0].grid(True, alpha=0.3)
@@ -481,9 +622,10 @@ def main():
         # 3. ドローン姿勢角度誤差 (Yaw) と Yaw変位誤差
         axs[2].plot(times, yaw_err_deg, 'g--', label='Absolute Yaw Angle Error', alpha=0.8)
         axs[2].plot(times, yaw_disp_err_deg, 'g-', label='Yaw Displacement Error (from start)', alpha=0.8)
+        axs[2].plot(times, attitude_errors_deg, 'm-', label='Quaternion Relative Rotation Error', alpha=0.8)
         axs[2].axhline(y=0.0, color='black', linestyle='--', linewidth=0.8)
-        axs[2].set_ylabel('Yaw Error [deg]', fontsize=10)
-        axs[2].set_title('Drone Yaw Angle & Displacement Error', fontsize=12, fontweight='bold')
+        axs[2].set_ylabel('Orientation Error [deg]', fontsize=10)
+        axs[2].set_title('Drone Yaw & Quaternion Relative Rotation Error', fontsize=12, fontweight='bold')
         axs[2].grid(True, alpha=0.3)
         axs[2].legend(loc='upper left', fontsize=9)
 

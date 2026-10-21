@@ -3,8 +3,8 @@
 """
 verify_vertical_accuracy_world.py - 垂直実験（下向きカメラ）用精度検証スクリプト
 
-AR-hook1_test_multi_ids.py 等で出力されたログCSVを読み込み、
-ワールド座標系 (ENU: East-North-Up) における AR計測値（荷物・手先/ドローン）と
+AR-hook1_test.py 等で出力されたログCSVを読み込み、
+ワールド座標系 (NED: North-East-Down) における AR計測値（荷物・手先/ドローン）と
 Motive真値の誤差を計算・統計評価（MAE, RMSE, SD）および可視化します。
 """
 import os
@@ -61,13 +61,13 @@ def main():
         return
 
     print("=" * 70)
-    print(f"📊 垂直実験 ワールド座標系(ENU) 誤差検証スクリプト")
-    print(f"🔍 読み込みファイル: {"C:/Users/Ushida/Downloads/20261012_132217_1.csv"}")
+    print(f"📊 垂直実験 ワールド座標系(NED) 誤差検証スクリプト")
+    print(f"🔍 読み込みファイル: {csv_path}")
     print("=" * 70)
 
     times = []
     
-    # ワールド座標系 (ENU: East, North, Up)
+    # ワールド座標系 (NED: North, East, Down)
     # 1. 荷物位置 (Cargo)
     cargo_x_ar, cargo_y_ar, cargo_z_ar = [], [], []
     cargo_x_mot, cargo_y_mot, cargo_z_mot = [], [], []
@@ -104,7 +104,7 @@ def main():
                 cargo_detected.append(c_det)
                 id1_detected.append(i_det)
 
-                # 荷物 AR推定 (ワールドENU)
+                # 荷物 AR推定 (ワールドNED)
                 cx = get_v(row, 'Cargo_X', 'Est_Cargo_X_m')
                 cy = get_v(row, 'Cargo_Y', 'Est_Cargo_Y_m')
                 cz = get_v(row, 'Cargo_Z', 'Est_Cargo_Z_m')
@@ -112,7 +112,7 @@ def main():
                 cargo_y_ar.append(float(cy) if cy is not None else float('nan'))
                 cargo_z_ar.append(float(cz) if cz is not None else float('nan'))
 
-                # 荷物 Motive真値 (ワールドENU)
+                # 荷物 Motive真値 (ワールドNED)
                 mcx = get_v(row, 'Motive_Cargo_X', 'Motive_Cargo_X_m')
                 mcy = get_v(row, 'Motive_Cargo_Y', 'Motive_Cargo_Y_m')
                 mcz = get_v(row, 'Motive_Cargo_Z', 'Motive_Cargo_Z_m')
@@ -120,7 +120,7 @@ def main():
                 cargo_y_mot.append(float(mcy) if mcy is not None else float('nan'))
                 cargo_z_mot.append(float(mcz) if mcz is not None else float('nan'))
 
-                # ドローン / 手先 AR/GPS (ワールドENU)
+                # ドローン / 手先 AR/GPS (ワールドNED)
                 dx = get_v(row, 'GPS_X', 'GPS_Drone_X_m')
                 dy = get_v(row, 'GPS_Y', 'GPS_Drone_Y_m')
                 dz = get_v(row, 'GPS_Z', 'GPS_Drone_Z_m')
@@ -128,7 +128,7 @@ def main():
                 drone_y_ar.append(float(dy) if dy is not None else float('nan'))
                 drone_z_ar.append(float(dz) if dz is not None else float('nan'))
 
-                # ドローン / 手先 Motive真値 (ワールドENU)
+                # ドローン / 手先 Motive真値 (ワールドNED)
                 mdx = get_v(row, 'Motive_Drone_X', 'Motive_Drone_X_m')
                 mdy = get_v(row, 'Motive_Drone_Y', 'Motive_Drone_Y_m')
                 mdz = get_v(row, 'Motive_Drone_Z', 'Motive_Drone_Z_m')
@@ -160,7 +160,7 @@ def main():
     time_sec = [t - t0 for t in times]
 
     # --- 誤差の計算 ---
-    # 1. 荷物ワールド誤差 (Cargo AR vs Motive in ENU)
+    # 1. 荷物ワールド誤差 (Cargo AR vs Motive in NED)
     err_cargo_x, err_cargo_y, err_cargo_z, err_cargo_3d = [], [], [], []
     valid_cargo_idx = []
 
@@ -178,7 +178,7 @@ def main():
                 err_cargo_3d.append(e3d)
                 valid_cargo_idx.append(i)
 
-    # 2. ドローン / 手先ワールド誤差 (Drone GPS/AR vs Motive ID1 in ENU)
+    # 2. ドローン / 手先ワールド誤差 (Drone GPS/AR vs Motive ID1 in NED)
     err_drone_x, err_drone_y, err_drone_z, err_drone_3d = [], [], [], []
     valid_drone_idx = []
 
@@ -208,16 +208,16 @@ def main():
 
     # レポート表示
     print("\n" + "=" * 70)
-    print(" 📈 垂直実験 ワールド座標系(ENU) 計測精度評価レポート")
-    print("   ENU軸定義: X=東(East), Y=北(North), Z=上(Up)")
+    print(" 📈 垂直実験 ワールド座標系(NED) 計測精度評価レポート")
+    print("   NED軸定義: X=北(North), Y=東(East), Z=下(Down)")
     print("=" * 70)
 
     print(f"■ 荷物中心位置 (Cargo) のワールド絶対誤差 [m] (AR推定 - Motive真値)")
     print(f"  有効評価サンプル数: {len(valid_cargo_idx)} / {len(times)} (検出率: {len(valid_cargo_idx)/len(times)*100:.1f}%)")
     if len(valid_cargo_idx) > 0:
-        print(f"  X (東 / East)  - MAE: {c_x_mae:7.4f} m, RMSE: {c_x_rmse:7.4f} m, SD: {c_x_sd:7.4f} m")
-        print(f"  Y (北 / North) - MAE: {c_y_mae:7.4f} m, RMSE: {c_y_rmse:7.4f} m, SD: {c_y_sd:7.4f} m")
-        print(f"  Z (上 / Up)    - MAE: {c_z_mae:7.4f} m, RMSE: {c_z_rmse:7.4f} m, SD: {c_z_sd:7.4f} m")
+        print(f"  X (北 / North) - MAE: {c_x_mae:7.4f} m, RMSE: {c_x_rmse:7.4f} m, SD: {c_x_sd:7.4f} m")
+        print(f"  Y (東 / East)  - MAE: {c_y_mae:7.4f} m, RMSE: {c_y_rmse:7.4f} m, SD: {c_y_sd:7.4f} m")
+        print(f"  Z (下 / Down)  - MAE: {c_z_mae:7.4f} m, RMSE: {c_z_rmse:7.4f} m, SD: {c_z_sd:7.4f} m")
         print(f"  3D合成誤差     - MAE: {c_3d_mae:7.4f} m, RMSE: {c_3d_rmse:7.4f} m, SD: {c_3d_sd:7.4f} m")
     else:
         print("  ⚠ 荷物の有効なAR/Motiveデータがありません。")
@@ -226,9 +226,9 @@ def main():
     print(f"■ ドローン / 手先位置 (Drone/Hand) のワールド絶対誤差 [m] (GPS/AR - Motive真値)")
     print(f"  有効評価サンプル数: {len(valid_drone_idx)} / {len(times)}")
     if len(valid_drone_idx) > 0:
-        print(f"  X (東 / East)  - MAE: {d_x_mae:7.4f} m, RMSE: {d_x_rmse:7.4f} m, SD: {d_x_sd:7.4f} m")
-        print(f"  Y (北 / North) - MAE: {d_y_mae:7.4f} m, RMSE: {d_y_rmse:7.4f} m, SD: {d_y_sd:7.4f} m")
-        print(f"  Z (上 / Up)    - MAE: {d_z_mae:7.4f} m, RMSE: {d_z_rmse:7.4f} m, SD: {d_z_sd:7.4f} m")
+        print(f"  X (北 / North) - MAE: {d_x_mae:7.4f} m, RMSE: {d_x_rmse:7.4f} m, SD: {d_x_sd:7.4f} m")
+        print(f"  Y (東 / East)  - MAE: {d_y_mae:7.4f} m, RMSE: {d_y_rmse:7.4f} m, SD: {d_y_sd:7.4f} m")
+        print(f"  Z (下 / Down)  - MAE: {d_z_mae:7.4f} m, RMSE: {d_z_rmse:7.4f} m, SD: {d_z_sd:7.4f} m")
         print(f"  3D合成誤差     - MAE: {d_3d_mae:7.4f} m, RMSE: {d_3d_rmse:7.4f} m, SD: {d_3d_sd:7.4f} m")
     print("=" * 70)
 
@@ -241,21 +241,21 @@ def main():
         t_cargo = [time_sec[i] for i in valid_cargo_idx]
 
         # 1. ワールド座標 (X, Y, Z) の時系列比較
-        axs[0].plot(t_cargo, [cargo_x_ar[i] for i in valid_cargo_idx], 'r--', label='Cargo AR X (East)', alpha=0.8)
+        axs[0].plot(t_cargo, [cargo_x_ar[i] for i in valid_cargo_idx], 'r--', label='Cargo AR X (North)', alpha=0.8)
         axs[0].plot(t_cargo, [cargo_x_mot[i] for i in valid_cargo_idx], 'r-', label='Cargo Motive X [True]', alpha=0.6, linewidth=2)
-        axs[0].plot(t_cargo, [cargo_y_ar[i] for i in valid_cargo_idx], 'g--', label='Cargo AR Y (North)', alpha=0.8)
+        axs[0].plot(t_cargo, [cargo_y_ar[i] for i in valid_cargo_idx], 'g--', label='Cargo AR Y (East)', alpha=0.8)
         axs[0].plot(t_cargo, [cargo_y_mot[i] for i in valid_cargo_idx], 'g-', label='Cargo Motive Y [True]', alpha=0.6, linewidth=2)
-        axs[0].plot(t_cargo, [cargo_z_ar[i] for i in valid_cargo_idx], 'b--', label='Cargo AR Z (Up)', alpha=0.8)
+        axs[0].plot(t_cargo, [cargo_z_ar[i] for i in valid_cargo_idx], 'b--', label='Cargo AR Z (Down)', alpha=0.8)
         axs[0].plot(t_cargo, [cargo_z_mot[i] for i in valid_cargo_idx], 'b-', label='Cargo Motive Z [True]', alpha=0.6, linewidth=2)
-        axs[0].set_ylabel('Position in World ENU [m]', fontsize=10)
+        axs[0].set_ylabel('Position in World NED [m]', fontsize=10)
         axs[0].set_title('Cargo World Position (AR Estimate vs Motive Ground Truth)', fontsize=12, fontweight='bold')
         axs[0].grid(True, alpha=0.3)
         axs[0].legend(loc='best', fontsize=9)
 
         # 2. 各軸の誤差 (X, Y, Z)
-        axs[1].plot(t_cargo, err_cargo_x, 'r.-', label=f'Error X (East) [MAE={c_x_mae:.3f}m]', markersize=3, alpha=0.7)
-        axs[1].plot(t_cargo, err_cargo_y, 'g.-', label=f'Error Y (North) [MAE={c_y_mae:.3f}m]', markersize=3, alpha=0.7)
-        axs[1].plot(t_cargo, err_cargo_z, 'b.-', label=f'Error Z (Up) [MAE={c_z_mae:.3f}m]', markersize=3, alpha=0.7)
+        axs[1].plot(t_cargo, err_cargo_x, 'r.-', label=f'Error X (North) [MAE={c_x_mae:.3f}m]', markersize=3, alpha=0.7)
+        axs[1].plot(t_cargo, err_cargo_y, 'g.-', label=f'Error Y (East) [MAE={c_y_mae:.3f}m]', markersize=3, alpha=0.7)
+        axs[1].plot(t_cargo, err_cargo_z, 'b.-', label=f'Error Z (Down) [MAE={c_z_mae:.3f}m]', markersize=3, alpha=0.7)
         axs[1].axhline(0, color='black', linestyle=':', alpha=0.6)
         axs[1].set_ylabel('Axis Error [m]', fontsize=10)
         axs[1].set_title('Cargo Estimation Error per Axis (AR - Motive)', fontsize=12, fontweight='bold')
@@ -268,7 +268,7 @@ def main():
         axs[2].axhline(c_3d_rmse, color='orange', linestyle='--', label=f'RMSE: {c_3d_rmse:.4f} m')
         axs[2].set_xlabel('Time elapsed [s]', fontsize=10)
         axs[2].set_ylabel('3D Error [m]', fontsize=10)
-        axs[2].set_title('Cargo 3D Total Error in World ENU Frame', fontsize=12, fontweight='bold')
+        axs[2].set_title('Cargo 3D Total Error in World NED Frame', fontsize=12, fontweight='bold')
         axs[2].grid(True, alpha=0.3)
         axs[2].legend(loc='best', fontsize=9)
 
