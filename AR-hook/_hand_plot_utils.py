@@ -10,6 +10,8 @@ from typing import Callable, Sequence
 
 PositionReader = Callable[[dict[str, str]], tuple[float, float, float] | None]
 ValidityCheck = Callable[[dict[str, str]], bool]
+PLOT_START_TRIM_S = 25.0
+PLOT_END_TRIM_S = 5.0
 
 
 def _finite_values(row: dict[str, str], columns: Sequence[str]):
@@ -88,6 +90,7 @@ def _plot(
             ]
             axis.plot(elapsed_s, values, label=label)
             axis.set_ylabel(f"{label} [deg]")
+            axis.set_ylim(-100, 100)
             axis.grid(True, alpha=0.3)
             axis.legend(loc="best")
         attitude_axes[-1].set_xlabel("Time from start [s]")
@@ -164,10 +167,23 @@ def run_hand_plotter(
             )
             attitudes.append(angles)
 
-    if not times or not any(position is not None for position in positions):
+    if not times:
         parser.error(f"{args.csv}: グラフにできる有効な位置データがありません")
 
     start_time = min(times)
+    end_time = max(times)
+    plot_start_time = start_time + PLOT_START_TRIM_S
+    plot_end_time = end_time - PLOT_END_TRIM_S
+    included_indices = [
+        index
+        for index, timestamp in enumerate(times)
+        if plot_start_time <= timestamp <= plot_end_time
+    ]
+    times = [times[index] for index in included_indices]
+    positions = [positions[index] for index in included_indices]
+    if attitudes is not None:
+        attitudes = [attitudes[index] for index in included_indices]
+
     elapsed_s = [timestamp - start_time for timestamp in times]
     output_path = args.output or _default_output(args.csv, suffix)
     try:
