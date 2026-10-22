@@ -176,7 +176,8 @@ motive_attitude_received = False
 motive_drone_pos_received = False
 MOTIVE_RIGID_BODY_IDS = (1, 2, CAMERA_RIGID_BODY_ID)
 MOTIVE_POSE_HISTORY_SECONDS = 10.0
-MOTIVE_POSE_INTERPOLATION_MAX_GAP_S = 0.1
+MOTIVE_POSE_INTERPOLATION_MAX_GAP_S = 0.3
+MOTIVE_POSE_MATCH_WAIT_S = 0.05
 motive_rigid_body_quaternions = {
     rigid_body_id: [float('nan')] * 4
     for rigid_body_id in MOTIVE_RIGID_BODY_IDS
@@ -1194,30 +1195,60 @@ def camera_tracker_loop(m, show_window=False):
             if not ret or img is None:
                 time.sleep(0.01)
                 continue
-            frame_camera_pose = _camera_pose_at_frame_time(frame_timestamp_s)
-            if (
-                frame_camera_pose is None
-                and time.monotonic() - last_camera_pose_match_warning >= 5.0
-            ):
-                with io_lock:
-                    camera_history = motive_rigid_body_pose_history[
-                        CAMERA_RIGID_BODY_ID
-                    ]
-                    latest_camera_timestamp = (
-                        camera_history[-1][0] if camera_history else float("nan")
-                    )
-                print(
-                    "⚠ 撮影時刻に対応するMotive RB3姿勢を補間できません。"
-                    f"frame={frame_timestamp_s:.6f}s, "
-                    f"latest_RB3={latest_camera_timestamp:.6f}s, "
-                    f"許容サンプル間隔={MOTIVE_POSE_INTERPOLATION_MAX_GAP_S:.3f}s。"
-                    "時計同期とMotiveカメラ剛体の受信を確認してください。"
-                )
-                last_camera_pose_match_warning = time.monotonic()
             fps_frame_count += 1
             # マーカー検出
             corners, ids, rejected = detector.detectMarkers(img)
             detected_ids = [] if ids is None else [int(marker_id) for marker_id in ids.flatten()]
+            needs_world_pose = any(
+                marker_id == ID_CENTER_MARKER
+                or marker_id in SQUARE_MARKER_IDS
+                for marker_id in detected_ids
+            )
+            frame_camera_pose = None
+            if needs_world_pose:
+                match_deadline = time.monotonic() + MOTIVE_POSE_MATCH_WAIT_S
+                while True:
+                    frame_camera_pose = _camera_pose_at_frame_time(
+                        frame_timestamp_s
+                    )
+                    if (
+                        frame_camera_pose is not None
+                        or time.monotonic() >= match_deadline
+                    ):
+                        break
+                    time.sleep(0.002)
+                if (
+                    frame_camera_pose is None
+                    and time.monotonic() - last_camera_pose_match_warning >= 5.0
+                ):
+                    with io_lock:
+                        camera_history = list(
+                            motive_rigid_body_pose_history[
+                                CAMERA_RIGID_BODY_ID
+                            ]
+                        )
+                    oldest_camera_timestamp = (
+                        camera_history[0][0]
+                        if camera_history
+                        else float("nan")
+                    )
+                    latest_camera_timestamp = (
+                        camera_history[-1][0]
+                        if camera_history
+                        else float("nan")
+                    )
+                    print(
+                        "⚠ 撮影時刻に対応するMotive RB3姿勢を補間できません。"
+                        f"frame={frame_timestamp_s:.6f}s, "
+                        f"RB3履歴=[{oldest_camera_timestamp:.6f}, "
+                        f"{latest_camera_timestamp:.6f}]s, "
+                        f"待機={MOTIVE_POSE_MATCH_WAIT_S * 1000:.0f}ms, "
+                        f"許容サンプル間隔="
+                        f"{MOTIVE_POSE_INTERPOLATION_MAX_GAP_S:.3f}s。"
+                        "このフレームのAR NED姿勢はCSVに記録されません。"
+                        "時計同期とMotiveカメラ剛体の受信を確認してください。"
+                    )
+                    last_camera_pose_match_warning = time.monotonic()
             has_cargo = False
             has_id1 = False
             used_last_center = False
