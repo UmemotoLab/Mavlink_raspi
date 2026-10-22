@@ -176,7 +176,7 @@ motive_attitude_received = False
 motive_drone_pos_received = False
 MOTIVE_RIGID_BODY_IDS = (1, 2, CAMERA_RIGID_BODY_ID)
 MOTIVE_POSE_HISTORY_SECONDS = 10.0
-MOTIVE_POSE_INTERPOLATION_MAX_GAP_S = 0.3
+MOTIVE_POSE_INTERPOLATION_MAX_GAP_S = 0.1
 MOTIVE_POSE_MATCH_WAIT_S = 0.05
 motive_rigid_body_quaternions = {
     rigid_body_id: [float('nan')] * 4
