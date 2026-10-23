@@ -18,9 +18,16 @@ and /home/taki/Downloads/Full-Params_ekf_V2.param:
 8. verify_all_cached() judges missing items without per-item waiting.
 9. No MAV_CMD_PREFLIGHT_STORAGE explicit-save command remains.
 10. No misleading EEPROM-saved/persisted success message remains.
-11. Default mode is read-only check; --write is required for writes.
-12. 2026-10-17付の実機確認TODOが残っている。
-13. Connection baud follows the profile: the /dev/ttyAMA0 (TELEM1) path derives
+11. No-flag run writes (WRITE_MODE = not args.check); --check is the only
+    read-only mode, and no interactive USB prompt remains.
+12. Default write is diff-only: only params differing from the live cache are
+    written; --write-all writes all 157; --only/--skip narrow the target set.
+   HARDWARE_PENDING (GPS1_CAN_NODEID, live 124) is skipped unless explicitly
+   requested.
+13. Armed guard: HEARTBEAT base_mode is checked before writing; abort unless
+    --force.
+14. 2026-10-17付の実機確認TODOが残っている。
+15. Connection baud follows the profile: the /dev/ttyAMA0 (TELEM1) path derives
     its baud from params_to_set['SERIAL1_BAUD'], and no literal baud is left in
     the connection block.
 """
@@ -72,9 +79,20 @@ def load_resolve_connection():
     src = open(RTKV2, encoding="utf-8").read()
     m = re.search(r"(def resolve_connection\(.*?)\n\n\n", src, re.S)
     assert m, "resolve_connection not found"
-    ns = {"input": input}
+    mdef = re.search(r'DEFAULT_UART_DEVICE = "([^"]+)"', src)
+    ns = {"os": os, "DEFAULT_UART_DEVICE": mdef.group(1) if mdef else "/dev/ttyAMA0"}
     exec(m.group(1), ns)
     return ns["resolve_connection"]
+
+
+def load_target_fns():
+    """Exec only the pure write-target helpers (no MAVLink connection)."""
+    src = open(RTKV2, encoding="utf-8").read()
+    m = re.search(r"(def close_enough.*?)(?=\n\n\n# ===+)", src, re.S)
+    assert m, "write-target helpers not found"
+    ns = {"time": time}
+    exec(m.group(1), ns)
+    return ns["select_write_targets"], ns["parse_param_list"]
 
 
 # Complete profile: identical key sets, diff limited to 9 GPS/CAN/compass items.
@@ -114,13 +132,24 @@ def test_uart_baud_follows_serial1_baud():
     src = open(RTKV2, encoding="utf-8").read()
     assert "UART_BAUD = int(params_to_set['SERIAL1_BAUD'][0])" in src, \
         "接続baudが設定辞書のSERIAL1_BAUDから導出されていない"
-    block = src[src.index("def resolve_connection"):src.index("master.wait_heartbeat()")]
+    block = src[src.index("def resolve_connection"):src.index("master.wait_heartbeat(")]
     assert "1000000" not in block, "接続ブロックにbaudのハードコードが残っている"
     resolve = load_resolve_connection()
     uart_baud = params["SERIAL1_BAUD"][0]
-    # UART (/dev/ttyAMA0) 経路は SERIAL1_BAUD、USB 経路は --baud-usb を使う
-    assert resolve("auto", 115200, uart_baud, lambda _msg: "y") == ("/dev/ttyACM0", 115200, False)
-    assert resolve("auto", 115200, uart_baud, lambda _msg: "n") == ("/dev/ttyAMA0", 1000000, True)
+    # auto は USB シリアルがあれば USB（--baud-usb）、無ければ TELEM1（SERIAL1_BAUD）
+    assert resolve("auto", 115200, uart_baud,
+                   exists=lambda p: p == "/dev/ttyACM0") == ("/dev/ttyACM0", 115200, False)
+    assert resolve("auto", 115200, uart_baud, exists=lambda p: False) == ("/dev/ttyAMA0", 1000000, True)
+    # --uart / --usb の明示指定
+    assert resolve("uart", 115200, uart_baud) == ("/dev/ttyAMA0", 1000000, True)
+    assert resolve("usb", 115200, uart_baud,
+                   exists=lambda p: p == "/dev/ttyACM0") == ("/dev/ttyACM0", 115200, False)
+    try:
+        resolve("usb", 115200, uart_baud, exists=lambda p: False)
+    except SystemExit as e:
+        assert "--device uart" in str(e)
+    else:
+        raise AssertionError("USB 不在時は --usb をエラーにする")
     assert resolve("/dev/ttyACM0", 115200, uart_baud) == ("/dev/ttyACM0", 115200, False)
     assert resolve("/dev/ttyAMA0", 115200, uart_baud) == ("/dev/ttyAMA0", 1000000, True)
 
@@ -228,13 +257,74 @@ def test_no_misleading_eeprom_message():
     assert "電源再投入後の保持は未検証" in src, "再投入未検証の明記がない"
 
 
-def test_check_is_default_and_write_flag_exists():
+def test_write_is_default_and_check_flag_is_readonly():
     src = open(RTKV2, encoding="utf-8").read()
-    assert '"--check"' in src and '"--write"' in src
-    assert "WRITE_MODE = bool(args.write)" in src
+    assert "WRITE_MODE = not args.check" in src, "引数なしの既定が書き込みになっていない"
+    for flag in ('"--check"', '"--write"', '"--write-all"', '"--only"', '"--skip"', '"--force"'):
+        assert flag in src, f"{flag} がない"
+    assert "USB接続を行いますか" not in src, "対話プロンプトが残っている"
+    assert "ask=input" not in src, "対話入力が残っている"
     r = subprocess.run([sys.executable, RTKV2, "--help"], capture_output=True, text=True, timeout=30)
     assert r.returncode == 0, r.stderr
-    assert "--write" in r.stdout and "--check" in r.stdout
+    for flag in ("--write", "--check", "--write-all", "--only", "--skip"):
+        assert flag in r.stdout, f"{flag} が --help にない"
+
+
+def test_armed_guard_before_write():
+    src = open(RTKV2, encoding="utf-8").read()
+    assert "def is_armed(" in src, "armed 判定関数がない"
+    assert "motors_armed" in src or "MAV_MODE_FLAG_SAFETY_ARMED" in src, "HEARTBEAT の armed 判定がない"
+    assert "if is_armed():" in src, "書き込み前の armed ガードがない"
+    assert "armed を検出しました" in src, "armed 中止メッセージがない"
+    assert "--force" in src
+
+
+def test_write_targets_are_diff_only_by_default():
+    select_write_targets, _parse = load_target_fns()
+    params = load_params(RTKV2)
+    cache = {n: (v[0], 9) for n, v in params.items()}
+    cache["PSC_NE_POS_P"] = (5.0, 9)
+    targets, unchanged, pending, not_in_fc = select_write_targets(
+        params, cache, hardware_pending={"GPS1_CAN_NODEID"})
+    assert set(targets) == {"PSC_NE_POS_P"}, set(targets)
+    assert len(unchanged) == len(params) - 1
+    assert not pending and not not_in_fc
+    # 実機差分が既知の GPS1_CAN_NODEID は保留して書かない
+    cache["GPS1_CAN_NODEID"] = (124.0, 9)
+    targets, unchanged, pending, _m = select_write_targets(
+        params, cache, hardware_pending={"GPS1_CAN_NODEID"})
+    assert set(targets) == {"PSC_NE_POS_P"}, set(targets)
+    assert [n for n, _e, _g in pending] == ["GPS1_CAN_NODEID"]
+    assert len(unchanged) == len(params) - 2
+    # FC に無い項目は書き込み対象にしない
+    targets, _u, _p, not_in_fc = select_write_targets(params, {})
+    assert not targets and len(not_in_fc) == len(params)
+
+
+def test_write_all_and_only_skip():
+    select_write_targets, parse = load_target_fns()
+    params = load_params(RTKV2)
+    cache = {n: (v[0], 9) for n, v in params.items()}
+    cache["GPS1_CAN_NODEID"] = (124.0, 9)
+    targets, _u, pending, _m = select_write_targets(
+        params, cache, write_all=True, hardware_pending={"GPS1_CAN_NODEID"})
+    assert set(targets) == set(params), "write_all は全項目を対象にする"
+    assert not pending
+    targets, _u, _p, _m = select_write_targets(
+        params, cache, only={"GPS1_CAN_NODEID"}, hardware_pending={"GPS1_CAN_NODEID"})
+    assert set(targets) == {"GPS1_CAN_NODEID"}, "only 指定時は保留項目も書く"
+    targets, _u, _p, _m = select_write_targets(
+        params, cache, only={"GPS1_CAN_NODEID"}, skip={"GPS1_CAN_NODEID"})
+    assert not targets, "skip は only より優先される"
+    assert parse("PSC_NE_POS_P, GPS1_CAN_NODEID", params, "--only") == {
+        "PSC_NE_POS_P", "GPS1_CAN_NODEID"}
+    assert parse("", params, "--only") == set()
+    try:
+        parse("NOPE_PARAM", params, "--only")
+    except SystemExit as e:
+        assert "NOPE_PARAM" in str(e)
+    else:
+        raise AssertionError("unknown param must be rejected")
 
 
 def test_dated_confirmation_todo_present():

@@ -24,29 +24,68 @@ SERIAL1_BAUD 1000000を実機 --check で確認すること（未実施）。
   実体を本スクリプトから直呼びすることはない。
 - V1 (RTK/setup_RTK_V1.py) は不変。DGNSSMODE等のF9P内部設定には触れない。
 
-動作: 既定は読み取り専用の --check。--write でのみ実書き込みする（FC自動保存、
-再投入保持は未検証）。PARAM_SET時にFCが自動保存するため明示保存コマンドは送らない。
-PARAM_REQUEST_LIST のキャッシュ照合 + 総時間上限で高速に検証する。電源再投入後の
-保持は未検証。通信喪失・武装・再起動・工場初期化は行わない。"""
+動作: 引数なし（または --write）で書き込み、--check でのみ読み取り専用。
+書き込みは既定で「実機の値と違う項目だけ」に絞り、157項目の無条件書き込みを避ける
+（--write-all で全項目、--only / --skip で個別指定）。書き込み前に HEARTBEAT の
+base_mode で armed を確認し、armed なら中止する（--force 指定時のみ続行）。
+FCはPARAM_SET時に自動保存するため明示保存コマンドは送らない。PARAM_REQUEST_LIST の
+キャッシュ照合 + 総時間上限で高速に検証する。電源再投入後の保持は未検証。
+通信喪失・武装・再起動・工場初期化は行わない。
+接続先は既定で /dev/ttyACM0（無ければ /dev/ttyAMA0）を自動選択し、対話入力はしない。
+UART を明示する場合は --uart（= --device uart）、USB は --usb（= --device usb）。
+UART の baud はプロファイルの SERIAL1_BAUD に追従する（--baud-uart で診断用に上書き可）。
+ハートビートは --heartbeat-timeout（既定15s）で打ち切り、無応答時は受信バイト数から
+電源/配線/baud の切り分けを表示する。
+GPS1_CAN_NODEID は実機が124でRTK Fix運用中のため差分書き込みでは保留する
+（125へ書き換えるとDroneCAN GPSを認識しなくなる恐れがある。--write-all か
+--only GPS1_CAN_NODEID を明示した場合のみ書く）。"""
 
 from pymavlink import mavutil
 import time
 import sys
 import argparse
+import os
 
 # ================================
 # 設定セクション
 # ================================
 
-# CLI: 既定は読み取り専用の --check。--write でのみ実書き込みする（FC自動保存、再投入保持は未検証）。
-parser = argparse.ArgumentParser(description="setup_RTK_V2 param setup (default: check-only)")
-parser.add_argument("--check", action="store_true", help="read-only verify (default when no flag)")
-parser.add_argument("--write", action="store_true", help="write params (FC autosaves; reboot persistence unverified)")
-parser.add_argument("--device", default="auto", help="auto | /dev/ttyACM0 | /dev/ttyAMA0")
+# CLI: 引数なし（または --write）で書き込み、--check でのみ読み取り専用。
+# 書き込みは既定で差分のみ（実機と値が違う項目だけ）。FC自動保存、再投入保持は未検証。
+parser = argparse.ArgumentParser(
+    description="setup_RTK_V2 param setup (default: write differing params)")
+parser.add_argument("--check", action="store_true",
+                    help="read-only verify (no write)")
+parser.add_argument("--write", action="store_true",
+                    help="write differing params (default when no flag)")
+parser.add_argument("--write-all", action="store_true",
+                    help="write all profile items regardless of live values")
+parser.add_argument("--only", default="",
+                    help="write only these params (comma separated)")
+parser.add_argument("--skip", default="",
+                    help="do not write these params (comma separated)")
+parser.add_argument("--force", action="store_true",
+                    help="allow writing while armed (not recommended)")
+parser.add_argument("--device", default="auto",
+                    help="auto | usb | uart | /dev/ttyACM0 | /dev/ttyAMA0")
+parser.add_argument("--uart", action="store_true", help="same as --device uart")
+parser.add_argument("--usb", action="store_true", help="same as --device usb")
 parser.add_argument("--baud-usb", type=int, default=115200)
+parser.add_argument("--baud-uart", type=int, default=None,
+                    help="UART baud (default: profile SERIAL1_BAUD)")
+parser.add_argument("--heartbeat-timeout", type=float, default=15.0,
+                    help="heartbeat wait timeout [s]")
 parser.add_argument("--verify-budget", type=float, default=60.0, help="verify phase total budget [s]")
 args = parser.parse_args()
-WRITE_MODE = bool(args.write)
+if args.check and (args.write or args.write_all):
+    parser.error("--check は --write / --write-all と併用できません")
+if args.uart and args.usb:
+    parser.error("--uart と --usb は同時に指定できません")
+if args.uart:
+    args.device = "uart"
+if args.usb:
+    args.device = "usb"
+WRITE_MODE = not args.check
 
 # 振り子周波数の計算
 import math
@@ -159,15 +198,16 @@ params_to_set = {
     'PILOT_ACC_Z': (2.5, 'AP_Float', 'パイロット垂直加速度 [m/s^2]（旧PILOT_ACCEL_Z 250cm/s^2相当）'),
 
     # === 垂直制御PID ===
+    # 'PSC_D_POS_P': (1.0, 'AP_Float', '高度位置制御P（旧PSC_POSZ_P）'),
     'PSC_D_POS_P': (1.0, 'AP_Float', '高度位置制御P（旧PSC_POSZ_P）'),
     'PSC_D_VEL_P': (4.0, 'AP_Float', '垂直速度制御P（旧PSC_VELZ_P）'),
     'PSC_D_VEL_I': (8.0, 'AP_Float', '垂直速度制御I（旧PSC_VELZ_I）'),
-    'PSC_D_VEL_D': (0.01, 'AP_Float', '垂直速度制御D（旧PSC_VELZ_D）'),
+    'PSC_D_VEL_D': (0.015, 'AP_Float', '垂直速度制御D（旧PSC_VELZ_D）'),
     'PSC_D_ACC_P': (0.03, 'AP_Float', '垂直加速度制御P（旧PSC_ACCZ_P 0.3から現ファームスケールに変更）'),
     'PSC_D_ACC_I': (0.1, 'AP_Float', '垂直加速度制御I（旧PSC_ACCZ_I 1.0から現ファームスケールに変更）'),
 
     # === 水平制御PID ===
-    'PSC_NE_POS_P': (5.0, 'AP_Float', '水平位置制御P（旧PSC_POSXY_P）'),
+    'PSC_NE_POS_P': (1.0, 'AP_Float', '水平位置制御P（旧PSC_POSXY_P）'),
     'PSC_NE_VEL_P': (6.0, 'AP_Float', '水平速度制御P（旧PSC_VELXY_P）'),
     'PSC_NE_VEL_I': (2.5, 'AP_Float', '水平速度制御I（旧PSC_VELXY_I）'),
     'PSC_NE_VEL_D': (1.0, 'AP_Float', '水平速度制御D（旧PSC_VELXY_D）'),
@@ -316,13 +356,37 @@ MAV_PARAM_TYPE_MAP = {
 # 接続
 # ================================
 
-def resolve_connection(device, baud_usb, uart_baud, ask=input):
-    """接続先と baud を決める。UART 側の baud は設定辞書の SERIAL1_BAUD を渡す。"""
+# 既定の UART（TELEM1）デバイス。Pi5 + uart0-pi5,ctsrts 構成。
+DEFAULT_UART_DEVICE = "/dev/ttyAMA0"
+
+
+def resolve_connection(device, baud_usb, uart_baud,
+                       acm_candidates=("/dev/ttyACM0", "/dev/ttyACM1"),
+                       uart_device=DEFAULT_UART_DEVICE,
+                       exists=os.path.exists):
+    """接続先と baud を決める。UART 側の baud は設定辞書の SERIAL1_BAUD を渡す。
+
+    device:
+      auto : USB シリアルがあれば USB、無ければ UART（既定）
+      usb  : USB シリアルを明示（無ければエラー）
+      uart : UART（/dev/ttyAMA0）を明示
+      パス : そのまま使う（"ACM" を含めば USB 扱い）
+    対話入力は行わない（cron / systemd / 非対話 SSH でも同じ結果になるようにする）。
+    """
     if device == "auto":
-        ans = ask("USB接続を行いますか (y/n): ").strip().lower()
-        if ans == "y":
-            return "/dev/ttyACM0", baud_usb, False
-        return "/dev/ttyAMA0", uart_baud, True
+        for cand in acm_candidates:
+            if exists(cand):
+                return cand, baud_usb, False
+        return uart_device, uart_baud, True
+    if device == "usb":
+        for cand in acm_candidates:
+            if exists(cand):
+                return cand, baud_usb, False
+        raise SystemExit(
+            f"USB シリアルが見つかりません（{', '.join(acm_candidates)}）。"
+            f"UART を使う場合は --device uart / --uart を指定してください。")
+    if device == "uart":
+        return uart_device, uart_baud, True
     if "ACM" in device:
         return device, baud_usb, False
     return device, uart_baud, True
@@ -330,19 +394,61 @@ def resolve_connection(device, baud_usb, uart_baud, ask=input):
 
 # /dev/ttyAMA0 (TELEM1) の baud は設定辞書の SERIAL1_BAUD を単一の出典とする。
 # 片側だけ変更してリンクが繋がらなくなる事故を防ぐため、接続 baud は必ずこれに追従させる。
+# --baud-uart は診断用の一時上書き（プロファイルの値は変更しない）。
 UART_BAUD = int(params_to_set['SERIAL1_BAUD'][0])
+if args.baud_uart is not None:
+    UART_BAUD = args.baud_uart
 dev, baud, rts = resolve_connection(args.device, args.baud_usb, UART_BAUD)
 master = mavutil.mavlink_connection(dev, baud=baud, rtscts=rts)
 
-# ハートビート確認
+# ハートビート確認（無応答で無限に待たず、原因の切り分けを表示する）
+print(f"接続先: {dev} ({baud} bps)")
 print("接続を待機中...")
-master.wait_heartbeat()
+if master.wait_heartbeat(timeout=args.heartbeat_timeout) is None:
+    print(f"❌ ハートビートを受信できませんでした（{dev} @ {baud} bps, {args.heartbeat_timeout:.0f}s）。")
+    try:
+        waiting = master.port.in_waiting
+    except Exception:
+        waiting = None
+    if waiting == 0:
+        print("   ※ 受信データが 0 バイトです。電気的に何も届いていません。")
+        print("      FCの電源、TELEM1 の TX/RX（Pi GPIO14/15 とクロス接続）、GND を確認してください。")
+    elif waiting:
+        print(f"   ※ {waiting} バイト受信していますがハートビートではありません。baud 違いの可能性があります。")
+    print("   UART を明示: python3 setup_RTK_V2.py --uart --baud-uart 1000000")
+    print("   USB  を明示: python3 setup_RTK_V2.py --usb")
+    sys.exit(1)
 print(f"接続完了 (システム: {master.target_system}, コンポーネント: {master.target_component})")
-print(f"モード: {'WRITE' if WRITE_MODE else 'CHECK (読み取り専用)'}")
+if not WRITE_MODE:
+    _mode = "CHECK (読み取り専用)"
+elif args.write_all:
+    _mode = "WRITE (全項目)"
+else:
+    _mode = "WRITE (差分のみ)"
+print(f"モード: {_mode}")
 
 # ================================
 # ユーティリティ関数
 # ================================
+
+# 書き込み前の安全ガード: HEARTBEAT の base_mode でアーミング状態を判定する
+MAV_MODE_FLAG_SAFETY_ARMED = 128
+
+def is_armed(timeout=2.0):
+    """HEARTBEAT の base_mode から armed を判定する（書き込み前チェック）。"""
+    try:
+        if master.motors_armed():
+            return True
+    except Exception:
+        pass
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        msg = master.recv_match(type="HEARTBEAT", blocking=True, timeout=0.5)
+        if msg is None:
+            continue
+        if int(msg.base_mode) & MAV_MODE_FLAG_SAFETY_ARMED:
+            return True
+    return False
 
 def clear_message_buffer(timeout=0.1):
     """メッセージバッファをクリアして古いメッセージを除去"""
@@ -562,13 +668,68 @@ def verify_all_cached(cache, params, budget_s):
     return ok, mismatch, missing
 
 
+# 実機でプロファイル値と食い違ったまま運用している項目。
+# GPS1_CAN_NODEID: 実機のF9Pは124で認識されRTK Fixが成立している
+# （RTK/README_RTK_ROVER.md）。125へ書き換えるとDroneCAN GPSを認識しなくなる恐れが
+# あるため、既定の差分書き込みでは触らない（--write-all / --only で明示した時のみ書く）。
+HARDWARE_PENDING = {"GPS1_CAN_NODEID"}
+
+
+def parse_param_list(text, params, flag):
+    """--only / --skip のカンマ区切りを検証して集合にする。"""
+    names = [t.strip() for t in text.split(",") if t.strip()]
+    unknown = [n for n in names if n not in params]
+    if unknown:
+        raise SystemExit(f"{flag}: プロファイルに無いパラメータです: {', '.join(unknown)}")
+    return set(names)
+
+
+def select_write_targets(params, cache, only=None, skip=None, write_all=False,
+                         hardware_pending=None):
+    """書き込み対象を決める（既定は差分のみ）。
+
+    戻り値: (targets, unchanged, pending, not_in_fc)
+    - 既定: cache の値と違う項目だけを対象にする（157項目の無条件書き込みを避ける）。
+    - hardware_pending: 実機差分が既知の項目。既定では書き込み対象から外す。
+    - write_all=True: 全項目を対象にする。only は絞り込み、skip は除外。
+    """
+    pending_set = set(hardware_pending or ())
+    only_set = set(only or ())
+    skip_set = set(skip or ())
+    targets, unchanged, pending, not_in_fc = {}, [], [], []
+    for name, item in params.items():
+        if only_set and name not in only_set:
+            continue
+        if name in skip_set:
+            continue
+        if name not in cache:
+            not_in_fc.append(name)
+            continue
+        if not write_all:
+            if close_enough(cache[name][0], item[0]):
+                unchanged.append(name)
+                continue
+            if name in pending_set and name not in only_set:
+                pending.append((name, item[0], cache[name][0]))
+                continue
+        targets[name] = item
+    return targets, unchanged, pending, not_in_fc
+
+
 # ================================
 # メイン処理
 # ================================
 
 # ================================
-# 実行フロー: --check(既定)=キャッシュ照合のみ / --write=設定+読戻し照合（明示保存なし）
+# 実行フロー: --check=キャッシュ照合のみ / 既定・--write=差分書き込み / --write-all=全項目書き込み
 # ================================
+
+ONLY = parse_param_list(args.only, params_to_set, "--only")
+SKIP = parse_param_list(args.skip, params_to_set, "--skip")
+
+# 検証・書き込みの対象（--only / --skip を反映）
+verify_params = {n: v for n, v in params_to_set.items()
+                 if (not ONLY or n in ONLY) and n not in SKIP}
 
 if not WRITE_MODE:
     print("\n" + "="*60)
@@ -577,8 +738,8 @@ if not WRITE_MODE:
     t_check0 = time.time()
     cache = fetch_param_cache()
     print(f"取得パラメータ数: {len(cache)}")
-    ok, mismatch, missing = verify_all_cached(cache, params_to_set, args.verify_budget)
-    total = len(params_to_set)
+    ok, mismatch, missing = verify_all_cached(cache, verify_params, args.verify_budget)
+    total = len(verify_params)
     print("\n" + "="*60)
     print(f"CHECK結果: {len(ok)}/{total} 一致")
     if mismatch:
@@ -598,75 +759,110 @@ if not WRITE_MODE:
     sys.exit(0)
 
 print("\n" + "="*60)
-print("ArduPilot パラメータを設定中（RTK V2完全プロファイル157項目）...")
+print("WRITE モード: RTK V2プロファイルを書き込みます（--check で読み取り専用）")
 print("="*60)
+
+# 安全ガード: armed なら書き込まない（--force 指定時のみ続行）
+if is_armed():
+    if not args.force:
+        print("❌ armed を検出しました。書き込みを中止します（続行する場合のみ --force）。")
+        sys.exit(2)
+    print("⚠ armed のまま --force 指定で書き込みを続行します。")
+
+cache0 = fetch_param_cache()
+targets, unchanged, pending, not_in_fc = select_write_targets(
+    params_to_set, cache0, ONLY, SKIP, args.write_all, HARDWARE_PENDING)
+
+print(f"\nプロファイル: {len(params_to_set)} 項目")
+print(f"  書き込み対象: {len(targets)} 項目")
+print(f"  既に一致    : {len(unchanged)} 項目")
+print(f"  保留        : {len(pending)} 項目")
+print(f"  FCに不在    : {len(not_in_fc)} 項目")
+for name, exp, live in pending:
+    print(f"  ⏸ {name}: 実機={live} / プロファイル={exp} → 保留"
+          f"（書く場合は --only {name} か --write-all）")
+for name in not_in_fc:
+    print(f"  - {name}（FCに存在しません）")
 
 failed_params = {}
-total = len(params_to_set)
 success_count = 0
+total = len(targets)
 
-for idx, (param_name, (param_value, param_type, param_comment)) in enumerate(params_to_set.items(), 1):
-    print(f"\n[{idx}/{total}] {param_name}")
-    print(f"  設定値: {param_value}")
+if not targets:
+    print("\n書き込み対象はありません（対象項目は全て一致）。")
+else:
+    for idx, (param_name, (param_value, param_type, param_comment)) in enumerate(targets.items(), 1):
+        print(f"\n[{idx}/{total}] {param_name}")
+        print(f"  設定値: {param_value}")
 
-    success, received_value = set_parameter_reliable(param_name, param_value, param_type)
-
-    if success:
-        print(f"  ✅ 確認値: {received_value}")
-        success_count += 1
-    else:
-        print(f"  ❌ 設定失敗")
-        failed_params[param_name] = (param_value, param_type, param_comment)
-
-print("\n" + "="*60)
-print(f"初期設定完了: {success_count}/{total} 成功")
-print("="*60)
-
-# FC側の処理完了を待つ
-print("\nFC側の処理完了を待機中...")
-time.sleep(3)
-
-# 保存待機（ArduPilotはPARAM_SET受信時に自動保存するため明示保存コマンドは送らない）
-print("\nFC側の自動保存待機中...")
-time.sleep(2)
-
-# 不一致パラメータの確認と再設定
-if failed_params:
-    print("\n" + "="*60)
-    print(f"⚠️ {len(failed_params)}個のパラメータが不一致です。再設定を試みます...")
-    print("="*60)
-
-    for param_name, (param_value, param_type, param_comment) in failed_params.items():
-        print(f"\n再設定: {param_name}")
-        success, received_value = set_parameter_reliable(param_name, param_value, param_type, max_retries=3)
+        success, received_value = set_parameter_reliable(param_name, param_value, param_type)
 
         if success:
-            print(f"  ✅ 再設定成功: {received_value}")
+            print(f"  ✅ 確認値: {received_value}")
+            success_count += 1
         else:
-            print(f"  ❌ 再設定失敗: {received_value}")
+            print(f"  ❌ 設定失敗")
+            failed_params[param_name] = (param_value, param_type, param_comment)
 
-    # 再設定分は最終読戻しで確認する（明示保存コマンドは送らない）
-    print("\n再設定分は最終読戻しで確認します...")
-    time.sleep(1)
+    print("\n" + "="*60)
+    print(f"初期設定完了: {success_count}/{total} 成功")
+    print("="*60)
 
-# 最終確認（--write時もキャッシュ照合: 不在項目の直列タイムアウトをなくす）
+    # FC側の処理完了と自動保存を待つ（明示保存コマンドは送らない）
+    print("\nFC側の処理完了・自動保存を待機中...")
+    time.sleep(2)
+
+    # 不一致パラメータの再設定
+    if failed_params:
+        print("\n" + "="*60)
+        print(f"⚠️ {len(failed_params)}個のパラメータが不一致です。再設定を試みます...")
+        print("="*60)
+
+        still_failed = {}
+        for param_name, (param_value, param_type, param_comment) in failed_params.items():
+            print(f"\n再設定: {param_name}")
+            success, received_value = set_parameter_reliable(
+                param_name, param_value, param_type, max_retries=3)
+
+            if success:
+                print(f"  ✅ 再設定成功: {received_value}")
+            else:
+                print(f"  ❌ 再設定失敗: {received_value}")
+                still_failed[param_name] = (param_value, param_type, param_comment)
+        failed_params = still_failed
+
+        print("\n再設定分は最終読戻しで確認します...")
+        time.sleep(1)
+
+# 最終確認（書き込み後もキャッシュ照合: 不在項目の直列タイムアウトをなくす）
 print("\n" + "="*60)
 print("最終確認を実施中（キャッシュ照合）...")
 print("="*60)
 
 _verify_cache = fetch_param_cache()
-ok_names, mismatch, missing = verify_all_cached(_verify_cache, params_to_set, args.verify_budget)
-final_success = len(ok_names)
+ok_names, mismatch, missing = verify_all_cached(_verify_cache, verify_params, args.verify_budget)
+total = len(verify_params)
+pending_names = {n for n, _e, _g in pending}
+not_in_fc_names = set(not_in_fc)
+final_failed = []
+
 for name in ok_names:
     print(f"✅ {name} = {_verify_cache[name][0]}")
-final_failed = [n for n, _e, _g in mismatch] + missing
 for name, exp, got in mismatch:
-    print(f"❌ {name} = {got} (期待値: {exp})")
+    if name in pending_names:
+        print(f"⏸ {name} = {got} (プロファイル: {exp}) → 保留（実機値を維持）")
+    else:
+        print(f"❌ {name} = {got} (期待値: {exp})")
+        final_failed.append(name)
 for name in missing:
-    print(f"❌ {name} (FCに存在しません)")
+    if name in not_in_fc_names:
+        print(f"⏸ {name} (FCに存在しません) → 保留")
+    else:
+        print(f"❌ {name} (FCに存在しません)")
+        final_failed.append(name)
 
 print("\n" + "="*60)
-print(f"最終結果: {final_success}/{total} 成功")
+print(f"最終結果: {len(ok_names)}/{total} 一致")
 if final_failed:
     print(f"失敗: {len(final_failed)}個")
     for name in final_failed[:10]:  # 最初の10個を表示
@@ -675,9 +871,15 @@ print("="*60)
 
 if final_failed:
     print(f"\n❌ {len(final_failed)}個のパラメータが正しく設定できませんでした")
+    sys.exit(1)
+
+if pending or not_in_fc:
+    print("\n✅ 書き込み対象はすべて最終読戻しで一致しました。")
+    print(f"   ※ 保留 {len(pending)} 個 / FC不在 {len(not_in_fc)} 個は変更していません。")
 else:
-    print("\n✅ 全てのパラメータが最終読戻しで一致しました（設定値の送信+読戻し確認）。")
-    print("   ※ ArduPilotはPARAM_SET時に自動保存します。電源再投入後の保持は未検証です。")
-    print("   （AP_Observer EKF版、OBS_* は新パラメータ、その他は標準設定）")
+    print("\n✅ プロファイルの全項目が最終読戻しで一致しました。")
+print("   ※ ArduPilotはPARAM_SET時に自動保存します。電源再投入後の保持は未検証です。")
 
 print("\n完了")
+sys.exit(0)
+

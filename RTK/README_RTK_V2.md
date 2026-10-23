@@ -5,7 +5,7 @@
 | ファイル | 役割 |
 |---|---|
 | `setup_RTK_V2.py` | ekf-V2対応の全ArduPilot設定ツール（本命） |
-| `test_rtk_v2_params.py` | ハードウェア不要のfocused test（14項目） |
+| `test_rtk_v2_params.py` | ハードウェア不要のfocused test（17項目） |
 | `mavlink_bridge.py` | rover側: Windows基地局TCP:2101 → MAVLink `GPS_RTCM_DATA` → Pixhawk |
 | `verify_rtcm_tcp.py` | rover側: 基地局TCPのRTCM3タイプ検証 |
 | `rtcm_monitor.py` | RTCM3フレーム抽出・CRC-24Qの正典（`verify_rtcm_tcp.py`が使用） |
@@ -55,13 +55,45 @@ SERIAL1_BAUD 1000000を実機 --check で確認すること（未実施）。
 ## 使い方
 
 ```bash
-# 既定: 読み取り専用の照合（推奨・まずこれ）
+# 既定: 実機と値が違う項目だけを書き込む（差分書き込み）
+python3 setup_RTK_V2.py
+
+# 読み取り専用の照合（書き込みなし。不一致があれば exit 1）
 python3 setup_RTK_V2.py --check
 
-# 実書き込み（disarmed確認後のみ。FC自動保存、再投入保持は未検証）
-python3 setup_RTK_V2.py --write
+# 全157項目を無条件に書き込む（従来動作）
+python3 setup_RTK_V2.py --write-all
+
+# 対象を絞る（--only / --skip はカンマ区切り。--check にも効く）
+python3 setup_RTK_V2.py --only PSC_NE_POS_P
+python3 setup_RTK_V2.py --skip GPS1_CAN_NODEID
 
 # テスト（ハードウェア不要）
 python3 test_rtk_v2_params.py
 python3 -m py_compile setup_RTK_V2.py
 ```
+
+`--write` は引数なしと同じ差分書き込み（互換用）。接続先は既定で
+`/dev/ttyACM0`（無ければ `/dev/ttyAMA0`）を自動選択し、対話入力はしない。
+
+| 指定 | 意味 |
+|---|---|
+| （なし） / `--device auto` | USB があれば USB、無ければ UART |
+| `--uart` / `--device uart` | `/dev/ttyAMA0`（TELEM1）を明示 |
+| `--usb` / `--device usb` | `/dev/ttyACM*` を明示（無ければエラー） |
+| `--device /dev/ttyAMA0` | パスを直接指定 |
+| `--baud-uart 1000000` | UART baud の一時上書き（既定はプロファイルの `SERIAL1_BAUD`） |
+| `--heartbeat-timeout 15` | ハートビート待ちの上限 [s] |
+
+ハートビートが来ない場合は 15 秒で打ち切り、受信バイト数から原因を表示する
+（0 バイト＝電源/配線、データあり＝baud 違いの可能性）。
+
+書き込み時の安全ガード:
+
+- 書き込み前に HEARTBEAT の `base_mode` で armed を判定し、armed なら中止する
+  （`--force` 指定時のみ続行）。
+- 既定は差分のみ。一致済みの項目は書き換えない。
+- `GPS1_CAN_NODEID` は実機が **124** で RTK Fix 運用中のため、既定の差分書き込みでは
+  **保留**する（125へ書き換えると DroneCAN GPS を認識しなくなる恐れがある）。
+  書く場合は `--only GPS1_CAN_NODEID` か `--write-all` を明示する。
+- 最終確認は `PARAM_REQUEST_LIST` のキャッシュ照合。保留・FC不在は失敗に数えない。
