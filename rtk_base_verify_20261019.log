@@ -1,0 +1,45 @@
+Capturing RTCM3 from 192.168.137.1:2101 for 60.0s...
+
+======================================================================
+  RTCM3 TCP Stream Verification Report
+======================================================================
+  TCP connect time:       0.001s
+
+  ── Frame Statistics (normal counts = CRC-24Q OK only) ──
+  Extracted frames:       2101
+  CRC-24Q OK frames:      2101
+  CRC-24Q NG frames:      0
+  Oversize frames (> 720B): 0
+  MSM7 frames:            0
+  Unknown type frames:    0
+  Normal frame count:     2101
+  Normal bytes:           177,310
+  Frame time span:        60.2s (34.9 frames/s)
+
+  ── Required Message Types ──
+   1005      301  max   25 B  ✅ OK     Stationary RTK Ref ARP
+   1006      300  max   27 B  ✅ OK     Stationary RTK Ref ARP + Ant Hgt
+   1074      300  max  129 B  ✅ OK     GPS MSM4
+   1084      300  max  100 B  ✅ OK     GLONASS MSM4
+   1094      300  max  115 B  ✅ OK     Galileo MSM4
+   1124      300  max  187 B  ✅ OK     BeiDou MSM4
+   1230      300  max   10 B  ✅ OK     GLONASS Code-Phase Biases
+
+  ── Forbidden MSM7 Types ──
+  ✅ none
+
+  ── Unknown Types (count: 0) ──
+  ✅ none
+
+  ── Max Frame Length / Count by Type (CRC-24Q OK) ──
+     1005      301 frames  max   25 B  Stationary RTK Ref ARP
+     1006      300 frames  max   27 B  Stationary RTK Ref ARP + Ant Hgt
+     1074      300 frames  max  129 B  GPS MSM4
+     1084      300 frames  max  100 B  GLONASS MSM4
+     1094      300 frames  max  115 B  Galileo MSM4
+     1124      300 frames  max  187 B  BeiDou MSM4
+     1230      300 frames  max   10 B  GLONASS Code-Phase Biases
+      ALL     2101 frames  max  187 B  (limit 720 B)
+
+  ── Result ──
+  ✅ PASS — 必須 7 タイプが CRC 正常で揃い、MSM7 / CRC 不正 / 720 byte 超なし

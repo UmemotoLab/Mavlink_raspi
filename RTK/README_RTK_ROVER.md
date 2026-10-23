@@ -89,12 +89,18 @@ Raspberry Pi    192.168.137.169     (/dev/ttyAMA0 -> Pixhawk)
 - `layer_ram_only` は必ず `true`（Pi から BBR/flash を書かない）。`false` だと拒否します。
 
 ### 2. 基地局の疎通確認（引継ぎ検証 #1）
+```bash
+date '+%Y-%m-%d %H:%M:%S'
+cd /home/taki/Mavlink_raspi/RTK
+/home/taki/Mavlink_venv/bin/python3 mavlink_bridge.py --no-forward
+```
 
 ```bash
 cd /home/taki/Mavlink_raspi/RTK
 ~/Mavlink_venv/bin/python3 verify_rtcm_tcp.py \
   --host 192.168.137.1 --port 2101 --duration 30
 ```
+
 
 期待値:
 - `1005/1006/1074/1084/1094/1124/1230` が CRC 正常で受信される
