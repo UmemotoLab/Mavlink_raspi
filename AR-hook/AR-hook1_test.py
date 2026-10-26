@@ -176,7 +176,7 @@ motive_attitude_received = False
 motive_drone_pos_received = False
 MOTIVE_RIGID_BODY_IDS = (1, 2, CAMERA_RIGID_BODY_ID)
 MOTIVE_POSE_HISTORY_SECONDS = 10.0
-MOTIVE_POSE_INTERPOLATION_MAX_GAP_S = 0.1
+MOTIVE_POSE_INTERPOLATION_MAX_GAP_S = 0.3
 MOTIVE_POSE_MATCH_WAIT_S = 0.05
 motive_rigid_body_quaternions = {
     rigid_body_id: [float('nan')] * 4
@@ -1332,9 +1332,8 @@ def camera_tracker_loop(m, show_window=False):
                     )
                     hand_pre_offset_position_cam = id1_cam.copy()
                     hand_pre_offset_rotation_cam = R_cam_marker.copy()
-                    id1_cam, R_cam_marker = _apply_marker_pose_offset(
-                        "hand", id1_cam, R_cam_marker
-                    )
+                    # marker_pose_offset はNED座標系で校正されているため、
+                    # NED変換後に適用する（ar_pose_updates セクション参照）
                     R_front_reference = ar_marker_front_facing_reference_rotation()
                     attitude_cam = ar_marker_relative_attitude_rpy(
                         R_cam_marker, R_front_reference
@@ -1384,9 +1383,8 @@ def camera_tracker_loop(m, show_window=False):
                     )
                     cargo_pre_offset_position_cam = center_cam.copy()
                     cargo_pre_offset_rotation_cam = R_cam_cargo.copy()
-                    center_cam, R_cam_cargo = _apply_marker_pose_offset(
-                        "cargo", center_cam, R_cam_cargo
-                    )
+                    # marker_pose_offset はNED座標系で校正されているため、
+                    # NED変換後に適用する（ar_pose_updates セクション参照）
                     rvec_cargo, _ = cv2.Rodrigues(R_cam_cargo)
 
                 h_cam_raw_val = [float('nan'), float('nan'), float('nan')]
@@ -1420,7 +1418,12 @@ def camera_tracker_loop(m, show_window=False):
                     motive_cargo_cam = m_cargo_cam_val
                     motive_hand_cam = m_hand_cam_val
 
+                # ─── NED変換 + marker_pose_offset 適用 ───
+                # オフセットはNED座標系で校正されているため、NED変換後に適用する。
+                # これによりカメラの位置・姿勢が変わってもオフセットが正しく機能する。
                 ar_pose_updates = {}
+                hand_ned_corrected = None
+                cargo_ned_corrected = None
                 if frame_camera_pose is not None:
                     (
                         calibration_camera_rotation,
@@ -1430,66 +1433,73 @@ def camera_tracker_loop(m, show_window=False):
                     for (
                         name,
                         detected,
-                        pre_offset_position,
-                        pre_offset_rotation,
-                        marker_position,
-                        marker_rotation,
+                        marker_position_cam,
+                        marker_rotation_cam,
                     ) in (
                         (
                             "hand",
                             has_id1,
-                            hand_pre_offset_position_cam if has_id1 else None,
-                            hand_pre_offset_rotation_cam if has_id1 else None,
                             id1_cam,
                             R_cam_marker,
                         ),
                         (
                             "cargo",
                             has_cargo and not used_last_center,
-                            cargo_pre_offset_position_cam if center_cam is not None else None,
-                            cargo_pre_offset_rotation_cam if center_cam is not None else None,
                             center_cam,
                             R_cam_cargo,
                         ),
                     ):
                         if (
                             detected
-                            and marker_position is not None
-                            and marker_rotation is not None
+                            and marker_position_cam is not None
+                            and marker_rotation_cam is not None
                         ):
+                            # カメラ座標系 → NED座標系
                             pre_offset_position_ned = (
                                 calibration_camera_rotation
-                                @ np.asarray(pre_offset_position, dtype=np.float64)
+                                @ np.asarray(marker_position_cam, dtype=np.float64)
                                 + calibration_camera_position
                             )
                             pre_offset_rotation_ned = (
                                 calibration_camera_rotation
-                                @ np.asarray(pre_offset_rotation, dtype=np.float64)
+                                @ np.asarray(marker_rotation_cam, dtype=np.float64)
                             )
-                            position_ned = (
-                                calibration_camera_rotation
-                                @ np.asarray(marker_position, dtype=np.float64)
-                                + calibration_camera_position
+                            pre_offset_quaternion_ned = rotation_matrix_to_quaternion_xyzw(
+                                pre_offset_rotation_ned
                             )
-                            rotation_ned = (
-                                calibration_camera_rotation
-                                @ np.asarray(marker_rotation, dtype=np.float64)
-                            )
+                            # NED座標系で marker_pose_offset を適用
+                            offset = MARKER_POSE_OFFSETS.get(name)
+                            if offset is not None:
+                                offset_position, offset_quaternion = offset
+                                position_ned_arr, quaternion_ned = apply_pose_offset(
+                                    pre_offset_position_ned,
+                                    pre_offset_quaternion_ned,
+                                    offset_position,
+                                    offset_quaternion,
+                                )
+                            else:
+                                position_ned_arr = pre_offset_position_ned
+                                quaternion_ned = pre_offset_quaternion_ned
                             ar_pose_updates[name] = {
                                 "pre_offset_position_ned": pre_offset_position_ned.tolist(),
                                 "pre_offset_quaternion_ned": list(
-                                    rotation_matrix_to_quaternion_xyzw(
-                                        pre_offset_rotation_ned
-                                    )
+                                    pre_offset_quaternion_ned
                                 ),
-                                "position_ned": position_ned.tolist(),
-                                "quaternion_ned": list(
-                                    rotation_matrix_to_quaternion_xyzw(rotation_ned)
-                                ),
+                                "position_ned": position_ned_arr.tolist() if hasattr(position_ned_arr, 'tolist') else list(position_ned_arr),
+                                "quaternion_ned": list(quaternion_ned),
                                 "timestamp_s": frame_timestamp_s,
                                 "camera_timestamp_s": calibration_camera_time,
                                 "received": True,
                             }
+                            # 誘導用にNED補正済み座標を保存
+                            if name == "hand":
+                                hand_ned_corrected = np.asarray(
+                                    position_ned_arr, dtype=np.float64
+                                )
+                            elif name == "cargo":
+                                cargo_ned_corrected = np.asarray(
+                                    position_ned_arr, dtype=np.float64
+                                )
                 with io_lock:
                     for name in ar_marker_pose_log:
                         ar_marker_pose_log[name] = ar_pose_updates.get(
@@ -1522,23 +1532,21 @@ def camera_tracker_loop(m, show_window=False):
                             drone_yaw = (current_yaw_rad + math.pi) % (2 * math.pi)
 
                     # ─── 荷物中心のワールド座標を算出 ───
-                    if CAMERA_ORIENTATION_SOURCE == "motive":
-                        # Motiveカメラ rigid body による直接変換を優先
-                        # debug=True にするとカメラ傾き補正の検証ログが2秒ごとに出力されます
-                        result_motive_cargo = (
-                            camera_to_world_xyz_motive(
-                                center_cam,
-                                debug=False,
-                                camera_pose=frame_camera_pose,
-                            )
-                            if frame_camera_pose is not None
-                            else None
+                    if CAMERA_ORIENTATION_SOURCE == "motive" and cargo_ned_corrected is not None:
+                        # NED座標系で offset 適用済みの値を直接使用
+                        cargo_x = float(cargo_ned_corrected[0])
+                        cargo_y = float(cargo_ned_corrected[1])
+                        cargo_z = float(cargo_ned_corrected[2])
+                        coord_source = "Motive-Camera"
+                    elif CAMERA_ORIENTATION_SOURCE == "motive":
+                        # frame_camera_pose が無い場合のフォールバック（オフセット無し）
+                        result_motive_cargo = camera_to_world_xyz_motive(
+                            center_cam, debug=False
                         )
                         if result_motive_cargo is not None:
                             cargo_x, cargo_y, cargo_z = result_motive_cargo
-                            coord_source = "Motive-Camera"
+                            coord_source = "Motive-Camera(no-offset)"
                         else:
-                            # フォールバック: 機体姿勢ベースの座標変換
                             cargo_x, cargo_y, cargo_z = camera_to_world_xyz(
                                 center_cam, drone_roll, drone_pitch, drone_yaw, drone_gps)
                             coord_source = "IMU-Fallback"
@@ -1555,9 +1563,6 @@ def camera_tracker_loop(m, show_window=False):
 
                     # ID1が見えていれば、中心との差分を使ってドローン目標を算出、および相対xyz座標を計算
                     if has_id1:
-                        # ドローン目標位置の差分ベクトル (ワールド座標補正適用後)
-                        tvec_error = center_cam - id1_cam
-                        
                         # ✅ マーカー間の純粋な相対距離計算 (カメラ視点オフセットの影響を排除するため生のカメラ座標値を使用)
                         v_cam_raw_vec = raw_id1_cam - raw_center_cam
                         R_cargo, _ = cv2.Rodrigues(rvec_cargo)
@@ -1567,28 +1572,52 @@ def camera_tracker_loop(m, show_window=False):
                         dist_x =  float(v_cargo[0])  # ArUco X -> X軸 (左右方向)
                         dist_y = -float(v_cargo[1])  # ArUco -Y -> Y軸 (上下/前後方向)
                         dist_z =  float(v_cargo[2])  # ArUco Z -> Z軸 (高さ/奥行き方向)
-                    else:
-                        # ID1が見えない場合は荷物中心そのものを目標にする（ただしID1目標距離は算出しない）
-                        tvec_error = center_cam
 
                     # ─── ドローン誘導目標のワールド座標を算出 ───
-                    if CAMERA_ORIENTATION_SOURCE == "motive":
-                        # Motiveカメラ rigid body による直接変換を優先
-                        result_motive_target = (
-                            camera_to_world_xyz_motive(
-                                tvec_error, camera_pose=frame_camera_pose
+                    if (
+                        CAMERA_ORIENTATION_SOURCE == "motive"
+                        and cargo_ned_corrected is not None
+                    ):
+                        if has_id1 and hand_ned_corrected is not None:
+                            # NED座標系で offset 適用済みの荷物・手先の差から誘導目標を算出
+                            # target = cargo_corrected - hand_corrected + camera_position
+                            # （ドローンの手先が荷物に一致する位置へ誘導する）
+                            camera_pos_ned = calibration_camera_position
+                            target_x = float(
+                                cargo_ned_corrected[0] - hand_ned_corrected[0]
+                                + camera_pos_ned[0]
                             )
-                            if frame_camera_pose is not None
-                            else None
-                        )
+                            target_y = float(
+                                cargo_ned_corrected[1] - hand_ned_corrected[1]
+                                + camera_pos_ned[1]
+                            )
+                            target_z = float(
+                                cargo_ned_corrected[2] - hand_ned_corrected[2]
+                                + camera_pos_ned[2]
+                            )
+                        else:
+                            # ID1が見えない場合は荷物中心を誘導目標にする
+                            target_x = cargo_x
+                            target_y = cargo_y
+                            target_z = cargo_z
+                    elif CAMERA_ORIENTATION_SOURCE == "motive":
+                        # frame_camera_pose が無い場合のフォールバック（オフセット無し）
+                        if has_id1:
+                            tvec_error = center_cam - id1_cam
+                        else:
+                            tvec_error = center_cam
+                        result_motive_target = camera_to_world_xyz_motive(tvec_error)
                         if result_motive_target is not None:
                             target_x, target_y, target_z = result_motive_target
                         else:
-                            # フォールバック: 機体姿勢ベースの座標変換
                             target_x, target_y, target_z = camera_to_world_xyz(
                                 tvec_error, drone_roll, drone_pitch, drone_yaw, drone_gps)
                     else:
                         # ArduPilot磁気センサー(IMU姿勢)ベースの座標変換
+                        if has_id1:
+                            tvec_error = center_cam - id1_cam
+                        else:
+                            tvec_error = center_cam
                         with io_lock:
                             ap_roll = current_roll_rad
                             ap_pitch = current_pitch_rad

@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "transform_definition": "T_motive_rigid_body_from_ar_marker_group; position in meters, quaternion active Hamilton xyzw",
+  "source_csv": "20261021_152442_1.csv",
+  "max_time_delta_ms": 100.0,
+  "transforms": {
+    "hand": {
+      "motive_rigid_body_id": 1,
+      "translation_m": [
+        0.11607027091534845,
+        0.05406031293335051,
+        -0.032652007539511946
+      ],
+      "quaternion_xyzw": [
+        0.7175622819818664,
+        0.6631422835949707,
+        -0.19606568285897913,
+        0.08309591560640045
+      ],
+      "sample_count": 2676,
+      "inlier_count": 2459,
+      "translation_rmse_m": 0.03627951252320207,
+      "rotation_rmse_deg": 17.7044345988674
+    },
+    "cargo": {
+      "motive_rigid_body_id": 2,
+      "translation_m": [
+        0.15767895184565073,
+        -0.0018877774772452138,
+        -0.04798048708676781
+      ],
+      "quaternion_xyzw": [
+        0.7073698480696582,
+        0.6890700441300782,
+        -0.09755522644337025,
+        -0.12366628529257025
+      ],
+      "sample_count": 3590,
+      "inlier_count": 2824,
+      "translation_rmse_m": 0.07037169921215197,
+      "rotation_rmse_deg": 5.073139148978188
+    }
+  }
+}
