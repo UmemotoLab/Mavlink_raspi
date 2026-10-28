@@ -1,211 +1,142 @@
-"""Rigid pose-offset helpers for AR marker frames and Motive rigid bodies."""
-import json
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 import math
-from bisect import bisect_left
+import json
 from pathlib import Path
-
 import numpy as np
 
-
-def quaternion_multiply_xyzw(left, right):
-    lx, ly, lz, lw = left
-    rx, ry, rz, rw = right
-    return (
-        lw * rx + lx * rw + ly * rz - lz * ry,
-        lw * ry - lx * rz + ly * rw + lz * rx,
-        lw * rz + lx * ry - ly * rx + lz * rw,
-        lw * rw - lx * rx - ly * ry - lz * rz,
-    )
-
-
-def normalized_quaternion_xyzw(quaternion):
-    quaternion = tuple(float(value) for value in quaternion)
-    norm = math.sqrt(sum(value * value for value in quaternion))
-    if not math.isfinite(norm) or norm == 0.0:
-        raise ValueError("quaternion must be finite and nonzero")
-    return tuple(value / norm for value in quaternion)
-
-
-def interpolate_pose(samples, timestamp_s, max_gap_s=0.1):
-    """Interpolate (timestamp, position, xyzw quaternion) samples at a timestamp."""
-    if (
-        not math.isfinite(timestamp_s)
-        or not math.isfinite(max_gap_s)
-        or max_gap_s <= 0
-    ):
-        raise ValueError("timestamp and max_gap_s must be finite and positive")
-    if not samples:
-        return None
-
-    timestamps = [sample[0] for sample in samples]
-    index = bisect_left(timestamps, timestamp_s)
-    if index < len(samples) and timestamps[index] == timestamp_s:
-        _, position, quaternion = samples[index]
-        return np.asarray(position, dtype=np.float64), normalized_quaternion_xyzw(quaternion)
-    if len(samples) < 2:
-        return None
-    if index == 0 or index == len(samples):
-        return None
-
-    before_time, before_position, before_quaternion = samples[index - 1]
-    after_time, after_position, after_quaternion = samples[index]
-    interval = after_time - before_time
-    if interval <= 0 or interval > max_gap_s:
-        return None
-
-    fraction = (timestamp_s - before_time) / interval
-    position = (
-        np.asarray(before_position, dtype=np.float64) * (1.0 - fraction)
-        + np.asarray(after_position, dtype=np.float64) * fraction
-    )
-    before_quaternion = np.asarray(
-        normalized_quaternion_xyzw(before_quaternion), dtype=np.float64
-    )
-    after_quaternion = np.asarray(
-        normalized_quaternion_xyzw(after_quaternion), dtype=np.float64
-    )
-    dot = float(np.dot(before_quaternion, after_quaternion))
-    if dot < 0.0:
-        after_quaternion = -after_quaternion
-        dot = -dot
-    dot = min(1.0, dot)
-    if dot > 0.9995:
-        quaternion = before_quaternion + fraction * (
-            after_quaternion - before_quaternion
-        )
-    else:
-        angle = math.acos(dot)
-        sin_angle = math.sin(angle)
-        quaternion = (
-            math.sin((1.0 - fraction) * angle) / sin_angle * before_quaternion
-            + math.sin(fraction * angle) / sin_angle * after_quaternion
-        )
-    return position, normalized_quaternion_xyzw(quaternion)
-
-
-def quaternion_to_rotation_matrix_xyzw(quaternion):
-    x, y, z, w = normalized_quaternion_xyzw(quaternion)
+def quaternion_to_rotation_matrix_xyzw(q):
+    """(x, y, z, w) クォータニオン -> 3x3 回転行列"""
+    x, y, z, w = q
     return np.array([
-        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
-        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
-        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+        [1 - 2*(y**2 + z**2), 2*(x*y - w*z),     2*(x*z + w*y)],
+        [2*(x*y + w*z),     1 - 2*(x**2 + z**2), 2*(y*z - w*x)],
+        [2*(x*z - w*y),     2*(y*z + w*x),     1 - 2*(x**2 + y**2)]
     ], dtype=np.float64)
 
-
-def rotation_matrix_to_quaternion_xyzw(rotation):
-    rotation = np.asarray(rotation, dtype=np.float64)
-    if rotation.shape != (3, 3) or not np.all(np.isfinite(rotation)):
-        raise ValueError("rotation must be a finite 3x3 matrix")
-    if not np.allclose(rotation.T @ rotation, np.eye(3), atol=1e-5):
-        raise ValueError("rotation matrix must be orthonormal")
-    if not math.isclose(float(np.linalg.det(rotation)), 1.0, abs_tol=1e-5):
-        raise ValueError("rotation matrix must have determinant +1")
-
-    trace = float(np.trace(rotation))
+def rotation_matrix_to_quaternion_xyzw(R):
+    """3x3 回転行列 -> Normalized (x, y, z, w) クォータニオン"""
+    trace = float(np.trace(R))
     if trace > 0.0:
-        scale = math.sqrt(trace + 1.0) * 2.0
-        quaternion = (
-            (rotation[2, 1] - rotation[1, 2]) / scale,
-            (rotation[0, 2] - rotation[2, 0]) / scale,
-            (rotation[1, 0] - rotation[0, 1]) / scale,
-            0.25 * scale,
+        s = math.sqrt(trace + 1.0) * 2.0
+        q = (
+            (R[2, 1] - R[1, 2]) / s,
+            (R[0, 2] - R[2, 0]) / s,
+            (R[1, 0] - R[0, 1]) / s,
+            0.25 * s
+        )
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+        q = (
+            0.25 * s,
+            (R[0, 1] + R[1, 0]) / s,
+            (R[0, 2] + R[2, 0]) / s,
+            (R[2, 1] - R[1, 2]) / s
+        )
+    elif R[1, 1] > R[2, 2]:
+        s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+        q = (
+            (R[0, 1] + R[1, 0]) / s,
+            0.25 * s,
+            (R[1, 2] + R[2, 1]) / s,
+            (R[0, 2] - R[2, 0]) / s
         )
     else:
-        index = int(np.argmax(np.diag(rotation)))
-        if index == 0:
-            scale = math.sqrt(
-                1.0 + rotation[0, 0] - rotation[1, 1] - rotation[2, 2]
-            ) * 2.0
-            quaternion = (
-                0.25 * scale,
-                (rotation[0, 1] + rotation[1, 0]) / scale,
-                (rotation[0, 2] + rotation[2, 0]) / scale,
-                (rotation[2, 1] - rotation[1, 2]) / scale,
-            )
-        elif index == 1:
-            scale = math.sqrt(
-                1.0 + rotation[1, 1] - rotation[0, 0] - rotation[2, 2]
-            ) * 2.0
-            quaternion = (
-                (rotation[0, 1] + rotation[1, 0]) / scale,
-                0.25 * scale,
-                (rotation[1, 2] + rotation[2, 1]) / scale,
-                (rotation[0, 2] - rotation[2, 0]) / scale,
-            )
-        else:
-            scale = math.sqrt(
-                1.0 + rotation[2, 2] - rotation[0, 0] - rotation[1, 1]
-            ) * 2.0
-            quaternion = (
-                (rotation[0, 2] + rotation[2, 0]) / scale,
-                (rotation[1, 2] + rotation[2, 1]) / scale,
-                0.25 * scale,
-                (rotation[1, 0] - rotation[0, 1]) / scale,
-            )
-    return normalized_quaternion_xyzw(quaternion)
+        s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+        q = (
+            (R[0, 2] + R[2, 0]) / s,
+            (R[1, 2] + R[2, 1]) / s,
+            0.25 * s,
+            (R[1, 0] - R[0, 1]) / s
+        )
+    norm = math.sqrt(sum(c * c for c in q))
+    if norm == 0:
+        return (0.0, 0.0, 0.0, 1.0)
+    return tuple(c / norm for c in q)
 
+def average_quaternions_xyzw(quaternions):
+    """複数の (x, y, z, w) クォータニオンの平均"""
+    A = np.zeros((4, 4))
+    for q in quaternions:
+        q_arr = np.array(q, dtype=np.float64).reshape(4, 1)
+        A += q_arr @ q_arr.T
+    A /= len(quaternions)
+    eigenvalues, eigenvectors = np.linalg.eigh(A)
+    avg_q = eigenvectors[:, np.argmax(eigenvalues)]
+    if avg_q[3] < 0:
+        avg_q = -avg_q
+    return tuple(avg_q / np.linalg.norm(avg_q))
 
-def motive_quaternion_to_ned_xyzw(quaternion):
-    quaternion = normalized_quaternion_xyzw(quaternion)
-    frame = (-math.sqrt(0.5), 0.0, 0.0, math.sqrt(0.5))
-    inverse_frame = (-frame[0], -frame[1], -frame[2], frame[3])
-    return quaternion_multiply_xyzw(
-        quaternion_multiply_xyzw(frame, quaternion), inverse_frame
-    )
+def interpolate_pose(samples, target_time, max_gap_s=0.1):
+    """タイムスタンプ付きポーズの線形・Slerp補間"""
+    if not samples:
+        return None
+    times = [s[0] for s in samples]
+    if target_time <= times[0]:
+        if times[0] - target_time > max_gap_s:
+            return None
+        return samples[0][1], samples[0][2]
+    if target_time >= times[-1]:
+        if target_time - times[-1] > max_gap_s:
+            return None
+        return samples[-1][1], samples[-1][2]
 
+    import bisect
+    idx = bisect.bisect_right(times, target_time)
+    t0, pos0, q0 = samples[idx - 1]
+    t1, pos1, q1 = samples[idx]
 
-def relative_pose(parent_position, parent_quaternion, child_position, child_quaternion):
-    parent_rotation = quaternion_to_rotation_matrix_xyzw(parent_quaternion)
-    child_rotation = quaternion_to_rotation_matrix_xyzw(child_quaternion)
-    relative_rotation = parent_rotation.T @ child_rotation
-    relative_position = parent_rotation.T @ (
-        np.asarray(child_position, dtype=np.float64)
-        - np.asarray(parent_position, dtype=np.float64)
-    )
-    return relative_position, rotation_matrix_to_quaternion_xyzw(relative_rotation)
+    if (t1 - t0) > max_gap_s:
+        return None
 
+    alpha = (target_time - t0) / (t1 - t0)
+    pos = tuple((1 - alpha) * p0 + alpha * p1 for p0, p1 in zip(pos0, pos1))
 
-def apply_pose_offset(position, quaternion, parent_from_ar_position,
-                      parent_from_ar_quaternion):
-    """Convert an AR pose to its Motive rigid-body frame using a saved offset."""
-    ar_rotation = quaternion_to_rotation_matrix_xyzw(quaternion)
-    parent_from_ar_rotation = quaternion_to_rotation_matrix_xyzw(
-        parent_from_ar_quaternion
-    )
-    corrected_rotation = ar_rotation @ parent_from_ar_rotation.T
-    corrected_position = np.asarray(position, dtype=np.float64) - (
-        corrected_rotation @ np.asarray(parent_from_ar_position, dtype=np.float64)
-    )
-    return corrected_position, rotation_matrix_to_quaternion_xyzw(corrected_rotation)
+    # Quaternion SLERP
+    q0 = np.array(q0)
+    q1 = np.array(q1)
+    dot = np.dot(q0, q1)
+    if dot < 0.0:
+        q1 = -q1
+        dot = -dot
+    dot = min(1.0, max(-1.0, dot))
+    theta = math.acos(dot)
+    if abs(theta) < 1e-6:
+        q_interp = q0
+    else:
+        sin_theta = math.sin(theta)
+        q_interp = (math.sin((1 - alpha) * theta) * q0 + math.sin(alpha * theta) * q1) / sin_theta
+    q_interp = tuple(q_interp / np.linalg.norm(q_interp))
+    return pos, q_interp
 
+def apply_pose_offset(position_ned, quaternion_ned, offset_position, offset_quaternion):
+    """ARマーカーのW座標系姿勢(pos, quat)にマーカーローカル系でのオフセットを適用"""
+    R_m = quaternion_to_rotation_matrix_xyzw(quaternion_ned)
+    R_off = quaternion_to_rotation_matrix_xyzw(offset_quaternion)
 
-def load_marker_pose_offsets(path):
-    path = Path(path)
-    with path.open("r", encoding="utf-8") as offset_file:
-        data = json.load(offset_file)
-    if data.get("schema_version") != 1:
-        raise ValueError(f"{path}: unsupported marker offset schema_version")
-    transforms = data.get("transforms")
-    if not isinstance(transforms, dict):
-        raise ValueError(f"{path}: transforms must be a JSON object")
-    if not {"hand", "cargo"}.issubset(transforms):
-        raise ValueError(f"{path}: both hand and cargo transforms are required")
+    corr_pos = np.array(position_ned, dtype=np.float64) + R_m @ np.array(offset_position, dtype=np.float64)
+    R_corr = R_m @ R_off
+    corr_quat = rotation_matrix_to_quaternion_xyzw(R_corr)
 
-    validated = {}
-    for name, transform in transforms.items():
-        if not isinstance(transform, dict):
-            raise ValueError(f"{path}: transform '{name}' must be an object")
-        expected_rigid_body_id = {"hand": 1, "cargo": 2}.get(name)
-        if expected_rigid_body_id is None:
-            raise ValueError(f"{path}: unknown transform '{name}'")
-        if transform.get("motive_rigid_body_id") != expected_rigid_body_id:
-            raise ValueError(
-                f"{path}: transform '{name}' must map to Motive RB"
-                f"{expected_rigid_body_id}"
-            )
-        position = tuple(float(value) for value in transform["translation_m"])
-        quaternion = normalized_quaternion_xyzw(transform["quaternion_xyzw"])
-        if len(position) != 3 or not all(math.isfinite(value) for value in position):
-            raise ValueError(f"{path}: transform '{name}' has invalid translation")
-        validated[name] = (position, quaternion)
-    return validated
+    return corr_pos, corr_quat
+
+def load_marker_pose_offsets(filepath):
+    path = Path(filepath)
+    if not path.exists():
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    offsets = {}
+    for key, val in data.items():
+        offsets[key] = (val["position_offset"], val["quaternion_offset"])
+    return offsets
+
+def save_marker_pose_offsets(filepath, offsets_dict):
+    data = {}
+    for key, (pos_off, quat_off) in offsets_dict.items():
+        data[key] = {
+            "position_offset": list(pos_off),
+            "quaternion_offset": list(quat_off)
+        }
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
