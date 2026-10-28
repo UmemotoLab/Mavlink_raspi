@@ -1137,7 +1137,7 @@ def camera_tracker_loop(m, show_window=False):
             print(f"USBカメラ申告FPS: {actual_camera_fps:.1f}")
         print(f"✓ USBカメラ 起動完了 ({CAMERA_WIDTH}x{CAMERA_HEIGHT})")
     # カメラキャリブレーションパラメータの読み込み
-    params_file = "camera_params.npz"
+    params_file = Path(__file__).resolve().parent / "camera_params.npz"
     # デフォルト値（640x360用）を新解像度に合わせてスケール調整
     camera_matrix = np.array([
         [786.38858756 * (CAMERA_WIDTH / 640.0),   0.,                                     351.02240753 * (CAMERA_WIDTH / 640.0)],
@@ -2191,3 +2191,4 @@ def main():
         print("✓ プログラム終了")
 if __name__ == "__main__":
     main()
+
