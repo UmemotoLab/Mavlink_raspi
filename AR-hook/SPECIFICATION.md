@@ -297,6 +297,18 @@ python3 plot_pose_offset_comparison.py <CSV_PATH> --target hand
 
 横軸の範囲は`plot_pose_offset_comparison.py`冒頭の`PLOT_X_RANGE_S`、縦軸は`POSITION_Y_RANGES_M`と`ATTITUDE_Y_RANGES_DEG`で設定します。各範囲は`(下限, 上限)`で指定し、`None`にすると自動範囲です。既定ではhand/cargoの両方を描画し、位置はm、姿勢はZYX順のRoll/Pitch/Yawを度で表示します。姿勢オフセット適用前列が記録されていない旧CSVは利用できないため、修正版AR-hookで新しいCSVを取得してください。
 
+### 7.2 ARマーカー姿勢オフセットの校正
+
+`calibrate_marker_pose_offsets.py`は、同期したAR-hook CSVからhand（AR ID1 ↔ Motive RB1）とcargo（AR ID2-5 ↔ Motive RB2）の固定6DoF変換を推定します。AR入力には`AR_Hand/Cargo_PreOffset_*_NED`列を使うため、既存の`marker_pose_offsets.json`がAR-hookに読み込まれていても、校正値にその補正が重複して入りません。カメラ基礎補正とカメラ姿勢によるNED変換は適用済みの値です。
+
+```bash
+python3 calibrate_marker_pose_offsets.py <CALIBRATION_CSV>
+```
+
+handとcargoの両方で、既定20件以上の同期済み有効サンプルが必要です。AR撮影時刻とカメラ姿勢時刻の差は既定100ms以内、Motive姿勢はAR撮影時刻で補間可能である必要があります。校正中はマーカーとMotive剛体の取り付けを固定し、ID1およびID2-5が十分に検出されるログを取得してください。出力されるサンプル数と位置・姿勢RMSEを確認し、外れ値や同期不良が多いCSVの結果は使用しないでください。
+
+出力先の既定はスクリプトと同じフォルダーの`marker_pose_offsets.json`です。既存ファイルは通常上書きされないため、再校正で置き換える場合は既存JSONを退避し、内容を確認したうえで`--force`を指定してください。新しいJSONはAR-hookの再起動後に適用されます。
+
 ---
 
 ## 8. システム使用手順・運用マニュアル

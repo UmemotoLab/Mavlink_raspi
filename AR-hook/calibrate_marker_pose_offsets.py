@@ -111,12 +111,12 @@ def collect_calibration_samples(path, max_time_delta_s):
                 f"{ar_prefix}_Camera_Pose_Time_s",
                 f"{ar_prefix}_Pose_Received",
                 *(
-                    f"{ar_prefix}_{axis}_NED_m"
+                    f"{ar_prefix}_PreOffset_{axis}_NED_m"
                     for axis in ("X", "Y", "Z")
                 ),
                 *(
-                    f"{ar_prefix}_{component}_NED"
-                    for component in ("QX", "QY", "QZ", "QW")
+                    f"{ar_prefix}_PreOffset_Q{component}_NED"
+                    for component in ("X", "Y", "Z", "W")
                 ),
             }
             missing.extend(sorted(required - columns))
@@ -193,11 +193,17 @@ def collect_calibration_samples(path, max_time_delta_s):
 
                 ar_position = _values(
                     row,
-                    [f"{ar_prefix}_{axis}_NED_m" for axis in ("X", "Y", "Z")],
+                    [
+                        f"{ar_prefix}_PreOffset_{axis}_NED_m"
+                        for axis in ("X", "Y", "Z")
+                    ],
                 )
                 ar_quaternion = normalized_quaternion_xyzw(_values(
                     row,
-                    [f"{ar_prefix}_{component}_NED" for component in ("QX", "QY", "QZ", "QW")],
+                    [
+                        f"{ar_prefix}_PreOffset_Q{component}_NED"
+                        for component in ("X", "Y", "Z", "W")
+                    ],
                 ))
                 rb_pose = interpolate_pose(
                     pose_samples_by_body[rigid_body_id],
