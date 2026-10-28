@@ -3,6 +3,7 @@
 import os,sys,select,time,math,threading,termios,tty,csv,datetime,signal
 from pathlib import Path
 from bisect import bisect_right
+from collections import deque
 import numpy as np
 import cv2
 from cv2 import aruco
@@ -178,6 +179,8 @@ MOTIVE_RIGID_BODY_IDS = (1, 2, CAMERA_RIGID_BODY_ID)
 MOTIVE_POSE_HISTORY_SECONDS = 10.0
 MOTIVE_POSE_INTERPOLATION_MAX_GAP_S = 0.1
 MOTIVE_POSE_MATCH_WAIT_S = 0.05
+MOTIVE_CLOCK_OFFSET_WINDOW = deque(maxlen=400)
+motive_clock_offset_s = float("nan")
 motive_rigid_body_quaternions = {
     rigid_body_id: [float('nan')] * 4
     for rigid_body_id in MOTIVE_RIGID_BODY_IDS
@@ -679,6 +682,15 @@ def motive_rigid_body_pose_udp_listener():
             quat_norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
             if not math.isfinite(quat_norm) or quat_norm == 0:
                 raise ValueError("剛体姿勢クォータニオンが不正です")
+            # Motive and the camera may use different wall-clock origins.
+            # Estimate their offset from packet arrival times; the minimum
+            # over a rolling window limits the effect of variable UDP delay.
+            receive_time_s = time.time()
+            clock_offset_candidate_s = receive_time_s - timestamp
+            with io_lock:
+                MOTIVE_CLOCK_OFFSET_WINDOW.append(clock_offset_candidate_s)
+                global motive_clock_offset_s
+                motive_clock_offset_s = min(MOTIVE_CLOCK_OFFSET_WINDOW)
             _store_motive_rigid_body_attitude(rigid_body_id, qx, qy, qz, qw)
             lat = lat_e7 / 1e7
             lon = lon_e7 / 1e7
@@ -1206,10 +1218,17 @@ def camera_tracker_loop(m, show_window=False):
             )
             frame_camera_pose = None
             if needs_world_pose:
+                with io_lock:
+                    clock_offset_s = motive_clock_offset_s
+                motive_frame_timestamp_s = (
+                    frame_timestamp_s - clock_offset_s
+                    if math.isfinite(clock_offset_s)
+                    else frame_timestamp_s
+                )
                 match_deadline = time.monotonic() + MOTIVE_POSE_MATCH_WAIT_S
                 while True:
                     frame_camera_pose = _camera_pose_at_frame_time(
-                        frame_timestamp_s
+                        motive_frame_timestamp_s
                     )
                     if (
                         frame_camera_pose is not None
@@ -1217,10 +1236,6 @@ def camera_tracker_loop(m, show_window=False):
                     ):
                         break
                     time.sleep(0.002)
-
-                if  frame_camera_pose is None and motive_camera_received:
-                    with io_lock:
-                        frame_camera_pose = (R_cam_to_world.copy(), t_cam_world.copy(), motive_camera_pose_time_s)
 
                 if (
                     frame_camera_pose is None
