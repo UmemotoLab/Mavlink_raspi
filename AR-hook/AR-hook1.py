@@ -1161,7 +1161,14 @@ def camera_tracker_loop(m, show_window=False):
         print("⚠ camera_params.npz が見つかりません。デフォルトのキャリブレーション値を使用します。")
     # ArUcoディテクタの設定
     dictionary = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
-    detector = aruco.ArucoDetector(dictionary)
+
+    params = aruco.DetectorParameters()
+    params.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
+    params.cornerRefinementWinSize = 5
+    params.cornerRefinementMaxIterations = 30
+    params.cornerRefinementMinAccuracy = 0.1
+
+    detector = aruco.ArucoDetector(dictionary, params)
     print("✓ マーカー追跡ループを開始します（中心ID: {}, 正方形頂点ID: {}）...".format(ID_CENTER_MARKER, SQUARE_MARKER_IDS))
     last_print_time = time.monotonic()
     fps_window_started = last_print_time
