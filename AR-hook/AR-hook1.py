@@ -76,16 +76,27 @@ CARGO_OFFSET_CAM_Y = 0.0
 CARGO_OFFSET_CAM_Z = 0.0
 
 # ───── オフセット・キャリブレーションパラメータの自動読み込み (camera_optical_offset.npz) ─────
-OFFSET_PARAMS_FILE = Path(__file__).parent / "camera_optical_offset.npz" if "__file__" in locals() else Path("camera_optical_offset.npz")
+SCRIPT_DIR = Path(__file__).resolve().parent if "__file__" in locals() else Path.cwd()
+OFFSET_PARAMS_FILE = SCRIPT_DIR / "camera_optical_offset.npz"
 if OFFSET_PARAMS_FILE.exists():
     try:
         with np.load(OFFSET_PARAMS_FILE) as data:
             if "optical_offset" in data:
-                CAMERA_OPTICAL_OFFSET = data["optical_offset"].astype(np.float32)
-                print(f"✓ オプティカルオフセット (camera_optical_offset.npz) のロードに成功しました: {CAMERA_OPTICAL_OFFSET}")
+                optical_offset = np.asarray(data["optical_offset"], dtype=np.float32)
+                if optical_offset.shape != (3,) or not np.all(np.isfinite(optical_offset)):
+                    raise ValueError("optical_offset は有限な3要素ベクトルである必要があります")
+                CAMERA_OPTICAL_OFFSET = optical_offset
+                print(f"✓ 光学中心オフセットをロードしました ({OFFSET_PARAMS_FILE}): {CAMERA_OPTICAL_OFFSET} m")
+            else:
+                print(f"⚠ {OFFSET_PARAMS_FILE.name} に optical_offset がありません。光学中心オフセットはゼロです。")
             if "optical_rot_offset" in data:
-                CAMERA_ROT_OFFSET = data["optical_rot_offset"].astype(np.float32)
-                print(f"✓ カメラ回転オフセットのロードに成功しました:\n{CAMERA_ROT_OFFSET}")
+                optical_rotation = np.asarray(data["optical_rot_offset"], dtype=np.float32)
+                if optical_rotation.shape != (3, 3) or not np.all(np.isfinite(optical_rotation)):
+                    raise ValueError("optical_rot_offset は有限な3x3行列である必要があります")
+                CAMERA_ROT_OFFSET = optical_rotation
+                print(f"✓ カメラ回転オフセットをロードしました ({OFFSET_PARAMS_FILE})")
+            else:
+                print(f"⚠ {OFFSET_PARAMS_FILE.name} に optical_rot_offset がありません。回転補正は単位行列です。")
             if "hand_offset" in data:
                 h_off = data["hand_offset"]
                 HAND_OFFSET_CAM_X, HAND_OFFSET_CAM_Y, HAND_OFFSET_CAM_Z = float(h_off[0]), float(h_off[1]), float(h_off[2])
@@ -102,6 +113,13 @@ if OFFSET_PARAMS_FILE.exists():
                 print(f"✓ 荷物カメラ回転オフセットのロードに成功しました")
     except Exception as e:
         print(f"⚠ オフセットファイル {OFFSET_PARAMS_FILE.name} のロードに失敗しました ({e})。デフォルト値を使用します。")
+else:
+    print(
+        f"⚠ カメラ外部校正ファイルが見つかりません: {OFFSET_PARAMS_FILE}\n"
+        "   CAMERA_OPTICAL_OFFSET=0、CAMERA_ROT_OFFSET=単位行列で続行します。"
+    )
+
+print(f"ℹ カメラ取付方向: {CAMERA_MOUNT_DIRECTION}")
 
 MARKER_POSE_OFFSET_FILE = Path(__file__).parent / "marker_pose_offsets.json"
 MARKER_POSE_OFFSETS = (
@@ -1141,7 +1159,7 @@ def camera_tracker_loop(m, show_window=False):
             print(f"USBカメラ申告FPS: {actual_camera_fps:.1f}")
         print(f"✓ USBカメラ 起動完了 ({CAMERA_WIDTH}x{CAMERA_HEIGHT})")
     # カメラキャリブレーションパラメータの読み込み
-    params_file = "camera_params.npz"
+    params_file = SCRIPT_DIR / "camera_params.npz"
     # デフォルト値（640x360用）を新解像度に合わせてスケール調整
     camera_matrix = np.array([
         [786.38858756 * (CAMERA_WIDTH / 640.0),   0.,                                     351.02240753 * (CAMERA_WIDTH / 640.0)],
@@ -1149,12 +1167,12 @@ def camera_tracker_loop(m, show_window=False):
         [0.,                                    0.,                                     1.]
     ])
     distortion_coeff = np.array([-0.03169828, -0.16365523, 0.0051104, -0.00278013, 0.50978427])
-    if os.path.exists(params_file):
+    if params_file.exists():
         try:
             with np.load(params_file) as data:
                 camera_matrix = data["mtx"]
                 distortion_coeff = data["dist"]
-            print("✓ カメラパラメータのロードに成功しました。")
+            print(f"✓ カメラ内部パラメータをロードしました: {params_file}")
         except Exception as e:
             print(f"⚠ カメラパラメータのロードに失敗しました ({e})。デフォルト値を使用します。")
     else:
@@ -2139,7 +2157,7 @@ def save_csv():
 def main():
     global running
     print("="*50)
-    print("ArduPilot 精密制御 - 前向きカメラテスト用 (ID1センサ利用)")
+    print("ArduPilot 精密制御 - 下向きカメラ用 (ID1センサ利用)")
     print("="*50)
     
     try:
