@@ -19,6 +19,11 @@ from marker_pose_calibration import (
     motive_quaternion_to_ned_xyzw,
     quaternion_to_rotation_matrix_xyzw,
 )
+from calibrate_marker_pose_offsets import (
+    CALIBRATION_TARGETS,
+    _robust_pose_mean,
+    collect_calibration_samples,
+)
 
 
 TARGETS = (("Hand", 1), ("Cargo", 2))
@@ -147,13 +152,16 @@ def _fit(matrices, vectors, max_rmse_m):
             f"fit rejected: 3-D residual RMSE {rmse:.3f} m exceeds "
             f"{max_rmse_m:.3f} m; use a synchronized capture with varied poses"
         )
-    return solution[:3], int(active.sum()), rmse, condition
+    return solution, int(active.sum()), rmse, condition
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("csv_paths", nargs="+", type=Path, help="校正用AR-hook CSV（複数可）")
     parser.add_argument("--output", type=Path, default=Path(__file__).with_name("camera_extrinsics.json"))
+    parser.add_argument("--marker-output", type=Path,
+                        default=Path(__file__).with_name("marker_pose_offsets.json"),
+                        help="カメラ外部オフセットと整合したマーカー姿勢オフセット")
     parser.add_argument("--max-time-gap-ms", type=float, default=100.0)
     parser.add_argument("--max-rmse-m", type=float, default=0.05,
                         help="このRMSEを超えた推定値は保存しない (default: 0.05 m)")
@@ -166,12 +174,21 @@ def main(argv=None):
     if (not math.isfinite(args.max_time_gap_ms) or args.max_time_gap_ms <= 0
             or args.max_rmse_m <= 0 or args.max_offset_norm_m <= 0):
         parser.error("時間差、RMSE上限、オフセット長上限は正の値にしてください")
-    if args.output.exists() and not args.force:
-        parser.error(f"既存ファイルを上書きするには --force を指定: {args.output}")
+    existing = [p for p in (args.output, args.marker_output) if p.exists()]
+    if existing and not args.force:
+        parser.error("既存ファイルを上書きするには --force を指定: "
+                     + ", ".join(str(p) for p in existing))
     records = []
+    marker_samples = {name.lower(): [] for name, _ in TARGETS}
     try:
         for path in args.csv_paths:
             records.extend(_collect(path, args.max_time_gap_ms / 1000.0))
+            samples, rejected = collect_calibration_samples(
+                path, args.max_time_gap_ms / 1000.0
+            )
+            for name, _ in TARGETS:
+                key = name.lower()
+                marker_samples[key].extend(samples[key])
         active_targets = [name for name, _ in TARGETS
                           if any(record[0] == name.lower() for record in records)]
         if not active_targets:
@@ -185,7 +202,8 @@ def main(argv=None):
             design[:, target_columns[name]] = r_ar
             matrices.append(design)
             vectors.append(difference)
-        offset, count, rmse, condition = _fit(matrices, vectors, args.max_rmse_m)
+        solution, count, rmse, condition = _fit(matrices, vectors, args.max_rmse_m)
+        offset = solution[:3]
         offset_norm = float(np.linalg.norm(offset))
         if offset_norm > args.max_offset_norm_m:
             raise ValueError(
@@ -195,7 +213,7 @@ def main(argv=None):
             )
     except (OSError, UnicodeError, csv.Error, ValueError) as exc:
         parser.error(str(exc))
-    result = {
+    camera_result = {
         "schema_version": 1,
         "definition": "Motive camera rigid-body origin to OpenCV optical origin",
         "camera_optical_offset_cv_m": offset.tolist(),
@@ -208,11 +226,43 @@ def main(argv=None):
         "design_condition_number": condition,
         "source_csvs": [p.name for p in args.csv_paths],
     }
+    marker_transforms = {}
+    for index, name in enumerate(active_targets):
+        schema_name = "hand" if name.lower() == "hand" else "cargo"
+        body_id = dict((key.lower(), value[0]) for key, value in CALIBRATION_TARGETS.items())[name.lower()]
+        if len(marker_samples[schema_name]) < 10:
+            parser.error(f"{schema_name}の姿勢校正サンプルが不足しています")
+        pose_result = _robust_pose_mean(marker_samples[schema_name])
+        translation = solution[3 + 3 * index:6 + 3 * index]
+        marker_transforms[schema_name] = {
+            "motive_rigid_body_id": body_id,
+            "translation_m": translation.tolist(),
+            "quaternion_xyzw": pose_result["quaternion_xyzw"].tolist(),
+            "sample_count": pose_result["sample_count"],
+            "inlier_count": pose_result["inlier_count"],
+            "joint_fit_rmse_m": rmse,
+            "rotation_rmse_deg": pose_result["rotation_rmse_deg"],
+        }
+    marker_result = {
+        "schema_version": 1,
+        "transform_definition": (
+            "T_motive_rigid_body_from_ar_marker_group; position in meters, "
+            "quaternion active Hamilton xyzw; translations jointly calibrated "
+            "with camera optical offset"
+        ),
+        "source_csvs": [p.name for p in args.csv_paths],
+        "max_time_delta_ms": args.max_time_gap_ms,
+        "camera_extrinsics_file": args.output.name,
+        "transforms": marker_transforms,
+    }
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    args.marker_output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(camera_result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    args.marker_output.write_text(json.dumps(marker_result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"光学中心オフセット: {offset.round(5).tolist()} m (OpenCV camera frame)")
     print(f"inliers={count}/{len(matrices)}, RMSE={rmse:.4f} m, condition={condition:.2f}")
     print(f"保存: {args.output}")
+    print(f"マーカー姿勢オフセット保存: {args.marker_output}")
     return 0
 
 
