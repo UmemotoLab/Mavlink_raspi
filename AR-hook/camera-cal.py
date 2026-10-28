@@ -128,11 +128,22 @@ def main():
         if ret:
             # 結果を保存
             save_path = "camera_params.npz"
-            np.savez(save_path, mtx=mtx, dist=dist)
+            # Intrinsic optical center (principal point) in image pixels.
+            optical_center_px = np.array([mtx[0, 2], mtx[1, 2]], dtype=np.float64)
+            np.savez(
+                save_path,
+                mtx=mtx,
+                dist=dist,
+                optical_center_px=optical_center_px,
+            )
             
             print(f"\nキャリブレーション完了！")
             print(f"結果を {save_path} に保存しました。")
             print("\nCamera Matrix:\n", mtx)
+            print(
+                "画像上の光学主点 (cx, cy): "
+                f"({optical_center_px[0]:.2f}, {optical_center_px[1]:.2f}) px"
+            )
             print("\nDistortion Coefficients:\n", dist)
             
             # 再投影誤差の計算

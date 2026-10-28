@@ -44,8 +44,8 @@ CAMERA_RIGID_BODY_ID = 3  # カメラに取り付けたMotiveセンサのID（Mo
 # 'front' : 前向きカメラ（テスト用）  OpenCV Z(前)=body X, X(右)=body Y, Y(下)=body Z
 # 'down'  : 下向きカメラ（実機用）   OpenCV Z(下)=body Z, X(右)=body Y, Y(画像下=機体後方)=-body X
 CAMERA_MOUNT_DIRECTION = 'down'
-# カメラ光学中心とMotiveマーカー中心のオフセット（カメラボディ座標系, メートル）
-# 実測後に更新してください（初期値はゼロベクトル）
+# Motive camera rigid body origin -> OpenCV optical origin, expressed in the
+# OpenCV camera frame (meters). A fresh camera_extrinsics.json can override it.
 CAMERA_OPTICAL_OFFSET = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 SQUARE_SIDE = 0.15  # 正方形の一辺長（メートル）
 HALF_SIDE = SQUARE_SIDE / 2
@@ -75,49 +75,27 @@ CARGO_OFFSET_CAM_X = 0.0
 CARGO_OFFSET_CAM_Y = 0.0
 CARGO_OFFSET_CAM_Z = 0.0
 
-# ───── オフセット・キャリブレーションパラメータの自動読み込み (camera_optical_offset.npz) ─────
 SCRIPT_DIR = Path(__file__).resolve().parent if "__file__" in locals() else Path.cwd()
-OFFSET_PARAMS_FILE = SCRIPT_DIR / "camera_optical_offset.npz"
-if OFFSET_PARAMS_FILE.exists():
+CAMERA_EXTRINSICS_FILE = SCRIPT_DIR / "camera_extrinsics.json"
+if CAMERA_EXTRINSICS_FILE.exists():
     try:
-        with np.load(OFFSET_PARAMS_FILE) as data:
-            if "optical_offset" in data:
-                optical_offset = np.asarray(data["optical_offset"], dtype=np.float32)
-                if optical_offset.shape != (3,) or not np.all(np.isfinite(optical_offset)):
-                    raise ValueError("optical_offset は有限な3要素ベクトルである必要があります")
-                CAMERA_OPTICAL_OFFSET = optical_offset
-                print(f"✓ 光学中心オフセットをロードしました ({OFFSET_PARAMS_FILE}): {CAMERA_OPTICAL_OFFSET} m")
-            else:
-                print(f"⚠ {OFFSET_PARAMS_FILE.name} に optical_offset がありません。光学中心オフセットはゼロです。")
-            if "optical_rot_offset" in data:
-                optical_rotation = np.asarray(data["optical_rot_offset"], dtype=np.float32)
-                if optical_rotation.shape != (3, 3) or not np.all(np.isfinite(optical_rotation)):
-                    raise ValueError("optical_rot_offset は有限な3x3行列である必要があります")
-                CAMERA_ROT_OFFSET = optical_rotation
-                print(f"✓ カメラ回転オフセットをロードしました ({OFFSET_PARAMS_FILE})")
-            else:
-                print(f"⚠ {OFFSET_PARAMS_FILE.name} に optical_rot_offset がありません。回転補正は単位行列です。")
-            if "hand_offset" in data:
-                h_off = data["hand_offset"]
-                HAND_OFFSET_CAM_X, HAND_OFFSET_CAM_Y, HAND_OFFSET_CAM_Z = float(h_off[0]), float(h_off[1]), float(h_off[2])
-                print(f"✓ 手先カメラ並進オフセットのロードに成功しました: [{HAND_OFFSET_CAM_X:.4f}, {HAND_OFFSET_CAM_Y:.4f}, {HAND_OFFSET_CAM_Z:.4f}]")
-            if "hand_rot_offset" in data:
-                HAND_ROT_OFFSET = data["hand_rot_offset"].astype(np.float32)
-                print(f"✓ 手先カメラ回転オフセットのロードに成功しました")
-            if "cargo_offset" in data:
-                c_off = data["cargo_offset"]
-                CARGO_OFFSET_CAM_X, CARGO_OFFSET_CAM_Y, CARGO_OFFSET_CAM_Z = float(c_off[0]), float(c_off[1]), float(c_off[2])
-                print(f"✓ 荷物カメラ並進オフセットのロードに成功しました: [{CARGO_OFFSET_CAM_X:.4f}, {CARGO_OFFSET_CAM_Y:.4f}, {CARGO_OFFSET_CAM_Z:.4f}]")
-            if "cargo_rot_offset" in data:
-                CARGO_ROT_OFFSET = data["cargo_rot_offset"].astype(np.float32)
-                print(f"✓ 荷物カメラ回転オフセットのロードに成功しました")
-    except Exception as e:
-        print(f"⚠ オフセットファイル {OFFSET_PARAMS_FILE.name} のロードに失敗しました ({e})。デフォルト値を使用します。")
+        import json
+        with CAMERA_EXTRINSICS_FILE.open("r", encoding="utf-8") as f:
+            _camera_extrinsics = json.load(f)
+        _offset = np.asarray(
+            _camera_extrinsics["camera_optical_offset_cv_m"], dtype=np.float64
+        ).reshape(3)
+        if not np.all(np.isfinite(_offset)):
+            raise ValueError("camera optical offset must be finite")
+        CAMERA_OPTICAL_OFFSET = _offset.astype(np.float32)
+        print(
+            "✓ カメラ光学中心の外部オフセットをロードしました "
+            f"({CAMERA_EXTRINSICS_FILE}): {CAMERA_OPTICAL_OFFSET.tolist()} m"
+        )
+    except Exception as exc:
+        print(f"⚠ {CAMERA_EXTRINSICS_FILE.name}を読めません ({exc}); 0 mで続行")
 else:
-    print(
-        f"⚠ カメラ外部校正ファイルが見つかりません: {OFFSET_PARAMS_FILE}\n"
-        "   CAMERA_OPTICAL_OFFSET=0、CAMERA_ROT_OFFSET=単位行列で続行します。"
-    )
+    print(f"ℹ 外部補正なし: {CAMERA_EXTRINSICS_FILE.name} (0 m)")
 
 print(f"ℹ カメラ取付方向: {CAMERA_MOUNT_DIRECTION}")
 
@@ -1159,7 +1137,7 @@ def camera_tracker_loop(m, show_window=False):
             print(f"USBカメラ申告FPS: {actual_camera_fps:.1f}")
         print(f"✓ USBカメラ 起動完了 ({CAMERA_WIDTH}x{CAMERA_HEIGHT})")
     # カメラキャリブレーションパラメータの読み込み
-    params_file = SCRIPT_DIR / "camera_params.npz"
+    params_file = "camera_params.npz"
     # デフォルト値（640x360用）を新解像度に合わせてスケール調整
     camera_matrix = np.array([
         [786.38858756 * (CAMERA_WIDTH / 640.0),   0.,                                     351.02240753 * (CAMERA_WIDTH / 640.0)],
@@ -1173,6 +1151,10 @@ def camera_tracker_loop(m, show_window=False):
                 camera_matrix = data["mtx"]
                 distortion_coeff = data["dist"]
             print(f"✓ カメラ内部パラメータをロードしました: {params_file}")
+            print(
+                "  画像上の光学主点 (cx, cy): "
+                f"({camera_matrix[0, 2]:.2f}, {camera_matrix[1, 2]:.2f}) px"
+            )
         except Exception as e:
             print(f"⚠ カメラパラメータのロードに失敗しました ({e})。デフォルト値を使用します。")
     else:
