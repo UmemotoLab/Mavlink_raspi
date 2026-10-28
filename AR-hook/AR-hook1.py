@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os,sys,select,time,math,threading,termios,tty,csv,datetime,signal,json
+import os,sys,select,time,math,threading,termios,tty,csv,datetime,signal
 from pathlib import Path
 from bisect import bisect_right
 import numpy as np
@@ -112,19 +112,6 @@ if MARKER_POSE_OFFSETS:
     print(f"✓ ARマーカーとMotive剛体の固定姿勢オフセットをロードしました: {MARKER_POSE_OFFSET_FILE.name}")
 else:
     print(f"ℹ 固定姿勢オフセットなし（未校正）: {MARKER_POSE_OFFSET_FILE.name}")
-
-# W座標系で適用する固定相対姿勢オフセット。
-# calibrate_w_pose_offset.py が生成するJSONを使用する。
-WORLD_POSE_OFFSET_FILE = Path(__file__).parent / "world_pose_offsets.json"
-try:
-    WORLD_POSE_OFFSETS = json.loads(WORLD_POSE_OFFSET_FILE.read_text(encoding="utf-8")) if WORLD_POSE_OFFSET_FILE.exists() else {}
-except Exception as exc:
-    WORLD_POSE_OFFSETS = {}
-    print(f"⚠ W座標系オフセットを読めません: {exc}")
-
-# MotiveタイムスタンプとPCのUnix時刻の差。UDP受信時に推定する。
-MOTIVE_TIMESTAMP_TO_UNIX_OFFSET = None
-MOTIVE_CLOCK_OFFSET_ALPHA = 0.02
 
 # ───── 基準点設定 ─────
 # Motive SDKの固定GPS基準点と一致させ、異なるCSV間でNED原点を共有します。
@@ -353,19 +340,6 @@ def quaternion_to_rotation_matrix(qx, qy, qz, qw):
     ], dtype=np.float32)
 
 
-def _apply_world_pose_offset(name, position_world, rotation_world):
-    """Apply a fixed AR-marker-to-Motive rigid-body transform in the AR local frame."""
-    offset = WORLD_POSE_OFFSETS.get(name)
-    position = np.asarray(position_world, dtype=np.float64)
-    rotation = np.asarray(rotation_world, dtype=np.float64)
-    if not offset:
-        return position, rotation
-    local_position = np.asarray(offset.get("position_local_m", [0, 0, 0]), dtype=np.float64)
-    local_quaternion = offset.get("quaternion_local_xyzw", [0, 0, 0, 1])
-    local_rotation = quaternion_to_rotation_matrix_xyzw(local_quaternion)
-    return position + rotation @ local_position, rotation @ local_rotation
-
-
 def _apply_marker_pose_offset(name, position_camera, rotation_camera):
     offset = MARKER_POSE_OFFSETS.get(name)
     position = np.asarray(position_camera, dtype=np.float64)
@@ -464,18 +438,11 @@ def _store_motive_pose_history(rigid_body_id, timestamp, position_ned, quaternio
 
 
 def _camera_pose_at_frame_time(frame_timestamp_s):
-    # カメラ側はUnix時刻、Motiveパケット時刻は送信元の時計である可能性がある。
-    # UDP受信時に推定した時計差を使って、同じ時計系に変換してから補間する。
     with io_lock:
         samples = list(motive_rigid_body_pose_history[CAMERA_RIGID_BODY_ID])
-        clock_offset = MOTIVE_TIMESTAMP_TO_UNIX_OFFSET
-    motive_frame_timestamp_s = (
-        frame_timestamp_s if clock_offset is None
-        else frame_timestamp_s - clock_offset
-    )
     pose = interpolate_pose(
         samples,
-        motive_frame_timestamp_s,
+        frame_timestamp_s,
         max_gap_s=MOTIVE_POSE_INTERPOLATION_MAX_GAP_S,
     )
     if pose is None:
@@ -485,9 +452,9 @@ def _camera_pose_at_frame_time(frame_timestamp_s):
     rotation = _camera_rotation_from_motive(*quaternion)
     position_ned = position_ned + rotation @ CAMERA_OPTICAL_OFFSET
     sample_times = [sample[0] for sample in samples]
-    insertion = bisect_right(sample_times, motive_frame_timestamp_s)
+    insertion = bisect_right(sample_times, frame_timestamp_s)
     pose_timestamp_s = (
-        motive_frame_timestamp_s
+        frame_timestamp_s
         if insertion and insertion < len(sample_times)
         else sample_times[max(0, min(insertion, len(sample_times) - 1))]
     )
@@ -664,7 +631,6 @@ def motive_udp_listener():
     print("[Motive UDP] Receiver thread stopped")
 
 def motive_rigid_body_pose_udp_listener():
-    global MOTIVE_TIMESTAMP_TO_UNIX_OFFSET
     global motive_drone_x, motive_drone_y, motive_drone_z
     global motive_drone_pos_received
     global motive_cargo_x, motive_cargo_y, motive_cargo_z
@@ -706,18 +672,6 @@ def motive_rigid_body_pose_udp_listener():
             )
             if magic != MOTIVE_POSE_MAGIC:
                 raise ValueError("パケット識別子が一致しません")
-            # timestampがUnix時刻でなくても、受信時刻との差を推定して補正する。
-            # 最初のサンプルで初期化し、以降は小さな係数で平滑化する。
-            receive_unix_s = time.time()
-            observed_offset = receive_unix_s - timestamp
-            with io_lock:
-                if MOTIVE_TIMESTAMP_TO_UNIX_OFFSET is None:
-                    MOTIVE_TIMESTAMP_TO_UNIX_OFFSET = observed_offset
-                else:
-                    MOTIVE_TIMESTAMP_TO_UNIX_OFFSET = (
-                        (1.0 - MOTIVE_CLOCK_OFFSET_ALPHA) * MOTIVE_TIMESTAMP_TO_UNIX_OFFSET
-                        + MOTIVE_CLOCK_OFFSET_ALPHA * observed_offset
-                    )
             if rigid_body_id not in (1, 2, CAMERA_RIGID_BODY_ID):
                 raise ValueError(f"未対応の剛体IDです: {rigid_body_id}")
             if not all(math.isfinite(value) for value in (qx, qy, qz, qw, timestamp)):
@@ -1263,6 +1217,11 @@ def camera_tracker_loop(m, show_window=False):
                     ):
                         break
                     time.sleep(0.002)
+
+                if  frame_camera_pose is None and motive_camera_received:
+                    with io_lock:
+                        frame_camera_pose = (R_cam_to_world.copy(), t_cam_world.copy(), motive_camera_pose_time_s)
+
                 if (
                     frame_camera_pose is None
                     and time.monotonic() - last_camera_pose_match_warning >= 5.0
@@ -1520,11 +1479,6 @@ def camera_tracker_loop(m, show_window=False):
                             rotation_ned = (
                                 calibration_camera_rotation
                                 @ np.asarray(marker_rotation, dtype=np.float64)
-                            )
-                            # W座標系へ変換した後に固定相対変換を適用するため、
-                            # カメラの向き・取り付け方向が変わっても同じオフセットを使える。
-                            position_ned, rotation_ned = _apply_world_pose_offset(
-                                name, position_ned, rotation_ned
                             )
                             ar_pose_updates[name] = {
                                 "pre_offset_position_ned": pre_offset_position_ned.tolist(),
@@ -2022,19 +1976,6 @@ def record_data():
                     *ar_marker_pose_log[name]["pre_offset_quaternion_ned"],
                 )
             ]
-            # Euler姿勢もW座標系NEDで出力（ラジアン、ZYX roll/pitch/yaw）。
-            ar_pose_euler_values = []
-            for name in ("hand", "cargo"):
-                pose = ar_marker_pose_log[name]
-                for key in ("pre_offset_quaternion_ned", "quaternion_ned"):
-                    q = pose[key]
-                    if all(math.isfinite(float(v)) for v in q):
-                        euler = rotation_matrix_to_euler_rpy(
-                            quaternion_to_rotation_matrix(*q)
-                        )
-                        ar_pose_euler_values.extend(euler)
-                    else:
-                        ar_pose_euler_values.extend([float("nan")] * 3)
             
         data_records.append([
             time.time(), 
@@ -2074,7 +2015,6 @@ def record_data():
             *motive_pose_calibration_log,
             *ar_pose_log_values,
             *ar_pose_pre_offset_log_values,
-            *ar_pose_euler_values,
         ])
         time.sleep(1 / AR_LOG_HZ)
 def save_csv():
@@ -2175,16 +2115,6 @@ def save_csv():
                     f'AR_{name}_PreOffset_QY_NED',
                     f'AR_{name}_PreOffset_QZ_NED',
                     f'AR_{name}_PreOffset_QW_NED',
-                )
-            ],
-            *[
-                column
-                for name in ("Hand", "Cargo")
-                for stage in ("PreOffset", "Corrected")
-                for column in (
-                    f'AR_{name}_{stage}_Roll_W_NED_rad',
-                    f'AR_{name}_{stage}_Pitch_W_NED_rad',
-                    f'AR_{name}_{stage}_Yaw_W_NED_rad',
                 )
             ],
         ])
