@@ -186,7 +186,6 @@ def collect_calibration_samples(path, max_time_delta_s):
                 if (
                     not math.isfinite(ar_time)
                     or not math.isfinite(camera_time)
-                    or abs(ar_time - camera_time) > max_time_delta_s
                 ):
                     rejected_by_target[name] += 1
                     continue
@@ -207,7 +206,10 @@ def collect_calibration_samples(path, max_time_delta_s):
                 ))
                 rb_pose = interpolate_pose(
                     pose_samples_by_body[rigid_body_id],
-                    ar_time,
+                    # Camera_Pose_Time is in Motive's clock domain and marks
+                    # the pose used to transform this AR frame. Pose_Time is
+                    # the camera's local clock and must not be compared with it.
+                    camera_time,
                     max_gap_s=max_time_delta_s,
                 )
                 if rb_pose is None:
@@ -321,7 +323,7 @@ def main(argv=None):
     output = {
         "schema_version": 1,
         "transform_definition": (
-            "T_motive_rigid_body_from_ar_marker_group; "
+            "T_ar_marker_group_from_motive_rigid_body; "
             "position in meters, quaternion active Hamilton xyzw"
         ),
         "source_csv": args.csv_path.name,
@@ -338,7 +340,7 @@ def main(argv=None):
         parser.error(f"校正結果を保存できません: {exc}")
     print(f"校正オフセットを保存しました: {args.output}")
     print(
-        "AR-hook1_test.pyを再起動すると、以後のAR位置・姿勢に"
+        "AR-hook1.pyを再起動すると、以後のAR位置・姿勢に"
         "この剛体変換が適用されます。"
     )
     return 0

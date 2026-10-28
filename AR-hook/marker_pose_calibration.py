@@ -54,6 +54,45 @@ def rotation_matrix_to_quaternion_xyzw(R):
         return (0.0, 0.0, 0.0, 1.0)
     return tuple(c / norm for c in q)
 
+def normalized_quaternion_xyzw(q):
+    q = tuple(float(component) for component in q)
+    norm = math.sqrt(sum(component * component for component in q))
+    if not math.isfinite(norm) or norm == 0.0:
+        raise ValueError("quaternion must be finite and nonzero")
+    return tuple(component / norm for component in q)
+
+def _quaternion_multiply_xyzw(left, right):
+    lx, ly, lz, lw = left
+    rx, ry, rz, rw = right
+    return (
+        lw * rx + lx * rw + ly * rz - lz * ry,
+        lw * ry - lx * rz + ly * rw + lz * rx,
+        lw * rz + lx * ry - ly * rx + lz * rw,
+        lw * rw - lx * rx - ly * ry - lz * rz,
+    )
+
+def motive_quaternion_to_ned_xyzw(q):
+    """Convert Motive-frame quaternion to the application's NED frame."""
+    q = normalized_quaternion_xyzw(q)
+    frame = (-math.sqrt(0.5), 0.0, 0.0, math.sqrt(0.5))
+    inverse_frame = (-frame[0], -frame[1], -frame[2], frame[3])
+    return _quaternion_multiply_xyzw(
+        _quaternion_multiply_xyzw(frame, q), inverse_frame
+    )
+
+def relative_pose(motive_position, motive_quaternion, ar_position, ar_quaternion):
+    """Return the local AR-to-Motive transform to apply after the AR pose."""
+    motive_position = np.asarray(motive_position, dtype=np.float64)
+    ar_position = np.asarray(ar_position, dtype=np.float64)
+    R_motive = quaternion_to_rotation_matrix_xyzw(motive_quaternion)
+    R_ar = quaternion_to_rotation_matrix_xyzw(ar_quaternion)
+    R_ar_from_motive = R_ar.T @ R_motive
+    translation_ar_from_motive = R_ar.T @ (motive_position - ar_position)
+    return (
+        translation_ar_from_motive,
+        rotation_matrix_to_quaternion_xyzw(R_ar_from_motive),
+    )
+
 def average_quaternions_xyzw(quaternions):
     """複数の (x, y, z, w) クォータニオンの平均"""
     A = np.zeros((4, 4))
