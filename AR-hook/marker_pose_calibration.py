@@ -127,8 +127,14 @@ def load_marker_pose_offsets(filepath):
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     offsets = {}
-    for key, val in data.items():
-        offsets[key] = (val["position_offset"], val["quaternion_offset"])
+    transforms = data.get("transforms", data)
+    for key, val in transforms.items():
+        if not isinstance(val, dict):
+            continue
+        if "translation_m" in val and "quaternion_xyzw" in val:
+            offsets[key] = (val["translation_m"], val["quaternion_xyzw"])
+        elif "position_offset" in val and "quaternion_offset" in val:
+            offsets[key] = (val["position_offset"], val["quaternion_offset"])
     return offsets
 
 def save_marker_pose_offsets(filepath, offsets_dict):

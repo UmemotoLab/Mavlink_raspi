@@ -8,7 +8,6 @@ from pathlib import Path
 
 from marker_pose_calibration import (
     interpolate_pose,
-    motive_quaternion_to_ned_xyzw,
     quaternion_to_rotation_matrix_xyzw,
 )
 
@@ -40,6 +39,32 @@ TARGETS = {
 POSITION_AXES = ("N", "E", "D")
 POSITION_COLUMNS = ("X", "Y", "Z")
 ATTITUDE_AXES = ("Roll", "Pitch", "Yaw")
+MOTIVE_TO_NED_QUATERNION_XYZW = (
+    -math.sqrt(0.5), 0.0, 0.0, math.sqrt(0.5)
+)
+
+
+def _quaternion_multiply_xyzw(left, right):
+    lx, ly, lz, lw = left
+    rx, ry, rz, rw = right
+    return (
+        lw * rx + lx * rw + ly * rz - lz * ry,
+        lw * ry - lx * rz + ly * rw + lz * rx,
+        lw * rz + lx * ry - ly * rx + lz * rw,
+        lw * rw - lx * rx - ly * ry - lz * rz,
+    )
+
+
+def _motive_quaternion_to_ned_xyzw(quaternion):
+    norm = math.sqrt(sum(component * component for component in quaternion))
+    if not math.isfinite(norm) or norm == 0.0:
+        raise ValueError("Motive quaternion must be finite and nonzero")
+    motive_q = tuple(component / norm for component in quaternion)
+    frame_q = MOTIVE_TO_NED_QUATERNION_XYZW
+    inverse_frame_q = (-frame_q[0], -frame_q[1], -frame_q[2], frame_q[3])
+    return _quaternion_multiply_xyzw(
+        _quaternion_multiply_xyzw(frame_q, motive_q), inverse_frame_q
+    )
 
 
 def _finite_values(row, columns):
@@ -157,6 +182,12 @@ def _series_for_target(rows, target_key, start_time):
             ar_timestamp = float(row[f"AR_{prefix}_Pose_Time_s"])
         except (KeyError, TypeError, ValueError):
             ar_timestamp = float("nan")
+        try:
+            motive_match_timestamp = float(
+                row[f"AR_{prefix}_Camera_Pose_Time_s"]
+            )
+        except (KeyError, TypeError, ValueError):
+            motive_match_timestamp = float("nan")
         frame_timestamp = (
             ar_timestamp
             if ar_valid and math.isfinite(ar_timestamp)
@@ -211,7 +242,11 @@ def _series_for_target(rows, target_key, start_time):
         motive_pose = (
             interpolate_pose(
                 motive_history,
-                ar_timestamp,
+                (
+                    motive_match_timestamp
+                    if math.isfinite(motive_match_timestamp)
+                    else ar_timestamp
+                ),
                 max_gap_s=POSE_INTERPOLATION_MAX_GAP_S,
             )
             if ar_valid and math.isfinite(ar_timestamp)
@@ -221,7 +256,7 @@ def _series_for_target(rows, target_key, start_time):
             motive_pose if motive_pose is not None else (None, None)
         )
         if motive_quaternion is not None:
-            motive_quaternion = motive_quaternion_to_ned_xyzw(
+            motive_quaternion = _motive_quaternion_to_ned_xyzw(
                 motive_quaternion
             )
 
@@ -279,12 +314,20 @@ def _plot_comparison(
     labels = ("AR before marker offset", "AR after marker offset", "Motive")
     styles = ("--", "-", "-")
     for axis_index, (axis, axis_name) in enumerate(zip(axes, axis_names)):
-        for values, label, style in zip(series, labels, styles):
+        for values, label, style, zorder in zip(
+            series, labels, styles, (3, 2, 1)
+        ):
             y_values = [
                 sample[axis_index] if sample is not None else float("nan")
                 for sample in values
             ]
-            axis.plot(times, y_values, linestyle=style, label=label)
+            axis.plot(
+                times,
+                y_values,
+                linestyle=style,
+                label=label,
+                zorder=zorder,
+            )
         axis.set_ylabel(f"{axis_name} [{unit}]")
         axis.grid(True, alpha=0.3)
         axis.legend(loc="best")
