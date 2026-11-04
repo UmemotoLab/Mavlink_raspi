@@ -836,13 +836,53 @@ def rotation_matrix_to_euler_rpy(rotation):
     return roll, pitch, yaw
 
 
+def _unwrap_angle_near(angle, reference):
+    """Return an equivalent angle (modulo 2*pi) nearest to reference."""
+    return angle + 2.0 * math.pi * round((reference - angle) / (2.0 * math.pi))
+
+
+def rotation_matrix_to_euler_rpy_continuous(rotation, previous_rpy=None):
+    """Convert to a temporally continuous Euler representation for display/logging.
+
+    Euler angles have multiple equivalent representations. Select the candidate
+    nearest to the previous frame, including the alternate ZYX branch, then
+    unwrap each component. This function is for visualization/logging only;
+    quaternion rotations remain the source for pose transforms and comparisons.
+    """
+    roll, pitch, yaw = rotation_matrix_to_euler_rpy(rotation)
+    if previous_rpy is None or not all(
+        math.isfinite(value) for value in previous_rpy
+    ):
+        return roll, pitch, yaw
+
+    candidates = (
+        (roll, pitch, yaw),
+        (roll + math.pi, math.pi - pitch, yaw + math.pi),
+    )
+    continuous_candidates = [
+        tuple(_unwrap_angle_near(value, previous) for value, previous in zip(
+            candidate, previous_rpy
+        ))
+        for candidate in candidates
+    ]
+    return min(
+        continuous_candidates,
+        key=lambda candidate: sum(
+            (value - previous) ** 2
+            for value, previous in zip(candidate, previous_rpy)
+        ),
+    )
+
+
 def ar_marker_front_facing_reference_rotation():
     return HAND_ROT_OFFSET @ np.diag(
         [1.0, -1.0, -1.0]
     ).astype(np.float32)
 
 
-def ar_marker_relative_attitude_rpy(rotation, reference_rotation):
+def ar_marker_relative_attitude_rpy(
+    rotation, reference_rotation, previous_rpy=None
+):
     rotation_q = rotation_matrix_to_quaternion_xyzw(rotation)
     reference_q = rotation_matrix_to_quaternion_xyzw(reference_rotation)
     inverse_reference_q = (
@@ -851,8 +891,8 @@ def ar_marker_relative_attitude_rpy(rotation, reference_rotation):
     relative_q = _quaternion_multiply_xyzw(
         inverse_reference_q, rotation_q
     )
-    return rotation_matrix_to_euler_rpy(
-        quaternion_to_rotation_matrix(*relative_q)
+    return rotation_matrix_to_euler_rpy_continuous(
+        quaternion_to_rotation_matrix(*relative_q), previous_rpy
     )
 
 
@@ -1173,6 +1213,10 @@ def camera_tracker_loop(m, show_window=False):
     last_print_time = time.monotonic()
     fps_window_started = last_print_time
     fps_frame_count = 0
+    # Euler angles are maintained as a continuous display/log representation.
+    # Pose transforms continue to use rotation matrices/quaternions directly.
+    previous_ar_attitude_cam = None
+    previous_ar_attitude_world = None
     warned_missing_sensor_timestamp = False
     last_camera_pose_match_warning = 0.0
     try:
@@ -1364,8 +1408,11 @@ def camera_tracker_loop(m, show_window=False):
                     )
                     R_front_reference = ar_marker_front_facing_reference_rotation()
                     attitude_cam = ar_marker_relative_attitude_rpy(
-                        R_cam_marker, R_front_reference
+                        R_cam_marker,
+                        R_front_reference,
+                        previous_ar_attitude_cam,
                     )
+                    previous_ar_attitude_cam = attitude_cam
                     if CAMERA_ORIENTATION_SOURCE == "motive":
                         R_camera_to_ned = (
                             frame_camera_pose[0]
@@ -1386,9 +1433,11 @@ def camera_tracker_loop(m, show_window=False):
                         marker_to_ned_q = _quaternion_multiply_xyzw(
                             camera_to_ned_q, marker_to_camera_q
                         )
-                        attitude_world = rotation_matrix_to_euler_rpy(
-                            quaternion_to_rotation_matrix(*marker_to_ned_q)
+                        attitude_world = rotation_matrix_to_euler_rpy_continuous(
+                            quaternion_to_rotation_matrix(*marker_to_ned_q),
+                            previous_ar_attitude_world,
                         )
+                        previous_ar_attitude_world = attitude_world
                     with io_lock:
                         id1_detected = True
                         ar_hand_attitude_cam = list(attitude_cam)
