@@ -943,14 +943,15 @@ def _active_camera_to_ned_rotation():
             motive_attitude_received_local = False
             roll = current_roll_rad
             pitch = current_pitch_rad
-            yaw = (current_yaw_rad + math.pi) % (2 * math.pi)
+            # MAVLink ATTITUDE yaw is already NED heading (0 = North).
+            yaw = current_yaw_rad
 
         if camera_received:
             return R_camera_to_ned
         if CAMERA_ORIENTATION_SOURCE == "motive" and not motive_attitude_received_local:
             roll = current_roll_rad
             pitch = current_pitch_rad
-            yaw = (current_yaw_rad + math.pi) % (2 * math.pi)
+            yaw = current_yaw_rad
 
     return _camera_to_ned_rotation_from_euler(roll, pitch, yaw)
 
@@ -1632,10 +1633,10 @@ def camera_tracker_loop(m, show_window=False):
                             drone_pitch = motive_pitch_rad
                             drone_yaw = _motive_yaw_south_positive(motive_yaw_rad)
                         else:
-                            # フォールバック: Pixhawk IMU（North-positiveのためSouth-positiveへ変換）
+                            # フォールバック: Pixhawk IMU（MAVLink NED yawをそのまま使用）
                             drone_roll = current_roll_rad
                             drone_pitch = current_pitch_rad
-                            drone_yaw = (current_yaw_rad + math.pi) % (2 * math.pi)
+                            drone_yaw = current_yaw_rad
 
                     # ─── 荷物中心のワールド座標を算出 ───
                     if CAMERA_ORIENTATION_SOURCE == "motive":
@@ -1664,7 +1665,6 @@ def camera_tracker_loop(m, show_window=False):
                             ap_roll = current_roll_rad
                             ap_pitch = current_pitch_rad
                             ap_yaw = current_yaw_rad
-                        ap_yaw = (ap_yaw + math.pi) % (2 * math.pi)
                         cargo_x, cargo_y, cargo_z = camera_to_world_xyz(
                             center_cam, ap_roll, ap_pitch, ap_yaw, drone_gps)
                         coord_source = "ArduPilot-Mag"
@@ -1709,7 +1709,6 @@ def camera_tracker_loop(m, show_window=False):
                             ap_roll = current_roll_rad
                             ap_pitch = current_pitch_rad
                             ap_yaw = current_yaw_rad
-                        ap_yaw = (ap_yaw + math.pi) % (2 * math.pi)
                         target_x, target_y, target_z = camera_to_world_xyz(
                             tvec_error, ap_roll, ap_pitch, ap_yaw, drone_gps)
 

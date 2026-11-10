@@ -3,7 +3,8 @@
 """Plot Hand-to-Cargo relative position and distance from an AR-hook CSV.
 
 AR series use W/NED positions from one camera frame. Motive RB1 and RB2
-positions are interpolated to the AR frame timestamp before differencing.
+positions are interpolated using the camera timestamp expressed in the Motive
+clock domain before differencing.
 """
 
 import argparse
@@ -143,8 +144,8 @@ def main():
 
     rows, fields = _read_rows(args.csv_file)
     required = {
-        "AR_Hand_Pose_Time_s",
-        "AR_Cargo_Pose_Time_s",
+        "AR_Hand_Camera_Pose_Time_s",
+        "AR_Cargo_Camera_Pose_Time_s",
         *[f"AR_{name}_{axis}_NED_m" for name in ("Hand", "Cargo") for axis in "XYZ"],
         *[f"AR_{name}_PreOffset_{axis}_NED_m" for name in ("Hand", "Cargo") for axis in "XYZ"],
     }
@@ -155,8 +156,15 @@ def main():
             "不足列: " + ", ".join(missing)
         )
 
-    ar_times = np.array([_float(row, "AR_Hand_Pose_Time_s") for row in rows])
-    cargo_times = np.array([_float(row, "AR_Cargo_Pose_Time_s") for row in rows])
+    # AR_Pose_Time_s is recorded in the camera/host clock domain, while
+    # Motive_RB*_Pose_Time_s uses the Motive clock. Camera_Pose_Time_s has
+    # already been converted to the Motive domain for frame matching.
+    ar_times = np.array(
+        [_float(row, "AR_Hand_Camera_Pose_Time_s") for row in rows]
+    )
+    cargo_times = np.array(
+        [_float(row, "AR_Cargo_Camera_Pose_Time_s") for row in rows]
+    )
     same_frame = np.isfinite(ar_times) & np.isfinite(cargo_times)
     same_frame &= np.abs(ar_times - cargo_times) <= 0.02
     ar_times[~same_frame] = np.nan
@@ -229,7 +237,7 @@ def main():
     print(f"PNGを保存しました: {output}")
     print(
         "相対ベクトルはW/NEDのHand−Cargoです。"
-        "Motive位置はCSV内のPose_Timeに基づきAR撮影時刻へ補間しています。"
+            "Motive位置はAR_Camera_Pose_Time_s（Motive時計）へ補間しています。"
     )
     if not args.no_show:
         plt.show()

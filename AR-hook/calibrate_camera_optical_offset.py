@@ -61,7 +61,7 @@ def _pixhawk_camera_rotation(row):
     roll, pitch, yaw = _finite_values(
         row, ["Pixhawk_Roll_rad", "Pixhawk_Pitch_rad", "Pixhawk_Yaw_rad"]
     )
-    yaw = (yaw + math.pi) % (2.0 * math.pi)
+    # MAVLink ATTITUDE yaw is already expressed as NED heading (0 = North).
     cr, sr = math.cos(roll), math.sin(roll)
     cp, sp = math.cos(pitch), math.sin(pitch)
     cy, sy = math.cos(yaw), math.sin(yaw)
