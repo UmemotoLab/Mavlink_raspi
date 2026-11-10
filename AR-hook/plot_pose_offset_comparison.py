@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Compare AR poses before/after fixed-pose correction against Motive."""
+"""Compare AR positions before/after correction and corrected attitudes against Motive."""
 import argparse
 import csv
 import math
@@ -311,12 +311,19 @@ def _plot_comparison(
     unit = "deg" if is_attitude else "m"
     title = "attitude (ZYX roll-pitch-yaw)" if is_attitude else "position (NED)"
     figure, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
-    labels = ("AR before marker offset", "AR after marker offset", "Motive")
-    styles = ("--", "-", "-")
+    if is_attitude:
+        # Euler angles from different local frames are not directly comparable
+        # before the fixed marker-to-rigid-body rotation has been applied.
+        series = series[1:]
+        labels = ("AR after marker offset", "Motive")
+        styles = ("-", "-")
+        zorders = (2, 1)
+    else:
+        labels = ("AR before marker offset", "AR after marker offset", "Motive")
+        styles = ("--", "-", "-")
+        zorders = (3, 2, 1)
     for axis_index, (axis, axis_name) in enumerate(zip(axes, axis_names)):
-        for values, label, style, zorder in zip(
-            series, labels, styles, (3, 2, 1)
-        ):
+        for values, label, style, zorder in zip(series, labels, styles, zorders):
             y_values = [
                 sample[axis_index] if sample is not None else float("nan")
                 for sample in values
@@ -349,7 +356,9 @@ def _plot_comparison(
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="補正前AR・補正後AR・Motiveの位置と姿勢を比較します"
+        description=(
+            "位置は補正前後のARとMotiveを比較し、姿勢は補正後ARとMotiveを比較します"
+        )
     )
     parser.add_argument("csv", type=Path, help="修正版AR-hookが出力したCSV")
     parser.add_argument(
