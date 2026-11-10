@@ -44,8 +44,8 @@ CAMERA_RIGID_BODY_ID = 3  # カメラに取り付けたMotiveセンサのID（Mo
 # 'front' : 前向きカメラ（テスト用）  OpenCV Z(前)=body X, X(右)=body Y, Y(下)=body Z
 # 'down'  : 下向きカメラ（実機用）   OpenCV Z(下)=body Z, X(右)=body Y, Y(画像下=機体後方)=-body X
 CAMERA_MOUNT_DIRECTION = 'down'
-# Motive camera rigid body origin -> OpenCV optical origin, expressed in the
-# OpenCV camera frame (meters). A fresh camera_extrinsics.json can override it.
+# Camera optical origin relative to the selected pose/GPS reference, expressed
+# in the OpenCV camera frame (meters). camera_extrinsics.json can override it.
 CAMERA_OPTICAL_OFFSET = np.array([0.0, 0.0, 0.0], dtype=np.float32)
 SQUARE_SIDE = 0.15  # 正方形の一辺長（メートル）
 HALF_SIDE = SQUARE_SIDE / 2
@@ -77,17 +77,25 @@ CARGO_OFFSET_CAM_Z = 0.0
 
 SCRIPT_DIR = Path(__file__).resolve().parent if "__file__" in locals() else Path.cwd()
 CAMERA_EXTRINSICS_FILE = SCRIPT_DIR / "camera_extrinsics.json"
+CAMERA_OPTICAL_OFFSETS = {"motive": CAMERA_OPTICAL_OFFSET.copy(),
+                          "ardupilot": CAMERA_OPTICAL_OFFSET.copy()}
 if CAMERA_EXTRINSICS_FILE.exists():
     try:
         import json
         with CAMERA_EXTRINSICS_FILE.open("r", encoding="utf-8") as f:
             _camera_extrinsics = json.load(f)
-        _offset = np.asarray(
-            _camera_extrinsics["camera_optical_offset_cv_m"], dtype=np.float64
-        ).reshape(3)
-        if not np.all(np.isfinite(_offset)):
-            raise ValueError("camera optical offset must be finite")
-        CAMERA_OPTICAL_OFFSET = _offset.astype(np.float32)
+        _profiles = _camera_extrinsics.get("profiles", {})
+        if not _profiles and "camera_optical_offset_cv_m" in _camera_extrinsics:
+            _profiles = {"motive": _camera_extrinsics}
+        for _source in CAMERA_OPTICAL_OFFSETS:
+            if _source in _profiles:
+                _offset = np.asarray(
+                    _profiles[_source]["camera_optical_offset_cv_m"], dtype=np.float64
+                ).reshape(3)
+                if not np.all(np.isfinite(_offset)):
+                    raise ValueError(f"{_source} camera optical offset must be finite")
+                CAMERA_OPTICAL_OFFSETS[_source] = _offset.astype(np.float32)
+        CAMERA_OPTICAL_OFFSET = CAMERA_OPTICAL_OFFSETS["motive"]
         print(
             "✓ カメラ光学中心の外部オフセットをロードしました "
             f"({CAMERA_EXTRINSICS_FILE}): {CAMERA_OPTICAL_OFFSET.tolist()} m"
@@ -905,11 +913,18 @@ def _camera_to_ned_rotation_from_euler(roll_rad, pitch_rad, yaw_rad):
         [cp*sy,  sr*sp*sy + cr*cy,  cr*sp*sy - sr*cy],
         [-sp,    sr*cp,            cr*cp]
     ], dtype=np.float32)
-    R_cv_to_body = np.array([
-        [0.0, 0.0, 1.0],
-        [1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0]
-    ], dtype=np.float32)
+    if CAMERA_MOUNT_DIRECTION == 'front':
+        R_cv_to_body = np.array([
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0]
+        ], dtype=np.float32)
+    else:
+        R_cv_to_body = np.array([
+            [0.0, -1.0, 0.0],
+            [1.0,  0.0, 0.0],
+            [0.0,  0.0, 1.0]
+        ], dtype=np.float32)
     return R_body_to_ned @ R_cv_to_body
 
 
@@ -938,6 +953,12 @@ def _active_camera_to_ned_rotation():
             yaw = (current_yaw_rad + math.pi) % (2 * math.pi)
 
     return _camera_to_ned_rotation_from_euler(roll, pitch, yaw)
+
+
+def _selected_camera_optical_offset():
+    return CAMERA_OPTICAL_OFFSETS.get(
+        CAMERA_ORIENTATION_SOURCE, CAMERA_OPTICAL_OFFSETS["motive"]
+    )
 
 
 # ───── カメラ座標系から世界座標系（北・東・下）への座標変換 ─────
@@ -1000,7 +1021,9 @@ def camera_to_world_xyz(tvec, roll_rad, pitch_rad, yaw_rad, gps_drone):
     R_camera_to_ned = _camera_to_ned_rotation_from_euler(
         roll_rad, pitch_rad, yaw_rad
     )
-    p_ned = R_camera_to_ned.dot(np.asarray(tvec, dtype=np.float32))
+    p_ned = R_camera_to_ned.dot(
+        np.asarray(tvec, dtype=np.float32) + _selected_camera_optical_offset()
+    )
     
     target_x = gps_drone['x'] + p_ned[0]
     target_y = gps_drone['y'] + p_ned[1]
@@ -1276,17 +1299,34 @@ def camera_tracker_loop(m, show_window=False):
                     if math.isfinite(clock_offset_s)
                     else frame_timestamp_s
                 )
-                match_deadline = time.monotonic() + MOTIVE_POSE_MATCH_WAIT_S
-                while True:
-                    frame_camera_pose = _camera_pose_at_frame_time(
-                        motive_frame_timestamp_s
+                if CAMERA_ORIENTATION_SOURCE == "motive":
+                    match_deadline = time.monotonic() + MOTIVE_POSE_MATCH_WAIT_S
+                    while True:
+                        frame_camera_pose = _camera_pose_at_frame_time(
+                            motive_frame_timestamp_s
+                        )
+                        if (
+                            frame_camera_pose is not None
+                            or time.monotonic() >= match_deadline
+                        ):
+                            break
+                        time.sleep(0.002)
+                else:
+                    R_imu_camera_to_ned = _active_camera_to_ned_rotation()
+                    with io_lock:
+                        vehicle_position_ned = np.array(
+                            [gps_now['x'], gps_now['y'], gps_now['z']],
+                            dtype=np.float32,
+                        )
+                    camera_position_ned = (
+                        vehicle_position_ned
+                        + R_imu_camera_to_ned @ _selected_camera_optical_offset()
                     )
-                    if (
-                        frame_camera_pose is not None
-                        or time.monotonic() >= match_deadline
-                    ):
-                        break
-                    time.sleep(0.002)
+                    frame_camera_pose = (
+                        R_imu_camera_to_ned,
+                        camera_position_ned,
+                        motive_frame_timestamp_s,
+                    )
 
                 if (
                     frame_camera_pose is None
@@ -2071,7 +2111,7 @@ def record_data():
             *m_cam_quaternion,
             m_cam_pose_time,
             *m_cam_rotation,
-            coord_src,
+            coord_src, CAMERA_ORIENTATION_SOURCE,
             # Pixhawk姿勢 カラム
             p_roll, p_pitch, p_yaw,
             # ✅ 新規追加：カメラ座標系 生データとMotive逆投影真値
@@ -2118,7 +2158,7 @@ def save_csv():
             'Motive_Camera_R00', 'Motive_Camera_R01', 'Motive_Camera_R02',
             'Motive_Camera_R10', 'Motive_Camera_R11', 'Motive_Camera_R12',
             'Motive_Camera_R20', 'Motive_Camera_R21', 'Motive_Camera_R22',
-            'Coord_Source',
+            'Coord_Source', 'Camera_Orientation_Source',
             'Pixhawk_Roll_rad', 'Pixhawk_Pitch_rad', 'Pixhawk_Yaw_rad',
             # ✅ カメラ座標系 生データ
             'Cargo_Cam_Raw_X_m', 'Cargo_Cam_Raw_Y_m', 'Cargo_Cam_Raw_Z_m',
@@ -2212,10 +2252,14 @@ def main():
         ori_choice = input_with_timeout("選択 (1 または 2): ", timeout=10, default='1')
         if ori_choice.strip() == '2':
             CAMERA_ORIENTATION_SOURCE = "ardupilot"
+            selected_offset = _selected_camera_optical_offset()
             print("✓ カメラ向きソース: ArduPilot 磁気センサー (Pixhawk IMU)")
+            print(f"  IMU用光学中心オフセット: {selected_offset.tolist()} m")
         else:
             CAMERA_ORIENTATION_SOURCE = "motive"
+            selected_offset = _selected_camera_optical_offset()
             print("✓ カメラ向きソース: Motive (カメラ rigid body)")
+            print(f"  Motive用光学中心オフセット: {selected_offset.tolist()} m")
         
         # スレッド起動
         threading.Thread(target=monitor_vehicle, args=(mav,), daemon=True).start()

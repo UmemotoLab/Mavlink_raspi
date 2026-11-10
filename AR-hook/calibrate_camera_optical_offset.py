@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 """Estimate the camera optical-origin offset from synchronized AR-hook CSV logs.
 
-This estimates the 3-D lever arm from Motive camera rigid-body ID 3's origin to
-the OpenCV optical origin. It is distinct from the 2-D principal point stored in
-camera_params.npz. Use logs with varied camera and target orientations.
+This estimates the 3-D lever arm from the selected camera pose source to the
+OpenCV optical origin. Use separate AR-hook logs captured with each selected
+orientation source and varied camera/target orientations.
 """
 import argparse
 import csv
@@ -57,16 +57,43 @@ def _histories(rows, rigid_body_id):
     return [(t, *pose) for t, pose in sorted(poses.items())]
 
 
-def _collect(path, max_gap_s):
+def _pixhawk_camera_rotation(row):
+    roll, pitch, yaw = _finite_values(
+        row, ["Pixhawk_Roll_rad", "Pixhawk_Pitch_rad", "Pixhawk_Yaw_rad"]
+    )
+    yaw = (yaw + math.pi) % (2.0 * math.pi)
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    r_body_to_ned = np.array([
+        [cp*cy, sr*sp*cy-cr*sy, cr*sp*cy+sr*sy],
+        [cp*sy, sr*sp*sy+cr*cy, cr*sp*sy-sr*cy],
+        [-sp, sr*cp, cr*cp],
+    ], dtype=np.float64)
+    r_cv_to_body = np.array(
+        [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
+        dtype=np.float64,
+    )
+    return r_body_to_ned @ r_cv_to_body
+
+
+def _collect(path, max_gap_s, source):
     with path.open("r", newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         rows = list(reader)
         columns = set(reader.fieldnames or ())
-    required = {"Motive_RB3_Pose_Received", "Motive_RB3_Pose_Time_s"}
+    required = {"Camera_Orientation_Source"}
+    if source == "motive":
+        required |= {"Motive_RB3_Pose_Received", "Motive_RB3_Pose_Time_s"}
+    else:
+        required |= {"Pixhawk_Roll_rad", "Pixhawk_Pitch_rad", "Pixhawk_Yaw_rad"}
     for bid in (1, 2, 3):
-        required |= {f"Motive_RB{bid}_{a}_NED_m" for a in "XYZ"}
-        required |= {f"Motive_RB{bid}_Pose_Q{a}" for a in "XYZW"}
-        required |= {f"Motive_RB{bid}_Pose_Received", f"Motive_RB{bid}_Pose_Time_s"}
+        if bid != 3:
+            required |= {f"Motive_RB{bid}_{a}_NED_m" for a in "XYZ"}
+            required |= {f"Motive_RB{bid}_Pose_Q{a}" for a in "XYZW"}
+            required |= {f"Motive_RB{bid}_Pose_Received", f"Motive_RB{bid}_Pose_Time_s"}
+    if source == "motive":
+        required |= {f"Motive_RB3_Pose_Q{a}" for a in "XYZW"}
     for name, _ in TARGETS:
         required |= {f"AR_{name}_Pose_Received", f"AR_{name}_Camera_Pose_Time_s"}
         required |= {f"AR_{name}_PreOffset_{a}_NED_m" for a in "XYZ"}
@@ -75,9 +102,13 @@ def _collect(path, max_gap_s):
     if missing:
         raise ValueError("required log columns missing: " + ", ".join(sorted(missing)))
 
-    histories = {bid: _histories(rows, bid) for bid in (1, 2, 3)}
+    histories = {bid: _histories(rows, bid) for bid in (1, 2)}
+    if source == "motive":
+        histories[3] = _histories(rows, 3)
     records = []
     for row in rows:
+        if row.get("Camera_Orientation_Source") != source:
+            continue
         for name, bid in TARGETS:
             if row.get(f"AR_{name}_Pose_Received") != "1":
                 continue
@@ -85,11 +116,21 @@ def _collect(path, max_gap_s):
                 t = float(row[f"AR_{name}_Camera_Pose_Time_s"])
                 if not math.isfinite(t):
                     continue
-                camera_pose = interpolate_pose(histories[3], t, max_gap_s)
                 target_pose = interpolate_pose(histories[bid], t, max_gap_s)
-                if camera_pose is None or target_pose is None:
+                if target_pose is None:
                     continue
-                _, camera_q = camera_pose
+                if source == "motive":
+                    camera_pose = interpolate_pose(histories[3], t, max_gap_s)
+                    if camera_pose is None:
+                        continue
+                    _, camera_q = camera_pose
+                    camera_q_ned = motive_quaternion_to_ned_xyzw(camera_q)
+                    r_world_camera = (
+                        quaternion_to_rotation_matrix_xyzw(camera_q_ned)
+                        @ MOUNT_CV_TO_BODY_DOWN
+                    )
+                else:
+                    r_world_camera = _pixhawk_camera_rotation(row)
                 target_pos, _ = target_pose
                 ar_pos = _finite_values(
                     row, [f"AR_{name}_PreOffset_{a}_NED_m" for a in "XYZ"]
@@ -98,11 +139,6 @@ def _collect(path, max_gap_s):
                     row, [f"AR_{name}_PreOffset_Q{a}_NED" for a in "XYZW"]
                 )
                 ar_q /= np.linalg.norm(ar_q)
-                camera_q_ned = motive_quaternion_to_ned_xyzw(camera_q)
-                r_world_camera = (
-                    quaternion_to_rotation_matrix_xyzw(camera_q_ned)
-                    @ MOUNT_CV_TO_BODY_DOWN
-                )
                 r_world_ar = quaternion_to_rotation_matrix_xyzw(ar_q)
                 records.append((name.lower(), r_world_camera, r_world_ar,
                                 np.asarray(target_pos) - ar_pos))
@@ -159,6 +195,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("csv_paths", nargs="+", type=Path, help="校正用AR-hook CSV（複数可）")
     parser.add_argument("--output", type=Path, default=Path(__file__).with_name("camera_extrinsics.json"))
+    parser.add_argument("--source", choices=("motive", "ardupilot"), default="motive",
+                        help="CSVを記録した姿勢ソース (motive または Pixhawk IMU の ardupilot)")
     parser.add_argument("--marker-output", type=Path,
                         default=Path(__file__).with_name("marker_pose_offsets.json"),
                         help="カメラ外部オフセットと整合したマーカー姿勢オフセット")
@@ -174,7 +212,8 @@ def main(argv=None):
     if (not math.isfinite(args.max_time_gap_ms) or args.max_time_gap_ms <= 0
             or args.max_rmse_m <= 0 or args.max_offset_norm_m <= 0):
         parser.error("時間差、RMSE上限、オフセット長上限は正の値にしてください")
-    existing = [p for p in (args.output, args.marker_output) if p.exists()]
+    outputs = (args.output, args.marker_output) if args.source == "motive" else (args.output,)
+    existing = [p for p in outputs if p.exists()]
     if existing and not args.force:
         parser.error("既存ファイルを上書きするには --force を指定: "
                      + ", ".join(str(p) for p in existing))
@@ -182,17 +221,18 @@ def main(argv=None):
     marker_samples = {name.lower(): [] for name, _ in TARGETS}
     try:
         for path in args.csv_paths:
-            records.extend(_collect(path, args.max_time_gap_ms / 1000.0))
-            samples, rejected = collect_calibration_samples(
-                path, args.max_time_gap_ms / 1000.0
-            )
-            for name, _ in TARGETS:
-                key = name.lower()
-                marker_samples[key].extend(samples[key])
+            records.extend(_collect(path, args.max_time_gap_ms / 1000.0, args.source))
+            if args.source == "motive":
+                samples, rejected = collect_calibration_samples(
+                    path, args.max_time_gap_ms / 1000.0
+                )
+                for name, _ in TARGETS:
+                    key = name.lower()
+                    marker_samples[key].extend(samples[key])
         active_targets = [name for name, _ in TARGETS
                           if any(record[0] == name.lower() for record in records)]
         if not active_targets:
-            raise ValueError("no valid AR/Motive synchronized target poses found")
+            raise ValueError("選択した姿勢ソースで有効な同期AR/基準姿勢がありません")
         target_columns = {name.lower(): slice(3 + 3 * i, 6 + 3 * i)
                           for i, name in enumerate(active_targets)}
         matrices, vectors = [], []
@@ -204,6 +244,21 @@ def main(argv=None):
             vectors.append(difference)
         solution, count, rmse, condition = _fit(matrices, vectors, args.max_rmse_m)
         offset = solution[:3]
+        # Logged AR world positions already include the currently configured
+        # lever arm, so the fit is a correction relative to that value.
+        if args.output.exists():
+            try:
+                previous = json.loads(args.output.read_text(encoding="utf-8"))
+                profiles = previous.get("profiles", {})
+                previous_profile = profiles.get(args.source)
+                if previous_profile is None and args.source == "motive":
+                    previous_profile = previous
+                if previous_profile:
+                    offset = offset + np.asarray(
+                        previous_profile["camera_optical_offset_cv_m"], dtype=np.float64
+                    ).reshape(3)
+            except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+                pass
         offset_norm = float(np.linalg.norm(offset))
         if offset_norm > args.max_offset_norm_m:
             raise ValueError(
@@ -213,12 +268,24 @@ def main(argv=None):
             )
     except (OSError, UnicodeError, csv.Error, ValueError) as exc:
         parser.error(str(exc))
-    camera_result = {
-        "schema_version": 1,
-        "definition": "Motive camera rigid-body origin to OpenCV optical origin",
+    camera_result = {"schema_version": 2, "profiles": {}}
+    if args.output.exists():
+        try:
+            previous = json.loads(args.output.read_text(encoding="utf-8"))
+            if isinstance(previous.get("profiles"), dict):
+                camera_result["profiles"].update(previous["profiles"])
+            elif "camera_optical_offset_cv_m" in previous:
+                camera_result["profiles"]["motive"] = previous
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            pass
+    camera_result["profiles"][args.source] = {
+        "definition": ("Motive camera rigid-body origin to OpenCV optical origin"
+                       if args.source == "motive" else
+                       "Pixhawk GPS reference to OpenCV optical origin"),
         "camera_optical_offset_cv_m": offset.tolist(),
         "coordinate_frame": "OpenCV camera (x right, y down, z forward)",
         "camera_mount_direction": "down",
+        "orientation_source": args.source,
         "calibrated_targets": active_targets,
         "sample_count": len(matrices),
         "inlier_count": count,
@@ -227,22 +294,23 @@ def main(argv=None):
         "source_csvs": [p.name for p in args.csv_paths],
     }
     marker_transforms = {}
-    for index, name in enumerate(active_targets):
-        schema_name = "hand" if name.lower() == "hand" else "cargo"
-        body_id = dict((key.lower(), value[0]) for key, value in CALIBRATION_TARGETS.items())[name.lower()]
-        if len(marker_samples[schema_name]) < 10:
-            parser.error(f"{schema_name}の姿勢校正サンプルが不足しています")
-        pose_result = _robust_pose_mean(marker_samples[schema_name])
-        translation = solution[3 + 3 * index:6 + 3 * index]
-        marker_transforms[schema_name] = {
-            "motive_rigid_body_id": body_id,
-            "translation_m": translation.tolist(),
-            "quaternion_xyzw": pose_result["quaternion_xyzw"].tolist(),
-            "sample_count": pose_result["sample_count"],
-            "inlier_count": pose_result["inlier_count"],
-            "joint_fit_rmse_m": rmse,
-            "rotation_rmse_deg": pose_result["rotation_rmse_deg"],
-        }
+    if args.source == "motive":
+        for index, name in enumerate(active_targets):
+            schema_name = "hand" if name.lower() == "hand" else "cargo"
+            body_id = dict((key.lower(), value[0]) for key, value in CALIBRATION_TARGETS.items())[name.lower()]
+            if len(marker_samples[schema_name]) < 10:
+                parser.error(f"{schema_name}の姿勢校正サンプルが不足しています")
+            pose_result = _robust_pose_mean(marker_samples[schema_name])
+            translation = solution[3 + 3 * index:6 + 3 * index]
+            marker_transforms[schema_name] = {
+                "motive_rigid_body_id": body_id,
+                "translation_m": translation.tolist(),
+                "quaternion_xyzw": pose_result["quaternion_xyzw"].tolist(),
+                "sample_count": pose_result["sample_count"],
+                "inlier_count": pose_result["inlier_count"],
+                "joint_fit_rmse_m": rmse,
+                "rotation_rmse_deg": pose_result["rotation_rmse_deg"],
+            }
     marker_result = {
         "schema_version": 1,
         "transform_definition": (
@@ -258,11 +326,13 @@ def main(argv=None):
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.marker_output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(camera_result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    args.marker_output.write_text(json.dumps(marker_result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    if args.source == "motive":
+        args.marker_output.write_text(json.dumps(marker_result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"光学中心オフセット: {offset.round(5).tolist()} m (OpenCV camera frame)")
     print(f"inliers={count}/{len(matrices)}, RMSE={rmse:.4f} m, condition={condition:.2f}")
     print(f"保存: {args.output}")
-    print(f"マーカー姿勢オフセット保存: {args.marker_output}")
+    if args.source == "motive":
+        print(f"マーカー姿勢オフセット保存: {args.marker_output}")
     return 0
 
 

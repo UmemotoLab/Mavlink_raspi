@@ -12,10 +12,38 @@ import math
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 import numpy as np
 
 
 MAX_MOTIVE_GAP_S = 0.25
+JAPANESE_FONT_CANDIDATES = (
+    "Yu Gothic",
+    "Yu Gothic UI",
+    "Meiryo",
+    "MS Gothic",
+    "Noto Sans CJK JP",
+    "Noto Sans JP",
+    "IPAexGothic",
+    "IPAGothic",
+    "TakaoGothic",
+)
+
+
+def _configure_plot_font():
+    """Use an installed Japanese font; use English legend labels if none exists."""
+    available = {
+        entry.name.casefold(): entry.name
+        for entry in font_manager.fontManager.ttflist
+    }
+    for candidate in JAPANESE_FONT_CANDIDATES:
+        installed_name = available.get(candidate.casefold())
+        if installed_name:
+            plt.rcParams["font.family"] = installed_name
+            plt.rcParams["axes.unicode_minus"] = False
+            return True
+    plt.rcParams["axes.unicode_minus"] = False
+    return False
 
 
 def _float(row, name):
@@ -106,6 +134,13 @@ def main():
     if args.max_motive_gap <= 0:
         parser.error("--max-motive-gapは正の秒数を指定してください")
 
+    has_japanese_font = _configure_plot_font()
+    if not has_japanese_font:
+        print(
+            "⚠ 日本語フォントが見つからないため、凡例を英語で表示します。"
+            "日本語表示には Yu Gothic / Meiryo / Noto Sans CJK JP などを導入してください。"
+        )
+
     rows, fields = _read_rows(args.csv_file)
     required = {
         "AR_Hand_Pose_Time_s",
@@ -143,10 +178,13 @@ def main():
     motive_cargo = _interpolate_motive(rows, 2, ar_times, args.max_motive_gap)
     motive_relative = motive_hand - motive_cargo
 
+    corrected_label = "AR 補正後" if has_japanese_font else "AR Corrected"
+    pre_offset_label = "AR 補正前" if has_japanese_font else "AR Before Offset"
+    motive_label = "Motive"
     series = {
-        "AR 補正後": ar_corrected,
-        "AR 補正前": ar_pre_offset,
-        "Motive": motive_relative,
+        corrected_label: ar_corrected,
+        pre_offset_label: ar_pre_offset,
+        motive_label: motive_relative,
     }
     time_origin = next(
         (value for value in ar_times if math.isfinite(value)), math.nan
@@ -156,8 +194,8 @@ def main():
     time_s = ar_times - time_origin
 
     fig, axes = plt.subplots(4, 1, figsize=(12, 10), sharex=True, constrained_layout=True)
-    colors = {"AR 補正後": "tab:blue", "AR 補正前": "tab:orange", "Motive": "black"}
-    line_styles = {"AR 補正後": "-", "AR 補正前": "--", "Motive": ":"}
+    colors = {corrected_label: "tab:blue", pre_offset_label: "tab:orange", motive_label: "black"}
+    line_styles = {corrected_label: "-", pre_offset_label: "--", motive_label: ":"}
     axis_labels = ("X / North", "Y / East", "Z / Down")
     for column, axis_label in enumerate(axis_labels):
         axis = axes[column]
