@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import os,sys,select,time,math,threading,termios,tty,csv,datetime,signal
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from bisect import bisect_right
 from collections import deque
@@ -127,6 +128,9 @@ CSV_DIR.mkdir(exist_ok=True)
 # ───── カメラ向きソース設定 ─────
 # "motive" = Motive rigid body (デフォルト), "ardupilot" = ArduPilot磁気センサー(IMU姿勢)
 CAMERA_ORIENTATION_SOURCE = "motive"
+CAMERA_STREAM_PORT = 8765
+_camera_stream_lock = threading.Lock()
+_camera_stream_jpeg = None
 # ───── 状態変数 ─────
 running = True
 recording = True  # ← 常に記録
@@ -1141,7 +1145,61 @@ def monitor_vehicle(m):
                 print(f"✓ 離陸高度到達: {target['z']:.2f}m")
         time.sleep(1 / SEND_HZ)
 # ───── バックグラウンド・カメラ追跡スレッド ─────
-def camera_tracker_loop(m, show_window=False):
+def start_camera_stream_server(port=CAMERA_STREAM_PORT):
+    """Serve the latest annotated camera frame on loopback for SSH tunneling."""
+    class CameraStreamHandler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/":
+                page = (
+                    "<!doctype html><html><head><meta charset='utf-8'>"
+                    "<title>AR-hook camera</title></head><body style='margin:0;background:#111'>"
+                    "<img src='/stream.mjpg' style='width:100%;height:auto'>"
+                    "</body></html>"
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(page)))
+                self.end_headers()
+                self.wfile.write(page)
+                return
+            if self.path != "/stream.mjpg":
+                self.send_error(404)
+                return
+
+            self.send_response(200)
+            self.send_header(
+                "Content-Type", "multipart/x-mixed-replace; boundary=frame"
+            )
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.end_headers()
+            try:
+                while running:
+                    with _camera_stream_lock:
+                        frame = _camera_stream_jpeg
+                    if frame is None:
+                        time.sleep(0.05)
+                        continue
+                    self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\n")
+                    self.wfile.write(
+                        f"Content-Length: {len(frame)}\r\n\r\n".encode("ascii")
+                    )
+                    self.wfile.write(frame)
+                    self.wfile.write(b"\r\n")
+                    self.wfile.flush()
+                    time.sleep(0.08)
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", int(port)), CameraStreamHandler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def camera_tracker_loop(m, show_window=False, stream_enabled=False):
     global running, target, gps_now, current_yaw_deg, initial_target_set, guided_mode_active
     global last_center_cam, last_rvec_cargo
     global cargo_center_world, cargo_detected, id1_detected
@@ -1150,6 +1208,7 @@ def camera_tracker_loop(m, show_window=False):
     global cargo_cam_raw, hand_cam_raw, motive_cargo_cam, motive_hand_cam
     global ar_hand_attitude_cam, ar_hand_attitude_world
     global _coord_source_log
+    global _camera_stream_jpeg
     
     print(f"カメラ初期化中（解像度: {CAMERA_WIDTH}x{CAMERA_HEIGHT}）...")
     picam2 = None
@@ -1243,6 +1302,7 @@ def camera_tracker_loop(m, show_window=False):
     previous_ar_attitude_world = None
     warned_missing_sensor_timestamp = False
     last_camera_pose_match_warning = 0.0
+    last_stream_frame_time = 0.0
     try:
         while running:
             ar_cargo_ned = None
@@ -1869,8 +1929,8 @@ def camera_tracker_loop(m, show_window=False):
                 fps_window_started = now
                 fps_frame_count = 0
 
-            # 表示が許可されていればウィンドウ表示
-            if show_window:
+            # Local window and/or SSH browser stream share the annotated frame.
+            if show_window or stream_enabled:
                 display = img.copy()
                 if ids is not None:
                     display = aruco.drawDetectedMarkers(display, corners, ids)
@@ -1920,25 +1980,40 @@ def camera_tracker_loop(m, show_window=False):
                         else:
                             cv2.putText(display, "ID1 Rel to Center: N/A (ID1 invisible)", (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, lineType=cv2.LINE_AA)
 
-                if video_writer is None:
-                    # ディスプレイ用にウィンドウの設定を行う (1640x1232は大きいため縮小表示)
-                    cv2.namedWindow("AR Camera", cv2.WINDOW_NORMAL)
-                    cv2.resizeWindow("AR Camera", 820, 616)
-                    
-                    height, width = display.shape[:2]
-                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                    now_str = datetime.datetime.now(pytz.timezone("Asia/Tokyo")).strftime("%Y%m%d_%H%M%S")
-                    video_path = CSV_DIR / f"{now_str}_video.mp4"
-                    video_writer = cv2.VideoWriter(
-                        str(video_path), fourcc, float(AR_MEASUREMENT_FPS), (width, height)
+                if stream_enabled and now - last_stream_frame_time >= 0.1:
+                    stream_img = cv2.resize(
+                        display, (820, 616), interpolation=cv2.INTER_AREA
                     )
-                    print(f"✓ ビデオ録画を開始しました: {video_path}")
-                video_writer.write(display)
+                    encoded, jpeg = cv2.imencode(
+                        ".jpg",
+                        stream_img,
+                        [int(cv2.IMWRITE_JPEG_QUALITY), 75],
+                    )
+                    if encoded:
+                        with _camera_stream_lock:
+                            _camera_stream_jpeg = jpeg.tobytes()
+                    last_stream_frame_time = now
 
-                cv2.imshow("AR Camera", display)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    running = False
-                    break
+                if show_window:
+                    if video_writer is None:
+                        # ディスプレイ用にウィンドウの設定を行う
+                        cv2.namedWindow("AR Camera", cv2.WINDOW_NORMAL)
+                        cv2.resizeWindow("AR Camera", 820, 616)
+
+                        height, width = display.shape[:2]
+                        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                        now_str = datetime.datetime.now(pytz.timezone("Asia/Tokyo")).strftime("%Y%m%d_%H%M%S")
+                        video_path = CSV_DIR / f"{now_str}_video.mp4"
+                        video_writer = cv2.VideoWriter(
+                            str(video_path), fourcc, float(AR_MEASUREMENT_FPS), (width, height)
+                        )
+                        print(f"✓ ビデオ録画を開始しました: {video_path}")
+                    video_writer.write(display)
+
+                    cv2.imshow("AR Camera", display)
+                    if cv2.waitKey(1) & 0xFF == ord('q'):
+                        running = False
+                        break
 
     finally:
         print("カメラ追跡スレッドを終了し、カメラを解放します...")
@@ -2233,6 +2308,7 @@ def save_csv():
 # ───── メイン関数 ─────
 def main():
     global running
+    stream_server = None
     print("="*50)
     print("ArduPilot 精密制御 - 下向きカメラ用 (ID1センサ利用)")
     print("="*50)
@@ -2267,21 +2343,45 @@ def main():
             target=motive_rigid_body_pose_udp_listener, daemon=True
         ).start()
 
-        # 起動時にカメラ映像表示の有無を選択
-        choice = input_with_timeout("カメラ映像を表示しますか？ 1:表示 2:非表示 (デフォルト2): ", timeout=15, default='2')
-        show_camera_window = (choice.strip() == '1')
+        # ローカル表示またはSSHブラウザ配信を選択
+        choice = input_with_timeout(
+            "カメラ映像 1:本体画面 2:なし 3:SSH先のブラウザ (デフォルト2): ",
+            timeout=15,
+            default='2',
+        )
+        show_camera_window = choice.strip() == '1'
+        stream_camera = choice.strip() == '3'
+        if stream_camera:
+            try:
+                stream_server = start_camera_stream_server()
+                print(
+                    f"✓ SSH映像配信を開始しました (Pi内: http://127.0.0.1:{CAMERA_STREAM_PORT})"
+                )
+                print(
+                    "PC側でSSHポート転送を設定し、ブラウザで同じURLを開いてください。"
+                )
+                print(
+                    f"例: ssh -L {CAMERA_STREAM_PORT}:127.0.0.1:{CAMERA_STREAM_PORT} "
+                    "<ユーザー名>@<Piのアドレス>"
+                )
+            except OSError as exc:
+                stream_camera = False
+                print(f"⚠ SSH映像配信を開始できません ({exc})")
         
         # コントロールループをサブスレッドで起動 (キー入力を別スレッドに逃がす)
         control_thread = threading.Thread(target=control_loop, args=(mav,), daemon=False)
         control_thread.start()
         
         # カメラ追跡ループをメインスレッドで実行 (OpenCV GUI of main thread workaround)
-        camera_tracker_loop(mav, show_camera_window)
+        camera_tracker_loop(mav, show_camera_window, stream_camera)
         
     except KeyboardInterrupt:
         print("\n⚠ ユーザーによる強制終了 (Ctrl+C) を検出しました。")
     finally:
         running = False
+        if stream_server is not None:
+            stream_server.shutdown()
+            stream_server.server_close()
         # コントロールスレッドの終了待機
         if 'control_thread' in locals() and control_thread.is_alive():
             control_thread.join()
