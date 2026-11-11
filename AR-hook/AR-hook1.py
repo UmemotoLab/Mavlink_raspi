@@ -1427,6 +1427,7 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
             dist_x, dist_y, dist_z = float('nan'), float('nan'), float('nan')
             center_cam = None
             rvec_cargo = None
+            raw_rvec_cargo = None
             id1_cam = None
             id1_rvec_cam = None
             raw_id1_cam = None
@@ -1479,6 +1480,7 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                     if success:
                         center_cam = tvec_sol.reshape(3)
                         rvec_cargo = rvec_sol.reshape(3)
+                        raw_rvec_cargo = rvec_cargo.copy()
                         last_center_cam = center_cam
                         last_rvec_cargo = rvec_cargo
                         has_cargo = True
@@ -1487,6 +1489,7 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                     if id1_cam is not None and last_center_cam is not None and last_rvec_cargo is not None:
                         center_cam = last_center_cam
                         rvec_cargo = last_rvec_cargo
+                        raw_rvec_cargo = rvec_cargo.copy()
                         used_last_center = True
                         has_cargo = True
 
@@ -1935,25 +1938,44 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                 if ids is not None:
                     display = aruco.drawDetectedMarkers(display, corners, ids)
                     
-                    if has_cargo and center_cam is not None and rvec_cargo is not None:
-                        # 1. 中心位置の投影と描画 (緑の丸)
+                    # ID1の検出姿勢（オフセット適用前）を軸で表示する。
+                    if has_id1 and raw_id1_cam is not None and id1_rvec_cam is not None:
+                        try:
+                            cv2.drawFrameAxes(
+                                display, camera_matrix, distortion_coeff,
+                                id1_rvec_cam, raw_id1_cam, MARKER_SIZE * 1.5
+                            )
+                        except AttributeError:
+                            try:
+                                cv2.aruco.drawAxis(
+                                    display, camera_matrix, distortion_coeff,
+                                    id1_rvec_cam, raw_id1_cam, MARKER_SIZE * 1.5
+                                )
+                            except AttributeError:
+                                pass
+
+                    if has_cargo and raw_center_cam is not None and raw_rvec_cargo is not None:
+                        # Cargo中心と軸はオフセット適用前のPnP推定値を表示する。
                         center_pts_3d = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
                         center_img_pts, _ = cv2.projectPoints(
-                            center_pts_3d, rvec_cargo, center_cam, camera_matrix, distortion_coeff
+                            center_pts_3d, raw_rvec_cargo, raw_center_cam, camera_matrix, distortion_coeff
                         )
                         center_pixel = tuple(center_img_pts[0][0].astype(int))
                         cv2.circle(display, center_pixel, 8, (0, 255, 0), 2, lineType=cv2.LINE_AA)
                         cv2.circle(display, center_pixel, 2, (0, 255, 0), -1, lineType=cv2.LINE_AA)
-                        cv2.putText(display, f"Cargo Center (px): ({cargo_center_cam_x:.1f}, {cargo_center_cam_y:.1f})", 
+                        H, W = img.shape[:2]
+                        display_dx = center_pixel[0] - W // 2
+                        display_dy = center_pixel[1] - H // 2
+                        cv2.putText(display, f"Cargo Center PRE-offset (px): ({display_dx}, {display_dy})", 
                                     (center_pixel[0] + 10, center_pixel[1] - 10),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
 
                         # 2. 座標系の描画 (X:赤, Y:緑, Z:青)
                         try:
-                            cv2.drawFrameAxes(display, camera_matrix, distortion_coeff, rvec_cargo, center_cam, SQUARE_SIDE)
+                            cv2.drawFrameAxes(display, camera_matrix, distortion_coeff, raw_rvec_cargo, raw_center_cam, SQUARE_SIDE)
                         except AttributeError:
                             try:
-                                cv2.aruco.drawAxis(display, camera_matrix, distortion_coeff, rvec_cargo, center_cam, SQUARE_SIDE)
+                                cv2.aruco.drawAxis(display, camera_matrix, distortion_coeff, raw_rvec_cargo, raw_center_cam, SQUARE_SIDE)
                             except AttributeError:
                                 pass
 
@@ -1966,7 +1988,7 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                                 [-HALF_SIDE, -HALF_SIDE, 0.0]
                             ], dtype=np.float32)
                             square_img_pts, _ = cv2.projectPoints(
-                                square_pts_3d, rvec_cargo, center_cam, camera_matrix, distortion_coeff
+                                square_pts_3d, raw_rvec_cargo, raw_center_cam, camera_matrix, distortion_coeff
                             )
                             pts_2d = square_img_pts.reshape(-1, 2).astype(np.int32)
                             cv2.polylines(display, [pts_2d], isClosed=True, color=(0, 165, 255), thickness=2, lineType=cv2.LINE_AA)
