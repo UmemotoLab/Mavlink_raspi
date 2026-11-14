@@ -1,7 +1,8 @@
 """setup_RTK_V2: ekf-V2対応の全ArduPilot設定ツール（RTK運用 / 屋外）。
 
 完全プロファイル: EKF/setup_EKF_Observer5.py とキー集合一致の157項目。
-値差分はGPS/CAN/コンパス方位の9項目のみで、それ以外のキーは値・型が同一である。
+値差分はGPS/CAN/コンパス方位の9項目 + PSCゲイン2項目（PSC_NE_POS_P、PSC_D_VEL_D）の
+計11項目のみで、それ以外のキーは値・型が同一である。
 交互実行時はObserver5と本スクリプトを入れ替えるだけで切替えできる
 （GPS1_TYPE 9、GPS2_TYPE 0、CAN1、GPS_INJECT_TO 127、SERIAL1_BAUD 1000000）。
 基準パラメータファイルは
@@ -31,6 +32,10 @@ base_mode で armed を確認し、armed なら中止する（--force 指定時�
 FCはPARAM_SET時に自動保存するため明示保存コマンドは送らない。PARAM_REQUEST_LIST の
 キャッシュ照合 + 総時間上限で高速に検証する。電源再投入後の保持は未検証。
 通信喪失・武装・再起動・工場初期化は行わない。
+/dev/ttyAMA0 (TELEM1) は mavlink-bridge.service が常時開いているため、UART 接続時は
+実行中だけブリッジを停止し、終了時（正常終了・例外・Ctrl+C）に自動再起動する
+（--no-stop-bridge で無効化。--stop-bridge は互換用）。USB 接続時はブリッジに触れない。
+ブリッジの停止/復帰は接続制御のみで、本スクリプトが扱うパラメータ値は変更しない。
 接続先は既定で /dev/ttyACM0（無ければ /dev/ttyAMA0）を自動選択し、対話入力はしない。
 UART を明示する場合は --uart（= --device uart）、USB は --usb（= --device usb）。
 UART の baud はプロファイルの SERIAL1_BAUD に追従する（--baud-uart で診断用に上書き可）。
@@ -41,10 +46,13 @@ GPS1_CAN_NODEID は実機が124でRTK Fix運用中のため差分書き込みで
 --only GPS1_CAN_NODEID を明示した場合のみ書く）。"""
 
 from pymavlink import mavutil
+import atexit
+import os
+import signal
+import subprocess
 import time
 import sys
 import argparse
-import os
 
 # ================================
 # 設定セクション
@@ -73,6 +81,10 @@ parser.add_argument("--usb", action="store_true", help="same as --device usb")
 parser.add_argument("--baud-usb", type=int, default=115200)
 parser.add_argument("--baud-uart", type=int, default=None,
                     help="UART baud (default: profile SERIAL1_BAUD)")
+parser.add_argument("--stop-bridge", action="store_true",
+                    help="(互換用) 既定で自動停止するため指定不要")
+parser.add_argument("--no-stop-bridge", action="store_true",
+                    help="mavlink-bridge.service を自動停止しない（使用中ならエラー終了）")
 parser.add_argument("--heartbeat-timeout", type=float, default=15.0,
                     help="heartbeat wait timeout [s]")
 parser.add_argument("--verify-budget", type=float, default=60.0, help="verify phase total budget [s]")
@@ -86,6 +98,8 @@ if args.uart:
 if args.usb:
     args.device = "usb"
 WRITE_MODE = not args.check
+# /dev/ttyAMA0 を掴んでいる mavlink-bridge は既定で一時停止し、終了時に自動復帰する
+AUTO_STOP_BRIDGE = not args.no_stop_bridge
 
 # 振り子周波数の計算
 import math
@@ -353,7 +367,129 @@ MAV_PARAM_TYPE_MAP = {
 }
 
 # ================================
-# 接続
+# mavlink-bridge の一時停止 / 自動復帰
+# ================================
+# この Pi では mavlink-bridge.service が /dev/ttyAMA0 を常時開いている。
+# 同じ tty を 2 プロセスで読むと BAD_DATA / SerialException になるため、
+# UART 接続時は実行中だけ停止し、終了時 (atexit / SIGINT / SIGTERM) に再起動する。
+# SIGKILL 等で強制終了された場合だけ手動復帰が必要。
+
+BRIDGE_SERVICE = "mavlink-bridge"
+_bridge_stopped = False
+
+
+def find_port_holders(dev):
+    """dev を開いているプロセスを /proc から列挙する（同一ユーザー権限で見える範囲）。"""
+    target = os.path.realpath(dev)
+    holders = []
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        fd_dir = f"/proc/{pid}/fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.path.realpath(os.path.join(fd_dir, fd)) != target:
+                    continue
+            except OSError:
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmd = f.read().replace(b"\x00", b" ").decode(errors="replace").strip()
+            except OSError:
+                cmd = "?"
+            holders.append((pid, cmd))
+            break
+    return holders
+
+
+def _sudo_systemctl(action):
+    """sudo systemctl <action> mavlink-bridge を実行（パスワード不要なら -n で先に試す）。"""
+    for cmd in (["sudo", "-n", "systemctl", action, BRIDGE_SERVICE],
+                ["sudo", "systemctl", action, BRIDGE_SERVICE]):
+        try:
+            result = subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL)
+        except FileNotFoundError:
+            print("  ⚠ systemctl が見つかりません（systemd 以外の環境？）")
+            return False
+        if result.returncode == 0:
+            return True
+    return False
+
+
+def _on_terminate(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
+def restore_bridge():
+    """停止した mavlink-bridge を再起動する（atexit から呼ばれる）。"""
+    global _bridge_stopped
+    if not _bridge_stopped:
+        return
+    print(f"\n{BRIDGE_SERVICE} を再起動します...")
+    if _sudo_systemctl("start"):
+        print(f"  ✅ {BRIDGE_SERVICE} を再起動しました")
+    else:
+        print(f"  ❌ {BRIDGE_SERVICE} を再起動できませんでした。手動で実行してください: "
+              f"sudo systemctl start {BRIDGE_SERVICE}")
+    _bridge_stopped = False
+
+
+def stop_bridge_temporarily(dev, wait_s=5.0):
+    """dev を掴んでいる mavlink-bridge を停止し、終了時に自動復帰するよう登録する。"""
+    global _bridge_stopped
+    print(f"  {BRIDGE_SERVICE} を一時停止します（終了時に自動再起動）")
+    if not _sudo_systemctl("stop"):
+        print(f"  ❌ {BRIDGE_SERVICE} を停止できませんでした（sudo 権限を確認してください）")
+        return False
+    _bridge_stopped = True
+    atexit.register(restore_bridge)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _on_terminate)
+        except (ValueError, OSError):
+            pass
+
+    t0 = time.time()
+    while time.time() - t0 < wait_s:
+        if not find_port_holders(dev):
+            print(f"  ✅ {dev} を解放しました")
+            return True
+        time.sleep(0.2)
+    print(f"  ⚠ {dev} がまだ解放されていません（このまま続行します）")
+    return True
+
+
+def release_serial_port(dev):
+    """dev が使用中なら、ブリッジ停止の可否を判断して必要なら停止する。
+
+    戻り値: True=続行可 / False=中止（呼び出し側で exit）
+    """
+    holders = find_port_holders(dev)
+    if not holders:
+        return True
+
+    is_bridge = any("mavlink_bridge.py" in cmd for _pid, cmd in holders)
+    if is_bridge and AUTO_STOP_BRIDGE:
+        print(f"ℹ️  {dev} は {BRIDGE_SERVICE} が使用中です:")
+        for pid, cmd in holders:
+            print(f"   - PID {pid}: {cmd}")
+        return stop_bridge_temporarily(dev)
+
+    print(f"❌ {dev} は次のプロセスが使用中です:")
+    for pid, cmd in holders:
+        print(f"   - PID {pid}: {cmd}")
+    if is_bridge:
+        print("   ヒント: --no-stop-bridge を外すと、実行中だけ自動停止して終了時に復帰します。")
+        print("           手動の場合は sudo systemctl stop mavlink-bridge（後に start で戻す）。")
+    else:
+        print("   ヒント: 他のプロセスを終了してから再実行してください。")
+    return False
+
+
+# ================================
+# 接続先の決定
 # ================================
 
 # 既定の UART（TELEM1）デバイス。Pi5 + uart0-pi5,ctsrts 構成。
@@ -399,12 +535,31 @@ UART_BAUD = int(params_to_set['SERIAL1_BAUD'][0])
 if args.baud_uart is not None:
     UART_BAUD = args.baud_uart
 dev, baud, rts = resolve_connection(args.device, args.baud_usb, UART_BAUD)
-master = mavutil.mavlink_connection(dev, baud=baud, rtscts=rts)
+
+# /dev/ttyAMA0 (TELEM1) は mavlink-bridge.service が常時開いている。
+# 競合すると BAD_DATA / SerialException になるため、既定で一時停止し、終了時に自動復帰する。
+if dev.startswith("/dev/") and os.path.exists(dev):
+    if not release_serial_port(dev):
+        sys.exit(2)
+
+try:
+    master = mavutil.mavlink_connection(dev, baud=baud, rtscts=rts)
+except Exception as e:
+    print(f"❌ {dev} を開けません: {e}")
+    print("   ヒント: 配線・電源・baud を確認してください。")
+    sys.exit(1)
 
 # ハートビート確認（無応答で無限に待たず、原因の切り分けを表示する）
 print(f"接続先: {dev} ({baud} bps)")
 print("接続を待機中...")
-if master.wait_heartbeat(timeout=args.heartbeat_timeout) is None:
+try:
+    heartbeat = master.wait_heartbeat(timeout=args.heartbeat_timeout)
+except Exception as e:
+    print(f"❌ ハートビート受信前に通信が切断されました: {e}")
+    print("   ヒント: 別プロセスが同じポートを開いていないか確認してください。")
+    sys.exit(1)
+
+if heartbeat is None:
     print(f"❌ ハートビートを受信できませんでした（{dev} @ {baud} bps, {args.heartbeat_timeout:.0f}s）。")
     try:
         waiting = master.port.in_waiting

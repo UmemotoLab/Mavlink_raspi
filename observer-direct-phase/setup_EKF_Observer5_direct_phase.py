@@ -1,30 +1,42 @@
 """
-Observer5: 現行ファーム向け EKF Observer パラメータ設定スクリプト.
+Observer5 (direct-phase): 実験用ファームウェア向け EKF Observer パラメータ設定スクリプト.
 
-由来: EKF/setup_EKF_Observer4.py のコピー（Observer4 は EKF/archive/ へ移動）。
-変更点: 現行ファームで名称変更された旧名 26 件を新名に置換し、SI単位化
+現行の実験ファームは OBS_PRED_TIME を持たず、代わりに OBS_PHASE_RLL /
+OBS_PHASE_PIT（高調波力推定の位相進み [deg]）を持つ direct-phase 版である。
+2026-11-14 時点の実機（1051 パラメータ）と本プロファイル 158 項目は 158/158 一致。
+
+由来: EKF/setup_EKF_Observer5.py（OBS_PRED_TIME 時代＝前ファーム向け。こちらは保留）。
+変更点: 前ファームで名称変更された旧名 26 件を新名に置換し、SI単位化
 (WP/PILOT/PSC/LOIT/RTL) とスケール変更 (PSC_D_ACC_*, OBS_EKF_Q_*) を live/param
 照合値に合わせ、live 型不一致 12 件を修正した。不在旧名は事前除外し、
 単発読み直しをやめて PARAM_REQUEST_LIST のキャッシュ照合 + 総時間上限で
 高速に検証する。既定は書き込み（引数なしで書き込む）で、--check は読み取り専用。
 書き込みは RTK/setup_RTK_V2.py と同じ設計で、既定では「実機の値と違う項目だけ」に絞り、
-157項目の無条件書き込みを避ける（--write-all で全項目、--only / --skip で個別指定）。
+158項目の無条件書き込みを避ける（--write-all で全項目、--only / --skip で個別指定）。
 書き込み前に HEARTBEAT の base_mode で armed を確認し、armed なら中止する
 （--force 指定時のみ続行）。PARAM_SET時にFCが自動保存するため明示保存コマンドは
 送らない。電源再投入後の保持は未検証。終了コードは 0=成功 / 1=不一致 / 2=中止。
-完全プロファイル: RTK/setup_RTK_V2.py とキー集合一致の157項目。値差分は
-GPS/CAN/コンパス方位の9項目のみで、交互実行時は本スクリプトとRTK V2を
-入れ替えるだけで切替えできる（GPS1_TYPE 14、GPS2_TYPE 0、CAN無効、
-GPS_INJECT_TO 0、SERIAL1_BAUD 1000000）。
 
-実行方法:
-    cd EKF && uv run --frozen python setup_EKF_Observer5.py          # 既定: 書き込み
-    cd EKF && uv run --frozen python setup_EKF_Observer5.py --check  # 読み取り専用
-    cd EKF && ./run_observer5.sh                                     # ラッパー経由（同じ）
-    cd リポジトリルート && uv run EKF/setup_EKF_Observer5.py
+プロファイル関係:
+- EKF/setup_EKF_Observer5.py（前ファーム用, 157項目）とは、OBS_PRED_TIME（EKF版のみ）
+  ↔ OBS_PHASE_RLL / OBS_PHASE_PIT（本版のみ）のキー差し替え1組のみ。
+  共通156項目の値は同一（OBS_EKF_Q_* の表記差は float32 丸めで、1e-4 許容判定では同値）。
+- RTK/setup_RTK_V2.py（157項目）とはキー差し替えに加えて値差分11項目
+  （GPS/CAN 5 + コンパス方位 4 + PSC_NE_POS_P 5.0 vs 1.0 / PSC_D_VEL_D 0.01 vs 0.015）。
+  RTK V2 はまだ OBS_PRED_TIME 名のため、現ファームでは同項目が「保留」になる。
+
+実行方法（このディレクトリに uv 環境が完結している）:
+    cd observer-direct-phase
+    uv run --frozen python setup_EKF_Observer5_direct_phase.py          # 既定: 差分のみ書き込み
+    uv run --frozen python setup_EKF_Observer5_direct_phase.py --check  # 読み取り専用
+    uv run --frozen python setup_EKF_Observer5_direct_phase.py --only OBS_PHASE_RLL
 
 既定では /dev/ttyAMA0 を掴んでいる mavlink-bridge.service を自動で一時停止し、
 終了時（正常終了・例外・Ctrl+C）に再起動する。止めたくない場合は --no-stop-bridge。
+
+接続先: USB (/dev/ttyACM0) があれば非対話実行でも USB を優先する（--baud-usb 既定 115200）。
+TELEM1 を明示する場合は --device /dev/ttyAMA0（baud は SERIAL1_BAUD = 1,000,000 に追従）。
+USB 接続時はブリッジを止めずにそのまま実行できる。
 
 pymavlink は PyPI 公式版を uv.lock で固定して使う（起動時に版とパスを表示する）。
 """

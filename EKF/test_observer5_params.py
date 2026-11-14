@@ -11,7 +11,8 @@ live-scan evidence (/tmp/live_scan.txt):
 6. No MAV_CMD_PREFLIGHT_STORAGE explicit-save command remains.
 7. No misleading EEPROM-saved/persisted success message remains.
 8. Complete profile: 157 items with key set identical to RTK/setup_RTK_V2.py;
-   value diff limited to 9 GPS/CAN/compass items. Observer side asserts
+   value diff limited to 11 items = 9 GPS/CAN/compass/yaw items + 2 PSC gains
+   (PSC_NE_POS_P, PSC_D_VEL_D). Observer side asserts
    GPS1_TYPE 14 / GPS2_TYPE 0 / CAN0 / RTCM注入0 / SERIAL1_BAUD 1000000.
 9. Connection baud follows the profile: the /dev/ttyAMA0 (TELEM1) path derives
    its baud from params_to_set['SERIAL1_BAUD'], and no literal baud is left in
@@ -88,9 +89,11 @@ def load_params_path(path):
     raise AssertionError(f"params_to_set not found in {path}")
 
 
-EXPECTED_DIFF9 = {"GPS1_TYPE", "GPS1_CAN_NODEID", "GPS_INJECT_TO",
-                  "CAN_P1_DRIVER", "CAN_D1_PROTOCOL", "COMPASS_USE",
-                  "COMPASS_USE2", "COMPASS_LEARN", "EK3_SRC1_YAW"}
+EXPECTED_DIFF = {"GPS1_TYPE", "GPS1_CAN_NODEID", "GPS_INJECT_TO",
+                 "CAN_P1_DRIVER", "CAN_D1_PROTOCOL", "COMPASS_USE",
+                 "COMPASS_USE2", "COMPASS_LEARN", "EK3_SRC1_YAW",
+                 # Observer専用のPSCゲイン（RTK V2は PSC_NE_POS_P=1.0 / PSC_D_VEL_D=0.015）
+                 "PSC_NE_POS_P", "PSC_D_VEL_D"}
 
 
 def load_v2():
@@ -206,7 +209,7 @@ def test_complete_profile_keys_match_rtk_v2():
         f"key set mismatch: only obs={sorted(set(obs) - set(rtk))} "
         f"only rtk={sorted(set(rtk) - set(obs))}")
     diff = sorted(n for n in obs if obs[n][:2] != rtk[n][:2])
-    assert diff == sorted(EXPECTED_DIFF9), f"value diff not limited to 9: {diff}"
+    assert diff == sorted(EXPECTED_DIFF), f"value diff not limited to 11: {diff}"
 
 
 def test_observer_profile_values():

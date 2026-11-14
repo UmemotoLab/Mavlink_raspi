@@ -1,10 +1,11 @@
 """Focused test for RTK/setup_RTK_V2.py (no hardware needed).
 
 Complete profile: 157 items with key set identical to
-EKF/setup_EKF_Observer5.py; value diff limited to 9 GPS/CAN/compass items.
+EKF/setup_EKF_Observer5.py; value diff limited to 11 items
+(9 GPS/CAN/compass/yaw items + 2 PSC gains).
 Checks against RTK/archive/setup_RTK_V1.py (DroneCAN + 外付コンパス2方位の正典)
 and /home/taki/Downloads/Full-Params_ekf_V2.param:
-1. Key sets match Observer5 (157); diff limited to 9 declared items.
+1. Key sets match Observer5 (157); diff limited to 11 declared items.
 2. RTK profile values: GPS1_TYPE 9 / GPS2_TYPE 0 / CAN1 / 注入127,
    SERIAL1_BAUD 1000000 (both profiles), YAW1 + USE0/USE2=1/LEARN0.
 3. Safety trio maintained: GPS_AUTO_CONFIG=0, GPS_SAVE_CFG=0, GPS1_GNSS_MODE=0.
@@ -30,12 +31,16 @@ and /home/taki/Downloads/Full-Params_ekf_V2.param:
 15. Connection baud follows the profile: the /dev/ttyAMA0 (TELEM1) path derives
     its baud from params_to_set['SERIAL1_BAUD'], and no literal baud is left in
     the connection block.
+16. UART connection stops mavlink-bridge for the duration of the run and
+    restores it on exit (atexit / SIGINT / SIGTERM); --no-stop-bridge disables.
+    Param values are untouched by this mechanism.
 """
 import ast
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 
 REPO = os.path.dirname(os.path.abspath(__file__))
@@ -85,6 +90,16 @@ def load_resolve_connection():
     return ns["resolve_connection"]
 
 
+def load_bridge_helpers():
+    """Exec only the bridge port-holder helper (no MAVLink connection)."""
+    src = open(RTKV2, encoding="utf-8").read()
+    m = re.search(r"(def find_port_holders.*?)(?=\n\n\n# ===+)", src, re.S)
+    assert m, "bridge helpers not found"
+    ns = {"os": os, "time": time}
+    exec(m.group(1), ns)
+    return ns["find_port_holders"]
+
+
 def load_target_fns():
     """Exec only the pure write-target helpers (no MAVLink connection)."""
     src = open(RTKV2, encoding="utf-8").read()
@@ -95,10 +110,12 @@ def load_target_fns():
     return ns["select_write_targets"], ns["parse_param_list"]
 
 
-# Complete profile: identical key sets, diff limited to 9 GPS/CAN/compass items.
-EXPECTED_DIFF9 = {"GPS1_TYPE", "GPS1_CAN_NODEID", "GPS_INJECT_TO",
-                  "CAN_P1_DRIVER", "CAN_D1_PROTOCOL", "COMPASS_USE",
-                  "COMPASS_USE2", "COMPASS_LEARN", "EK3_SRC1_YAW"}
+# Complete profile: identical key sets, diff limited to 11 items
+# (9 GPS/CAN/compass/yaw items + 2 PSC gains tuned differently for Observer).
+EXPECTED_DIFF = {"GPS1_TYPE", "GPS1_CAN_NODEID", "GPS_INJECT_TO",
+                 "CAN_P1_DRIVER", "CAN_D1_PROTOCOL", "COMPASS_USE",
+                 "COMPASS_USE2", "COMPASS_LEARN", "EK3_SRC1_YAW",
+                 "PSC_NE_POS_P", "PSC_D_VEL_D"}
 
 
 def test_keys_match_observer5_and_diff_limited():
@@ -110,7 +127,7 @@ def test_keys_match_observer5_and_diff_limited():
         f"key set mismatch: only obs={sorted(set(base) - set(v2))} "
         f"only rtk={sorted(set(v2) - set(base))}")
     diff = sorted(n for n in base if v2[n][:2] != base[n][:2])
-    assert diff == sorted(EXPECTED_DIFF9), f"value diff not limited to 9: {diff}"
+    assert diff == sorted(EXPECTED_DIFF), f"value diff not limited to 11: {diff}"
 
 
 def test_rtk_profile_values():
@@ -215,8 +232,17 @@ def test_no_gcs_rtk_tools_calls():
     )
     body = re.sub(r"#.*", "", body)
     for token in ("rtk_tools", "rtcm_injector", "gcs/ops", "gcs.ops",
-                  "from gcs", "import gcs", "subprocess", "os.system"):
+                  "from gcs", "import gcs", "os.system"):
         assert token not in body, f"direct call reference remains: {token}"
+    # subprocess は mavlink-bridge の systemctl 制御 (_sudo_systemctl) だけに限定する。
+    # GCS/RTK パイプラインの外部呼び出しに使われていないことを関数単位で確認する。
+    users = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            seg = ast.get_source_segment(src, node) or ""
+            if "subprocess" in seg:
+                users.add(node.name)
+    assert users <= {"_sudo_systemctl"}, f"unexpected subprocess use: {sorted(users)}"
 
 
 def test_injector_archived():
@@ -332,6 +358,40 @@ def test_dated_confirmation_todo_present():
     assert "2026-10-17" in src, "日付入り確認TODOがない"
     assert "YAW1" in src and "USE2" in src and "LEARN0" in src, "方位確認TODOの内容がない"
     assert "SERIAL1_BAUD 1000000" in src, "ボーレート確認TODOがない"
+
+
+def test_uart_stops_bridge_and_restores():
+    """UART 接続時は mavlink-bridge を一時停止し、終了時に自動復帰する実装であること。"""
+    src = open(RTKV2, encoding="utf-8").read()
+    assert "AUTO_STOP_BRIDGE = not args.no_stop_bridge" in src, "自動停止の既定が無効"
+    for token in ("def find_port_holders(", "def stop_bridge_temporarily(",
+                  "def restore_bridge(", "atexit.register(restore_bridge)",
+                  "signal.SIGINT", "release_serial_port(dev)",
+                  '"--stop-bridge"', '"--no-stop-bridge"'):
+        assert token in src, f"{token} がない"
+    # 接続（mavlink_connection）より前にポート解放処理を呼ぶ
+    assert src.index("release_serial_port(dev)") < src.index(
+        "master = mavutil.mavlink_connection("), "接続前の解放処理がない"
+    # パラメータ値は従来どおり（この仕組みで値は変えない）
+    params = load_params(RTKV2)
+    assert len(params) == 157
+    assert params["PSC_NE_POS_P"][:2] == (1.0, "AP_Float")
+    assert params["PSC_D_VEL_D"][:2] == (0.015, "AP_Float")
+    assert params["GPS1_TYPE"][:2] == (9, "AP_Int8")
+
+
+def test_find_port_holders_detects_open_fd():
+    """find_port_holders が同一プロセスの open FD を検出できること（実機不要）。"""
+    find_port_holders = load_bridge_helpers()
+    fh = tempfile.NamedTemporaryFile(delete=False)
+    fh.close()
+    try:
+        with open(fh.name, "r"):
+            holders = find_port_holders(fh.name)
+        assert any(pid == str(os.getpid()) for pid, _ in holders), holders
+        assert find_port_holders("/dev/ttyDOESNOTEXIST") == []
+    finally:
+        os.unlink(fh.name)
 
 
 if __name__ == "__main__":

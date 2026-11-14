@@ -24,7 +24,14 @@ Piから基地局を再設定しません。
 ## setup_RTK_V2.py
 
 `EKF/setup_EKF_Observer5.py` とキー集合一致の完全プロファイル157項目を扱う。
-値差分は GPS/CAN/コンパス方位の9項目のみで、それ以外は値・型が同一である。
+値差分は GPS/CAN/コンパス方位の9項目 + PSCゲイン2項目（`PSC_NE_POS_P`、
+`PSC_D_VEL_D`）の計11項目のみで、それ以外は値・型が同一である。
+
+接続は既定で USB（`/dev/ttyACM0`）があれば USB、無ければ UART（`/dev/ttyAMA0`）。
+UART 接続時は `mavlink-bridge.service` が同じポートを常時開いているため、
+実行中だけブリッジを停止し、終了時（正常終了・例外・Ctrl+C）に自動再起動する
+（`--no-stop-bridge` で無効化、`--stop-bridge` は互換用）。この停止/復帰は接続制御のみで、
+プロファイルのパラメータ値は変更しない。
 交互実行時は Observer5 と本スクリプトを入れ替えるだけで切替えできる。基準は
 `/home/taki/Downloads/Full-Params_ekf_V2.param`、RTK接続の正典は
 `RTK/archive/setup_RTK_V1.py`（DroneCAN構成）である。

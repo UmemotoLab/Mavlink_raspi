@@ -13,7 +13,8 @@ Observer5: 現行ファーム向け EKF Observer パラメータ設定スクリ�
 （--force 指定時のみ続行）。PARAM_SET時にFCが自動保存するため明示保存コマンドは
 送らない。電源再投入後の保持は未検証。終了コードは 0=成功 / 1=不一致 / 2=中止。
 完全プロファイル: RTK/setup_RTK_V2.py とキー集合一致の157項目。値差分は
-GPS/CAN/コンパス方位の9項目のみで、交互実行時は本スクリプトとRTK V2を
+GPS/CAN/コンパス方位の9項目 + PSCゲイン2項目（PSC_NE_POS_P 5.0 vs 1.0、
+PSC_D_VEL_D 0.01 vs 0.015）の計11項目で、交互実行時は本スクリプトとRTK V2を
 入れ替えるだけで切替えできる（GPS1_TYPE 14、GPS2_TYPE 0、CAN無効、
 GPS_INJECT_TO 0、SERIAL1_BAUD 1000000）。
 
@@ -127,10 +128,10 @@ params_to_set = {
     'EK3_PRIMARY': (-1, 'AP_Int8', '自動切り替え無効'),
 
     # === GPS/CAN設定（Observer運用: MAVLink GPS入力。CAN無効、注入なし） ===
-    # 完全プロファイル: RTK V2とキー集合一致。値差分9項目のうちGPS/CAN側5項目は
+    # 完全プロファイル: RTK V2とキー集合一致。値差分11項目のうちGPS/CAN側5項目は
     # GPS1_TYPE / GPS1_CAN_NODEID / GPS_INJECT_TO / CAN_P1_DRIVER / CAN_D1_PROTOCOL。
-    # 残り4項目の差分はコンパス方位（COMPASS_USE / COMPASS_USE2 / COMPASS_LEARN /
-    # EK3_SRC1_YAW）。それ以外のキーはRTK V2と値・型が同一。
+    # コンパス方位4項目（COMPASS_USE / COMPASS_USE2 / COMPASS_LEARN / EK3_SRC1_YAW）と
+    # PSCゲイン2項目（PSC_NE_POS_P / PSC_D_VEL_D）もObserver専用値。それ以外は同一。
     'GPS1_TYPE': (14, 'AP_Int8', 'MAVLink GPS Input（Observer運用）'),
     'GPS2_TYPE': (0, 'AP_Int8', 'GPS2無効（両プロファイル共通）'),
     'GPS1_CAN_NODEID': (0, 'AP_Int8', 'DroneCAN不使用のため0（基準ファイル値0; RTK値は125）'),

@@ -1,0 +1,13 @@
+[project]
+name = "observer-direct-phase"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "pymavlink>=2.4.50",
+    "pyserial>=3.5",
+]
+
+# 非パッケージプロジェクト（setup_EKF_Observer5_direct_phase.py を uv 環境で実行する）。
+# pymavlink は PyPI 公式版を uv.lock で固定する（現ファーム direct-phase 用プロファイル）。
+[tool.uv]
+package = false
