@@ -6,15 +6,34 @@ Observer5: 現行ファーム向け EKF Observer パラメータ設定スクリ�
 (WP/PILOT/PSC/LOIT/RTL) とスケール変更 (PSC_D_ACC_*, OBS_EKF_Q_*) を live/param
 照合値に合わせ、live 型不一致 12 件を修正した。不在旧名は事前除外し、
 単発読み直しをやめて PARAM_REQUEST_LIST のキャッシュ照合 + 総時間上限で
-高速に検証する（--check 既定）。実書き込みは --write のみで、--check は
-読み取り専用。PARAM_SET時にFCが自動保存するため明示保存コマンドは送らない。電源再投入後の保持は未検証。
+高速に検証する。既定は書き込み（引数なしで書き込む）で、--check は読み取り専用。
+書き込みは RTK/setup_RTK_V2.py と同じ設計で、既定では「実機の値と違う項目だけ」に絞り、
+157項目の無条件書き込みを避ける（--write-all で全項目、--only / --skip で個別指定）。
+書き込み前に HEARTBEAT の base_mode で armed を確認し、armed なら中止する
+（--force 指定時のみ続行）。PARAM_SET時にFCが自動保存するため明示保存コマンドは
+送らない。電源再投入後の保持は未検証。終了コードは 0=成功 / 1=不一致 / 2=中止。
 完全プロファイル: RTK/setup_RTK_V2.py とキー集合一致の157項目。値差分は
 GPS/CAN/コンパス方位の9項目のみで、交互実行時は本スクリプトとRTK V2を
 入れ替えるだけで切替えできる（GPS1_TYPE 14、GPS2_TYPE 0、CAN無効、
 GPS_INJECT_TO 0、SERIAL1_BAUD 1000000）。
+
+実行方法:
+    cd EKF && uv run --frozen python setup_EKF_Observer5.py          # 既定: 書き込み
+    cd EKF && uv run --frozen python setup_EKF_Observer5.py --check  # 読み取り専用
+    cd EKF && ./run_observer5.sh                                     # ラッパー経由（同じ）
+    cd リポジトリルート && uv run EKF/setup_EKF_Observer5.py
+
+既定では /dev/ttyAMA0 を掴んでいる mavlink-bridge.service を自動で一時停止し、
+終了時（正常終了・例外・Ctrl+C）に再起動する。止めたくない場合は --no-stop-bridge。
+
+pymavlink は PyPI 公式版を uv.lock で固定して使う（起動時に版とパスを表示する）。
 """
 
 from pymavlink import mavutil
+import atexit
+import os
+import signal
+import subprocess
 import time
 import sys
 import argparse
@@ -23,15 +42,30 @@ import argparse
 # 設定セクション
 # ================================
 
-# CLI: 既定は読み取り専用の --check。--write でのみ実書き込みする（FC自動保存、再投入保持は未検証）。
-parser = argparse.ArgumentParser(description="Observer5 param setup (default: check-only)")
-parser.add_argument("--check", action="store_true", help="read-only verify (default when no flag)")
-parser.add_argument("--write", action="store_true", help="write params (FC autosaves; reboot persistence unverified)")
+# CLI: 既定=書き込み（引数なしで書き込む）。--check で読み取り専用。
+# ブリッジは既定で自動停止/復帰（--no-stop-bridge で無効化）。FC自動保存、再投入保持は未検証。
+parser = argparse.ArgumentParser(description="Observer5 param setup (default: write; --check = read-only)")
+parser.add_argument("--check", action="store_true", help="読み取り専用の照合のみ（書き込みしない）")
+parser.add_argument("--write", action="store_true", help="書き込み（既定のため指定不要・互換用）")
+parser.add_argument("--write-all", action="store_true",
+                    help="実機値に関係なく全項目を書く（既定は差分のみ）")
+parser.add_argument("--only", default="", help="この項目だけ書き込む（カンマ区切り）")
+parser.add_argument("--skip", default="", help="この項目は書き込まない（カンマ区切り）")
+parser.add_argument("--force", action="store_true", help="armed でも書き込む（非推奨）")
 parser.add_argument("--device", default="auto", help="auto | /dev/ttyACM0 | /dev/ttyAMA0")
 parser.add_argument("--baud-usb", type=int, default=115200)
+parser.add_argument("--url", default=None, help="MAVLink接続文字列 (例: udpin:0.0.0.0:14560)。指定時は --device/--baud-usb を無視")
+parser.add_argument("--stop-bridge", action="store_true",
+                    help="(互換用) 既定で自動停止するため指定不要")
+parser.add_argument("--no-stop-bridge", action="store_true",
+                    help="mavlink-bridge.service を自動停止しない（ポート使用中ならエラー終了）")
+parser.add_argument("--heartbeat-timeout", type=float, default=15.0, help="ハートビート待機の上限 [s]")
 parser.add_argument("--verify-budget", type=float, default=60.0, help="verify phase total budget [s]")
 args = parser.parse_args()
-WRITE_MODE = bool(args.write)
+if args.check and (args.write or args.write_all):
+    parser.error("--check と --write/--write-all は同時に指定できません")
+WRITE_MODE = not args.check  # 既定=書き込み、--check で読み取り専用
+AUTO_STOP_BRIDGE = not args.no_stop_bridge
 
 # 振り子周波数の計算
 import math
@@ -292,6 +326,51 @@ MAV_PARAM_TYPE_MAP = {
 # 接続
 # ================================
 
+def print_pymavlink_info():
+    """実際に読み込んでいる pymavlink の版とパスを表示する。
+
+    公式版（PyPI の pymavlink）は site-packages 配下に入る。カスタムビルドや
+    ローカルチェックアウトを PYTHONPATH 等で読んでいる場合はパスがそれ以外になるため、
+    一目で判別できるようにしている。
+    """
+    try:
+        from importlib.metadata import version as _pkg_version
+        ver = _pkg_version("pymavlink")
+    except Exception:
+        ver = getattr(mavutil, "__version__", "unknown")
+    path = os.path.dirname(mavutil.__file__)
+    print(f"pymavlink: {ver} ({path})")
+    if "site-packages" not in path:
+        print("  ⚠ site-packages 以外の pymavlink を読み込んでいます（カスタムビルドの可能性）。")
+        print("    公式版で実行するには: cd EKF && uv run --frozen python setup_EKF_Observer5.py ...")
+
+
+def find_port_holders(dev):
+    """dev を開いているプロセスを /proc から列挙する（同一ユーザー権限で見える範囲）。"""
+    target = os.path.realpath(dev)
+    holders = []
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        fd_dir = f"/proc/{pid}/fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.path.realpath(os.path.join(fd_dir, fd)) != target:
+                    continue
+            except OSError:
+                continue
+            try:
+                with open(f"/proc/{pid}/cmdline", "rb") as f:
+                    cmd = f.read().replace(b"\x00", b" ").decode(errors="replace").strip()
+            except OSError:
+                cmd = "?"
+            holders.append((pid, cmd))
+            break
+    return holders
+
+
 def resolve_connection(device, baud_usb, uart_baud, ask=input):
     """接続先と baud を決める。UART 側の baud は設定辞書の SERIAL1_BAUD を渡す。"""
     if device == "auto":
@@ -304,17 +383,166 @@ def resolve_connection(device, baud_usb, uart_baud, ask=input):
     return device, uart_baud, True
 
 
+def default_ask(msg):
+    """非対話実行（VS Codeの実行ボタン、stdinリダイレクト等）では input() が
+    EOFError になるため、USB の有無から自動回答する。"""
+    if sys.stdin.isatty():
+        return input(msg)
+    ans = "y" if os.path.exists("/dev/ttyACM0") else "n"
+    print(f"{msg}{ans} （非対話実行のため自動選択）")
+    return ans
+
+
+# ================================
+# mavlink-bridge の一時停止 / 自動復帰
+# ================================
+# この Pi では mavlink-bridge.service が /dev/ttyAMA0 を常時開いている。
+# --stop-bridge（または対話での確認）時に停止し、終了時 (atexit / SIGINT / SIGTERM)
+# に必ず再起動する。SIGKILL 等で強制終了された場合だけ手動復帰が必要。
+
+BRIDGE_SERVICE = "mavlink-bridge"
+_bridge_stopped = False
+
+
+def _sudo_systemctl(action):
+    """sudo systemctl <action> mavlink-bridge を実行（パスワード不要なら -n で先に試す）。"""
+    for cmd in (["sudo", "-n", "systemctl", action, BRIDGE_SERVICE],
+                ["sudo", "systemctl", action, BRIDGE_SERVICE]):
+        try:
+            result = subprocess.run(cmd, check=False, stdout=subprocess.DEVNULL)
+        except FileNotFoundError:
+            print("  ⚠ systemctl が見つかりません（systemd 以外の環境？）")
+            return False
+        if result.returncode == 0:
+            return True
+    return False
+
+
+def _on_terminate(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
+def restore_bridge():
+    """停止した mavlink-bridge を再起動する（atexit から呼ばれる）。"""
+    global _bridge_stopped
+    if not _bridge_stopped:
+        return
+    print(f"\n{BRIDGE_SERVICE} を再起動します...")
+    if _sudo_systemctl("start"):
+        print(f"  ✅ {BRIDGE_SERVICE} を再起動しました")
+    else:
+        print(f"  ❌ {BRIDGE_SERVICE} を再起動できませんでした。手動で実行してください: "
+              f"sudo systemctl start {BRIDGE_SERVICE}")
+    _bridge_stopped = False
+
+
+def stop_bridge_temporarily(dev, wait_s=5.0):
+    """dev を掴んでいる mavlink-bridge を停止し、終了時に自動復帰するよう登録する。"""
+    global _bridge_stopped
+    print(f"  {BRIDGE_SERVICE} を一時停止します（終了時に自動再起動）")
+    if not _sudo_systemctl("stop"):
+        print(f"  ❌ {BRIDGE_SERVICE} を停止できませんでした（sudo 権限を確認してください）")
+        return False
+    _bridge_stopped = True
+    atexit.register(restore_bridge)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _on_terminate)
+        except (ValueError, OSError):
+            pass
+
+    t0 = time.time()
+    while time.time() - t0 < wait_s:
+        if not find_port_holders(dev):
+            print(f"  ✅ {dev} を解放しました")
+            return True
+        time.sleep(0.2)
+    print(f"  ⚠ {dev} がまだ解放されていません（このまま続行します）")
+    return True
+
+
+def release_serial_port(dev):
+    """dev が使用中なら、ブリッジ停止の可否を判断して必要なら停止する。
+
+    戻り値: True=続行可 / False=中止（呼び出し側で exit）
+    """
+    holders = find_port_holders(dev)
+    if not holders:
+        return True
+
+    print(f"❌ {dev} は次のプロセスが使用中です:")
+    for pid, cmd in holders:
+        print(f"   - PID {pid}: {cmd}")
+
+    is_bridge = any("mavlink_bridge.py" in cmd for _pid, cmd in holders)
+    if is_bridge and AUTO_STOP_BRIDGE:
+        return stop_bridge_temporarily(dev)
+
+    if is_bridge:
+        print("   ヒント: --no-stop-bridge を外すと、実行中だけ自動停止して終了時に復帰します。")
+        print("           手動の場合は sudo systemctl stop mavlink-bridge（後に start で戻す）。")
+    else:
+        print("   ヒント: 他のプロセスを終了してから再実行してください。")
+    return False
+
+
 # /dev/ttyAMA0 (TELEM1) の baud は設定辞書の SERIAL1_BAUD を単一の出典とする。
 # 片側だけ変更してリンクが繋がらなくなる事故を防ぐため、接続 baud は必ずこれに追従させる。
+print_pymavlink_info()
 UART_BAUD = int(params_to_set['SERIAL1_BAUD'][0])
-dev, baud, rts = resolve_connection(args.device, args.baud_usb, UART_BAUD)
-master = mavutil.mavlink_connection(dev, baud=baud, rtscts=rts)
+IS_SERIAL = False
 
-# ハートビート確認
-print("接続を待機中...")
-master.wait_heartbeat()
+if args.url:
+    # MAVLink URL（udpin:/udpout:/tcp: 等）で接続する。シリアルを直接開かないので
+    # mavlink-bridge.service が /dev/ttyAMA0 を掴んでいても共存できる。
+    print(f"接続文字列: {args.url}")
+    master = mavutil.mavlink_connection(args.url)
+else:
+    dev, baud, rts = resolve_connection(args.device, args.baud_usb, UART_BAUD, ask=default_ask)
+    if dev == "/dev/ttyACM0" and not os.path.exists(dev):
+        # USB 未接続で y を選んだ場合のフォールバック
+        print("USB (/dev/ttyACM0) が見つからないため /dev/ttyAMA0 (UART) に切り替えます")
+        dev, baud, rts = "/dev/ttyAMA0", UART_BAUD, True
+    IS_SERIAL = dev.startswith("/dev/")
+
+    # 同一シリアルポートを別プロセスが開いていると読み取りが競合し、
+    # BAD_DATA の連発 → SerialException になるため、事前に検出する。
+    # mavlink-bridge が掴んでいる場合は --stop-bridge / 対話確認で一時停止できる。
+    if IS_SERIAL and os.path.exists(dev):
+        if not release_serial_port(dev):
+            sys.exit(2)
+
+    try:
+        master = mavutil.mavlink_connection(dev, baud=baud, rtscts=rts)
+    except Exception as e:
+        print(f"❌ {dev} を開けません: {e}")
+        print("   ヒント: 配線・電源・baud (SERIAL1_BAUD) を確認してください。")
+        sys.exit(2)
+
+# ハートビート確認（無応答で永久に待たないよう上限を設ける）
+print(f"接続を待機中... (最大 {args.heartbeat_timeout:.0f}s)")
+try:
+    hb = master.wait_heartbeat(timeout=args.heartbeat_timeout)
+except Exception as e:
+    print(f"❌ ハートビート受信前に通信が切断されました: {e}")
+    if IS_SERIAL:
+        print("   ヒント: 別プロセスが同じポートを開いていないか確認してください"
+              "（sudo systemctl status mavlink-bridge）。")
+    sys.exit(2)
+
+if hb is None:
+    print(f"❌ {args.heartbeat_timeout:.0f}s 以内にハートビートを受信できませんでした。")
+    print("   ヒント: FC の電源・TELEM1 配線・SERIAL1_BAUD を確認してください。")
+    sys.exit(2)
+
 print(f"接続完了 (システム: {master.target_system}, コンポーネント: {master.target_component})")
-print(f"モード: {'WRITE' if WRITE_MODE else 'CHECK (読み取り専用)'}")
+if not WRITE_MODE:
+    _mode = "CHECK (読み取り専用)"
+elif args.write_all:
+    _mode = "WRITE (全項目)"
+else:
+    _mode = "WRITE (差分のみ・既定)"
+print(f"モード: {_mode}")
 
 # ================================
 # ユーティリティ関数
@@ -539,12 +767,78 @@ def verify_all_cached(cache, params, budget_s):
 
 
 # ================================
+# 書き込み対象の選定（RTK/setup_RTK_V2.py と同じ設計: 既定は差分のみ）
+# ================================
+
+def parse_param_list(text, params, flag):
+    """--only / --skip のカンマ区切りを検証して集合にする。"""
+    names = [t.strip() for t in text.split(",") if t.strip()]
+    unknown = [n for n in names if n not in params]
+    if unknown:
+        raise SystemExit(f"{flag}: プロファイルに無いパラメータです: {', '.join(unknown)}")
+    return set(names)
+
+
+def select_write_targets(params, cache, only=None, skip=None, write_all=False):
+    """書き込み対象を決める（既定は差分のみ）。
+
+    戻り値: (targets, unchanged, not_in_fc)
+    - 既定: cache の値と違う項目だけを対象にする（157項目の無条件書き込みを避ける）。
+    - write_all=True: 全項目を対象にする。only は絞り込み、skip は除外。
+    """
+    only_set = set(only or ())
+    skip_set = set(skip or ())
+    targets, unchanged, not_in_fc = {}, [], []
+    for name, item in params.items():
+        if only_set and name not in only_set:
+            continue
+        if name in skip_set:
+            continue
+        if name not in cache:
+            not_in_fc.append(name)
+            continue
+        if not write_all and close_enough(cache[name][0], item[0]):
+            unchanged.append(name)
+            continue
+        targets[name] = item
+    return targets, unchanged, not_in_fc
+
+
+# 書き込み前の安全ガード: HEARTBEAT の base_mode でアーミング状態を判定する
+MAV_MODE_FLAG_SAFETY_ARMED = 128
+
+
+def is_armed(timeout=2.0):
+    """HEARTBEAT の base_mode から armed を判定する（書き込み前チェック）。"""
+    try:
+        if master.motors_armed():
+            return True
+    except Exception:
+        pass
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        msg = master.recv_match(type="HEARTBEAT", blocking=True, timeout=0.5)
+        if msg is None:
+            continue
+        if int(msg.base_mode) & MAV_MODE_FLAG_SAFETY_ARMED:
+            return True
+    return False
+
+
+# ================================
 # メイン処理
 # ================================
 
 # ================================
-# 実行フロー: --check(既定)=キャッシュ照合のみ / --write=設定+読戻し照合（明示保存なし）
+# 実行フロー: --check=キャッシュ照合のみ / 既定・--write=差分書き込み / --write-all=全項目
 # ================================
+
+ONLY = parse_param_list(args.only, params_to_set, "--only")
+SKIP = parse_param_list(args.skip, params_to_set, "--skip")
+
+# 検証・書き込みの対象（--only / --skip を反映）
+verify_params = {n: v for n, v in params_to_set.items()
+                 if (not ONLY or n in ONLY) and n not in SKIP}
 
 if not WRITE_MODE:
     print("\n" + "="*60)
@@ -553,8 +847,8 @@ if not WRITE_MODE:
     t_check0 = time.time()
     cache = fetch_param_cache()
     print(f"取得パラメータ数: {len(cache)}")
-    ok, mismatch, missing = verify_all_cached(cache, params_to_set, args.verify_budget)
-    total = len(params_to_set)
+    ok, mismatch, missing = verify_all_cached(cache, verify_params, args.verify_budget)
+    total = len(verify_params)
     print("\n" + "="*60)
     print(f"CHECK結果: {len(ok)}/{total} 一致")
     if mismatch:
@@ -574,14 +868,36 @@ if not WRITE_MODE:
     sys.exit(0)
 
 print("\n" + "="*60)
-print("ArduPilot パラメータを設定中（AP_Observer EKF版 Observer5）...")
+print("WRITE モード: Observer5プロファイルを書き込みます（--check で読み取り専用）")
 print("="*60)
 
+# 安全ガード: armed なら書き込まない（--force 指定時のみ続行）
+if is_armed():
+    if not args.force:
+        print("❌ armed を検出しました。書き込みを中止します（続行する場合のみ --force）。")
+        sys.exit(2)
+    print("⚠ armed のまま --force 指定で書き込みを続行します。")
+
+# 実機値を一括取得し、既定では「実機と違う項目だけ」を書き込み対象にする
+cache0 = fetch_param_cache()
+targets, unchanged, not_in_fc = select_write_targets(
+    params_to_set, cache0, ONLY, SKIP, args.write_all)
+
+print(f"\nプロファイル: {len(verify_params)} 項目（--only/--skip 適用後）")
+print(f"  書き込み対象: {len(targets)} 項目")
+print(f"  既に一致    : {len(unchanged)} 項目")
+print(f"  FCに不在    : {len(not_in_fc)} 項目")
+for name in not_in_fc:
+    print(f"  - {name}（FCに存在しません）")
+
+if not targets:
+    print("\n書き込み対象はありません（対象項目は全て一致）。")
+
 failed_params = {}
-total = len(params_to_set)
+total = len(targets)
 success_count = 0
 
-for idx, (param_name, (param_value, param_type, param_comment)) in enumerate(params_to_set.items(), 1):
+for idx, (param_name, (param_value, param_type, param_comment)) in enumerate(targets.items(), 1):
     print(f"\n[{idx}/{total}] {param_name}")
     print(f"  設定値: {param_value}")
 
@@ -594,17 +910,14 @@ for idx, (param_name, (param_value, param_type, param_comment)) in enumerate(par
         print(f"  ❌ 設定失敗")
         failed_params[param_name] = (param_value, param_type, param_comment)
 
-print("\n" + "="*60)
-print(f"初期設定完了: {success_count}/{total} 成功")
-print("="*60)
+if targets:
+    print("\n" + "="*60)
+    print(f"初期設定完了: {success_count}/{total} 成功")
+    print("="*60)
 
-# FC側の処理完了を待つ
-print("\nFC側の処理完了を待機中...")
-time.sleep(3)
-
-# 保存待機（ArduPilotはPARAM_SET受信時に自動保存するため明示保存コマンドは送らない）
-print("\nFC側の自動保存待機中...")
-time.sleep(2)
+    # FC側の処理完了・自動保存を待つ（明示保存コマンドは送らない）
+    print("\nFC側の処理完了・自動保存を待機中...")
+    time.sleep(3)
 
 # 不一致パラメータの確認と再設定
 if failed_params:
@@ -625,24 +938,30 @@ if failed_params:
     print("\n再設定分は最終読戻しで確認します...")
     time.sleep(1)
 
-# 最終確認（--write時もキャッシュ照合: 不在項目の直列タイムアウトをなくす）
+# 最終確認（書き込み後もキャッシュ照合: 不在項目の直列タイムアウトをなくす）
 print("\n" + "="*60)
 print("最終確認を実施中（キャッシュ照合）...")
 print("="*60)
 
 _verify_cache = fetch_param_cache()
-ok_names, mismatch, missing = verify_all_cached(_verify_cache, params_to_set, args.verify_budget)
+ok_names, mismatch, missing = verify_all_cached(_verify_cache, verify_params, args.verify_budget)
 final_success = len(ok_names)
+not_in_fc_names = set(not_in_fc)
+final_failed = []
 for name in ok_names:
     print(f"✅ {name} = {_verify_cache[name][0]}")
-final_failed = [n for n, _e, _g in mismatch] + missing
 for name, exp, got in mismatch:
     print(f"❌ {name} = {got} (期待値: {exp})")
+    final_failed.append(name)
 for name in missing:
-    print(f"❌ {name} (FCに存在しません)")
+    if name in not_in_fc_names:
+        print(f"⏸ {name} (FCに存在しません) → 保留")
+    else:
+        print(f"❌ {name} (FCに存在しません)")
+        final_failed.append(name)
 
 print("\n" + "="*60)
-print(f"最終結果: {final_success}/{total} 成功")
+print(f"最終結果: {final_success}/{len(verify_params)} 一致")
 if final_failed:
     print(f"失敗: {len(final_failed)}個")
     for name in final_failed[:10]:  # 最初の10個を表示
@@ -651,9 +970,16 @@ print("="*60)
 
 if final_failed:
     print(f"\n❌ {len(final_failed)}個のパラメータが正しく設定できませんでした")
+    print("\n完了")
+    sys.exit(1)
+
+if not_in_fc:
+    print("\n✅ 書き込み対象はすべて最終読戻しで一致しました。")
+    print(f"   ※ FCに存在しない {len(not_in_fc)} 個は変更していません。")
 else:
     print("\n✅ 全てのパラメータが最終読戻しで一致しました（設定値の送信+読戻し確認）。")
-    print("   ※ ArduPilotはPARAM_SET時に自動保存します。電源再投入後の保持は未検証です。")
-    print("   （AP_Observer EKF版、OBS_* は新パラメータ、その他は標準設定）")
+print("   ※ ArduPilotはPARAM_SET時に自動保存します。電源再投入後の保持は未検証です。")
+print("   （AP_Observer EKF版、OBS_* は新パラメータ、その他は標準設定）")
 
 print("\n完了")
+sys.exit(0)

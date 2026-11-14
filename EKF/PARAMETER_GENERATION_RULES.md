@@ -453,17 +453,19 @@ Observer 運用では `GPS1_TYPE` 14（MAVLink GPS 入力）、`GPS2_TYPE` 0、`
 前提は `ekf-V2` を書き込んだ Pixhawk6C と、pymavlink が導入された Python 環境である。
 
 1. 機体を USB またはラズパイ UART で接続する。
-2. 読み取り専用で現状を照合する。`python setup_EKF_Observer5.py --check` を実行する。引数なしでも `--check` と同じ動作になる。
+2. 現状を照合する。`python setup_EKF_Observer5.py --check`（読み取り専用）を実行する。引数なしは書き込みになるため、照合だけしたいときは `--check` を付ける。
 3. 照合結果を確認する。全 157 項目が一致すると終了コード 0 で終わる。値不一致または不在があると該当項目を表示して終了コード 1 で終わる。
-4. 書き込む場合は `python setup_EKF_Observer5.py --write` を実行する。書き込みは 1 項目ごとに `PARAM_SET` を送り、`PARAM_VALUE` の読戻し値を比較して最大 5 回まで再試行する。
+4. 書き込む場合は `python setup_EKF_Observer5.py`（引数なし。既定=書き込み。`--write` も可）を実行する。既定では `PARAM_REQUEST_LIST` で実機値を取得し、**実機と値が違う項目だけ**を対象にする（`--write-all` で全項目、`--only` / `--skip` で個別指定）。書き込みは 1 項目ごとに `PARAM_SET` を送り、`PARAM_VALUE` の読戻し値を比較して最大 5 回まで再試行する。
 5. 書き込み後に不一致が残った項目は、`max_retries=3` で再設定する。
-6. 最後に `PARAM_REQUEST_LIST` によるキャッシュ照合で全項目を再確認する。
+6. 最後に `PARAM_REQUEST_LIST` によるキャッシュ照合で全項目を再確認する。FC に存在しない項目（`OBS_PRED_TIME` 等）は「保留」として変更せず、失敗には数えない。終了コードは 0=成功 / 1=不一致 / 2=armed・ポート使用中などの中止。
+
+書き込み前には HEARTBEAT の `base_mode` で armed を判定し、armed の場合は中止する（`--force` 指定時のみ続行）。この設計は `RTK/setup_RTK_V2.py` と同一で、`EKF/test_observer5_params.py::test_write_targets_are_diff_only` が差分選定を、`::test_write_flow_has_safety_guards` が armed ガード・フラグ・終了コードの存在を検証する。
 
 明示的な保存コマンドは送らない。ArduPilot は `PARAM_SET` 受信時に自動保存するためである。この挙動の確認は `EKF/test_observer5_params.py::test_no_preflight_storage` が行う。
 
 ## USB 検証
 
-接続先は `--device` で指定する。`--device auto`（既定）では対話入力 `USB接続を行いますか (y/n):` を求める。
+接続先は `--device` で指定する。`--device auto`（既定）は、対話端末かつ `/dev/ttyACM0` が存在する場合だけ `USB接続を行いますか (y/n):` を求める。`/dev/ttyACM0` が無ければ質問せず UART を使い、非対話実行（VS Code・stdin リダイレクト）でも自動判定する。
 
 | 入力または指定 | デバイス | ボーレート | `rtscts` |
 |---|---|---|---|
@@ -476,7 +478,7 @@ Observer 運用では `GPS1_TYPE` 14（MAVLink GPS 入力）、`GPS2_TYPE` 0、`
 
 UART 側のボーレートは設定辞書を単一の出典とする。`UART_BAUD = int(params_to_set['SERIAL1_BAUD'][0])` を読み、`resolve_connection()` に渡す。接続ブロックに数値を直書きすると、片側だけ変更してリンクが繋がらなくなるため、ここは必ず辞書に追従させる。USB 側の `--baud-usb` は CDC-ACM ではファームが指定を無視する名目値である。この対応は `EKF/test_observer5_params.py::test_uart_baud_follows_serial1_baud` が検証する。
 
-接続後はハートビートを待ち、`--check` では読み取り専用の照合のみを行う。検証は `PARAM_REQUEST_LIST` で全項目を一括取得し、辞書照合する方式である。項目ごとの直列タイムアウトを行わないため、現行ファームに存在しない項目を含んでいても待ち時間が増えない。照合の総時間上限は `--verify-budget`（既定 60 秒）で制限する。
+接続後はハートビートを待つ。`--check` では読み取り専用の照合のみを行い、既定（書き込み）では冒頭の設定送信と最後の照合を行う。検証は `PARAM_REQUEST_LIST` で全項目を一括取得し、辞書照合する方式である。項目ごとの直列タイムアウトを行わないため、現行ファームに存在しない項目を含んでいても待ち時間が増えない。照合の総時間上限は `--verify-budget`（既定 60 秒）で制限する。
 
 照合の許容差は絶対値 1e-4 である（`close_enough()`）。整数値を持つ項目も同じ許容差で比較する。
 

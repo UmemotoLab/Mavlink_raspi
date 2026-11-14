@@ -147,3 +147,93 @@ EK3_VELD_M_NSE  = 0.5   # 垂直速度ノイズ
 |------|----------|------|
 | 2026-06-09 | `775a238` | GPSチェック有効化、ノイズ2倍、グリッチ検出有効化、チェック厳格化 → **安定** |
 | 2026-06-09 | `981ee89` | Futaba5向け調整 → ふらふら発生（上記設定が不十分） |
+
+---
+
+## 6. Raspberry Pi 実機での実行手順
+
+この Raspberry Pi では `mavlink-bridge.service` が `/dev/ttyAMA0` (TELEM1, 1,000,000 bps) を
+常時開いている。同じポートを直接開くと読み取りが競合して `BAD_DATA` の連発 →
+`SerialException: device reports readiness to read but returned no data` になるため、
+実機ではラッパー `EKF/run_observer5.sh` を使う。
+
+```bash
+cd ~/Mavlink_raspi/EKF
+uv run --frozen python setup_EKF_Observer5.py            # 既定: 書き込み（引数なしでOK）
+uv run --frozen python setup_EKF_Observer5.py --check    # 読み取り専用で照合
+./run_observer5.sh              # 既定: 書き込み（ラッパー経由）
+./run_observer5.sh --check      # 読み取り専用で照合
+```
+
+**既定動作（2026-11-13 変更）**: 引数なし = **書き込み**。ただし RTK/setup_RTK_V2.py と同じ設計で、
+既定では**実機の値と違う項目だけ**を書く（157項目の無条件書き込みを避ける）。
+`--write-all` で全項目、`--only A,B` / `--skip C` で個別指定。`--check` は読み取り専用。
+`--write` は互換用で、付けても同じ（差分）挙動。書き込み前に HEARTBEAT の `base_mode` で
+armed を確認し、armed なら中止（`--force` 指定時のみ続行）。終了コードは
+0=成功 / 1=不一致 / 2=armed・ポート使用中などの中止。
+
+書き込みモードの流れ:
+1. `PARAM_REQUEST_LIST` で実機値を一括取得
+2. `書き込み対象 / 既に一致 / FCに不在` を表示（FC不在は「保留」で変更しない）
+3. 差分のみ `PARAM_SET` → 読戻し照合（不一致は最大5回、その後3回再試行）
+4. 最終キャッシュ照合 → 終了コードで結果を返す
+
+`/dev/ttyAMA0` を掴んでいる `mavlink-bridge` は**既定で自動停止**し、終了時
+（正常終了・例外・Ctrl+C）に `atexit` で自動再起動する。停止させたくない場合は
+`--no-stop-bridge`（ポート使用中ならエラー終了）。
+`SIGKILL` で強制終了した場合のみ手動復帰（`sudo systemctl start mavlink-bridge`）が必要。
+ラッパー `run_observer5.sh` は同じ停止/復帰をシェルの `trap` で行う（内部で
+`uv run --frozen python setup_EKF_Observer5.py` を呼ぶ）。
+
+手動でブリッジを止める場合は次のとおり。
+
+```bash
+sudo systemctl stop mavlink-bridge
+uv run --frozen python setup_EKF_Observer5.py --check
+sudo systemctl start mavlink-bridge
+```
+
+### uv と pymavlink（公式版の固定）(2026-11-13 追加)
+
+`EKF/pyproject.toml` + `EKF/uv.lock` で依存を管理し、pymavlink は **PyPI 公式版 2.4.50**
+（`registry = "https://pypi.org/simple"`、ハッシュ付き）に固定している。
+
+```bash
+cd ~/Mavlink_raspi/EKF
+uv run --frozen python setup_EKF_Observer5.py           # 既定: 書き込み
+uv run --frozen python setup_EKF_Observer5.py --check   # 読み取り専用
+uv run --frozen python -c "import pymavlink, importlib.metadata as m; print(m.version('pymavlink'))"
+# → 2.4.50
+```
+
+| 実行方法 | 結果 |
+|---|---|
+| `cd EKF && uv run --frozen python setup_EKF_Observer5.py ...` | ✅ `EKF/.venv` の公式 pymavlink 2.4.50 |
+| `uv run EKF/setup_EKF_Observer5.py ...`（リポジトリルートから） | ✅ スクリプト位置から `ekf` プロジェクトを検出して同じ環境 |
+| `uv run python EKF/setup_EKF_Observer5.py ...`（ルートから） | ❌ ルートに `pyproject.toml` が無く一時環境になるため `ModuleNotFoundError: pymavlink` |
+| `python3 setup_EKF_Observer5.py ...` | ⚠ `~/.local/lib/python3.11/site-packages` の pymavlink 2.4.49（プロジェクト管理外）を拾う |
+
+スクリプトは起動時に `pymavlink: <版> (<パス>)` を表示し、`site-packages` 以外から
+読み込んだ場合は警告を出す（カスタムビルドの混入をその場で判別できる）。
+`uv run` に `--frozen` を付けるのは、`uv.lock` の版をそのまま使い、暗黙の
+アップグレードや再解決を防ぐため。
+
+### 接続オプション (2026-11-13 追加)
+
+| オプション | 内容 |
+|---|---|
+| `--device auto`（既定） | 対話時は USB 接続の有無を質問。非対話時（VS Code 実行 / stdin リダイレクト）は `/dev/ttyACM0` があれば USB、無ければ `/dev/ttyAMA0` を自動選択（`EOFError` を出さない）。 |
+| `--device /dev/ttyAMA0` | UART 固定。baud は `SERIAL1_BAUD`（1,000,000）に追従。 |
+| `--url udpin:0.0.0.0:14560` | MAVLink URL で接続。シリアルを開かないためブリッジ稼働中でも共存可能。 |
+| `--check` | 読み取り専用の照合のみ。**引数なしの既定は書き込み**だが、既定は**差分のみ**（実機と違う項目だけ）。`--write` は互換用。 |
+| `--write-all` | 実機値に関係なく全項目を書く（157項目の無条件書き込み）。 |
+| `--only A,B` / `--skip C` | 書き込み・照合の対象を個別指定（プロファイルに無い名前はエラー）。 |
+| `--force` | armed を検出しても書き込む（非推奨。既定は armed で中止し `exit 2`）。 |
+| `--no-stop-bridge` | `mavlink-bridge` の自動停止を行わない（既定は停止→終了時復帰）。`--stop-bridge` は互換用で指定不要。 |
+| `--heartbeat-timeout 15` | ハートビート待機の上限 [s]。無応答時は生のトレースバックではなく案内メッセージを出して `exit 2`。 |
+
+`/dev/ttyAMA0` を掴んでいるのが `mavlink-bridge` なら既定で自動停止/復帰する。
+それ以外のプロセスが使用中の場合は、使用中プロセス（PID とコマンド）を表示して `exit 2` する。
+2026-11-13 時点の実測では、この手順の照合が
+`取得パラメータ数: 1065 / 所要 21.8s` で完走する（FC は sysid 2 / ArduCopter）。
+

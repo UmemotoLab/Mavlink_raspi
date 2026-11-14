@@ -114,6 +114,18 @@ def load_verify_fns():
     return ns["verify_all_cached"]
 
 
+def load_write_helpers():
+    """Exec only the pure write-selection helpers (no MAVLink connection)."""
+    src = open(OBS5, encoding="utf-8").read()
+    m1 = re.search(r"(def close_enough.*?)(?=\n\n\n# ===+)", src, re.S)
+    m2 = re.search(r"(def parse_param_list.*?)(?=\n\n\n# ===+)", src, re.S)
+    assert m1 and m2, "write helpers not found"
+    ns = {"time": time}
+    exec(m1.group(1), ns)
+    exec(m2.group(1), ns)
+    return ns["parse_param_list"], ns["select_write_targets"]
+
+
 def load_resolve_connection():
     """Exec only resolve_connection (no MAVLink connection)."""
     src = open(OBS5, encoding="utf-8").read()
@@ -137,6 +149,10 @@ def test_new_names_present():
 
 
 def test_values_match_v2():
+    if not os.path.exists(V2):
+        # 基準パラメータファイルは外部（Downloads）。無い環境ではスキップする。
+        print(f"SKIP test_values_match_v2: {V2} がありません")
+        return
     params = load_params()
     v2 = load_v2()
     bad = []
@@ -203,12 +219,55 @@ def test_observer_profile_values():
     assert params["SERIAL1_BAUD"][:2] == (1000000, "AP_Int32"), params["SERIAL1_BAUD"]
 
 
+def test_write_targets_are_diff_only():
+    """既定の書き込みは実機と違う項目だけ（RTK V2 と同じ設計）であること。"""
+    _parse, select = load_write_helpers()
+    params = {"A": (1.0, "AP_Float", ""), "B": (2.0, "AP_Float", ""),
+              "C": (3.0, "AP_Float", "")}
+    cache = {"A": (1.0, 9), "B": (9.0, 9)}  # C は FC に無い
+    targets, unchanged, not_in_fc = select(params, cache)
+    assert set(targets) == {"B"}, f"差分のみのはず: {sorted(targets)}"
+    assert unchanged == ["A"], unchanged
+    assert not_in_fc == ["C"], not_in_fc
+
+    # --write-all 相当: 一致項目も対象。--skip は除外。
+    targets, unchanged, not_in_fc = select(params, cache, skip={"B"}, write_all=True)
+    assert set(targets) == {"A"}, sorted(targets)
+    assert unchanged == [], unchanged
+    assert not_in_fc == ["C"], not_in_fc
+
+
+def test_only_skip_validation():
+    parse, _select = load_write_helpers()
+    params = {"A": (1, "AP_Int8", ""), "B": (2, "AP_Int8", "")}
+    assert parse("", params, "--only") == set()
+    assert parse("A, B", params, "--only") == {"A", "B"}
+    try:
+        parse("A,ZZZ", params, "--only")
+    except SystemExit as e:
+        assert "ZZZ" in str(e), str(e)
+    else:
+        raise AssertionError("プロファイルに無い項目はエラーにする必要がある")
+
+
+def test_write_flow_has_safety_guards():
+    """armed ガード・差分書き込み・終了コードが実装されていること。"""
+    src = open(OBS5, encoding="utf-8").read()
+    assert "def is_armed(" in src, "armed チェックが無い"
+    assert "select_write_targets(" in src, "差分書き込みの対象選定が無い"
+    assert "WRITE_MODE = not args.check" in src, "既定が書き込みになっていない"
+    for flag in ('"--write-all"', '"--only"', '"--skip"', '"--force"'):
+        assert flag in src, f"{flag} が無い"
+    assert "sys.exit(2)" in src, "armed/ポート使用時の中止コードが無い"
+    assert "sys.exit(1)" in src, "不一致時の終了コードが無い"
+
+
 def test_uart_baud_follows_serial1_baud():
     params = load_params()
     src = open(OBS5, encoding="utf-8").read()
     assert "UART_BAUD = int(params_to_set['SERIAL1_BAUD'][0])" in src, \
         "接続baudが設定辞書のSERIAL1_BAUDから導出されていない"
-    block = src[src.index("def resolve_connection"):src.index("master.wait_heartbeat()")]
+    block = src[src.index("def resolve_connection"):src.index("master.wait_heartbeat(")]
     assert "1000000" not in block, "接続ブロックにbaudのハードコードが残っている"
     resolve = load_resolve_connection()
     uart_baud = params["SERIAL1_BAUD"][0]
