@@ -285,7 +285,7 @@ Observer 運用では `GPS1_TYPE` 14（MAVLink GPS 入力）、`GPS2_TYPE` 0、`
 
 | パラメータ | 値 | 型 |
 |---|---|---|
-| `PSC_NE_POS_P` | `5.0` | `AP_Float` |
+| `PSC_NE_POS_P` | `4.0` | `AP_Float` |
 | `PSC_NE_VEL_P` | `6.0` | `AP_Float` |
 | `PSC_NE_VEL_I` | `2.5` | `AP_Float` |
 | `PSC_NE_VEL_D` | `1.0` | `AP_Float` |
@@ -294,7 +294,7 @@ Observer 運用では `GPS1_TYPE` 14（MAVLink GPS 入力）、`GPS2_TYPE` 0、`
 
 | パラメータ | 値 | 型 |
 |---|---|---|
-| `ATC_RAT_RLL_P` | `0.04` | `AP_Float` |
+| `ATC_RAT_RLL_P` | `0.03` | `AP_Float` |
 | `ATC_RAT_RLL_I` | `0.05` | `AP_Float` |
 | `ATC_RAT_RLL_D` | `0.0012` | `AP_Float` |
 | `ATC_RAT_PIT_P` | `0.05` | `AP_Float` |

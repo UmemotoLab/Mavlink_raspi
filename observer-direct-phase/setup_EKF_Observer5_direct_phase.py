@@ -22,7 +22,7 @@ OBS_PHASE_PIT（高調波力推定の位相進み [deg]）を持つ direct-phase
   ↔ OBS_PHASE_RLL / OBS_PHASE_PIT（本版のみ）のキー差し替え1組のみ。
   共通156項目の値は同一（OBS_EKF_Q_* の表記差は float32 丸めで、1e-4 許容判定では同値）。
 - RTK/setup_RTK_V2.py（157項目）とはキー差し替えに加えて値差分11項目
-  （GPS/CAN 5 + コンパス方位 4 + PSC_NE_POS_P 5.0 vs 1.0 / PSC_D_VEL_D 0.01 vs 0.015）。
+  （GPS/CAN 5 + コンパス方位 4 + PSC_NE_POS_P 4.0 vs 1.0 / PSC_D_VEL_D 0.01 vs 0.015）。
   RTK V2 はまだ OBS_PRED_TIME 名のため、現ファームでは同項目が「保留」になる。
 
 実行方法（このディレクトリに uv 環境が完結している）:
@@ -190,13 +190,20 @@ params_to_set = {
     'PSC_D_ACC_I': (0.1, 'AP_Float', '垂直加速度制御I（旧PSC_ACCZ_I 1.0から現ファームスケールに変更）'),
 
     # === 水平制御PID ===
-    'PSC_NE_POS_P': (5.0, 'AP_Float', '水平位置制御P（旧PSC_POSXY_P）'),
+    # 4.0 = 安定版 775a238 (2026-06-09, 位置制御「安定」記録) の値。
+    # 5.0 は 6042941 (2026-06-16) で「Futaba5 に合わせて」上げられたが飛行検証の記録がなく、
+    # f37b820 (2026-05-11, 機体振動を止める) で 5.0 -> 2.0 にして振動が止まった実績がある。
+    # Loiter 振動の切り分けのため 4.0 に戻す。
+    'PSC_NE_POS_P': (4.0, 'AP_Float', '水平位置制御P（旧PSC_POSXY_P / 安定版775a238の値）'),
     'PSC_NE_VEL_P': (6.0, 'AP_Float', '水平速度制御P（旧PSC_VELXY_P）'),
     'PSC_NE_VEL_I': (2.5, 'AP_Float', '水平速度制御I（旧PSC_VELXY_I）'),
     'PSC_NE_VEL_D': (1.0, 'AP_Float', '水平速度制御D（旧PSC_VELXY_D）'),
 
     # === 姿勢制御PID ===
-    'ATC_RAT_RLL_P': (0.04, 'AP_Float', 'Roll P'),
+    # ATC_RAT_RLL_P: 0.04 -> 0.03。PSC_NE_POS_P 5.0->4.0 で全体は改善したが、ロール方向のみ
+    # ハンチングが残るため、ロールレートPを下げて位相余裕を確保する。ピッチ(0.05)は振動なしの
+    # ため変更しない。最終的にロール/ピッチの非対称が残る場合は、どちらへ寄せるかを再検討する。
+    'ATC_RAT_RLL_P': (0.03, 'AP_Float', 'Roll P（ロールハンチング対策で0.04から低減）'),
     'ATC_RAT_RLL_I': (0.05, 'AP_Float', 'Roll I'),
     'ATC_RAT_RLL_D': (0.0012, 'AP_Float', 'Roll D'),
     'ATC_RAT_PIT_P': (0.05, 'AP_Float', 'Pitch P'),
@@ -260,7 +267,7 @@ params_to_set = {
 
     # === シリアル設定 ===
     'SERIAL1_PROTOCOL': (2, 'AP_Int8', 'MAVLink2プロトコル'),
-    'SERIAL1_BAUD': (1000000, 'AP_Int32', 'ボーレート [bps]'),
+    'SERIAL1_BAUD': (1000000, 'AP_Int32', 'ボーレート [bps]（TELEM1 / 1000000 が正典）'),
     'BRD_SER1_RTSCTS': (2, 'AP_Int8', 'ハードウェアフロー制御有効'),
     'SERIAL2_PROTOCOL': (23, 'AP_Int8', 'ELRSレシーバー'),
 
