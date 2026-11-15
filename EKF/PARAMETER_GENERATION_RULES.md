@@ -286,7 +286,7 @@ Observer 運用では `GPS1_TYPE` 14（MAVLink GPS 入力）、`GPS2_TYPE` 0、`
 | パラメータ | 値 | 型 |
 |---|---|---|
 | `PSC_NE_POS_P` | `4.0` | `AP_Float` |
-| `PSC_NE_VEL_P` | `6.0` | `AP_Float` |
+| `PSC_NE_VEL_P` | `4.0` | `AP_Float` |
 | `PSC_NE_VEL_I` | `2.5` | `AP_Float` |
 | `PSC_NE_VEL_D` | `1.0` | `AP_Float` |
 
@@ -294,7 +294,7 @@ Observer 運用では `GPS1_TYPE` 14（MAVLink GPS 入力）、`GPS2_TYPE` 0、`
 
 | パラメータ | 値 | 型 |
 |---|---|---|
-| `ATC_RAT_RLL_P` | `0.03` | `AP_Float` |
+| `ATC_RAT_RLL_P` | `0.04` | `AP_Float` |
 | `ATC_RAT_RLL_I` | `0.05` | `AP_Float` |
 | `ATC_RAT_RLL_D` | `0.0012` | `AP_Float` |
 | `ATC_RAT_PIT_P` | `0.05` | `AP_Float` |
@@ -556,3 +556,4 @@ Observer4 の安定性分析は `EKF/MEMORY_BANK.md` に記録されている。
 |---|---|
 | 2026-10-16 | 初版作成。Observer5 の生成・選定規則、更新手順、USB 検証、永続化確認、危険項目を記録した。 |
 | 2026-10-17 | 完全プロファイル化。Observer5 を RTK V2 とキー集合一致の 157 項目に拡張し、値差分を GPS/CAN/コンパス方位の 9 項目に限定した。Observer 側は GPS1_TYPE 14 / GPS2_TYPE 0 / CAN 無効 / GPS_INJECT_TO 0 / SERIAL1_BAUD 1000000。RTK 側の方位は V1 の外付コンパス 2 構成（YAW1+USE0/USE2=1/LEARN0）を採用した。 |
+| 2026-11-15 | Loiter 水平振動（機体ふらふら）対策。`PSC_NE_POS_P` 5.0 → 4.0（安定版 775a238 の値に復帰）でピッチ方向の振動が解消。残ったロール方向ハンチングは `PSC_NE_VEL_P` 6.0 → 4.0 で解消し、実機で Loiter 安定を確認した。`ATC_RAT_RLL_P` 0.04 → 0.03 も試したが採用せず、0.04 に据え置き。`LOIT_ANG_MAX` 10.0 は変更履歴がなく根拠不明のため保留（未解決）。`ATC_RAT_RLL_P`=0.04 と `ATC_RAT_PIT_P`=0.05 の非対称も未解決の課題として残る。 |
