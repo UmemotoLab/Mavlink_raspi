@@ -203,7 +203,7 @@ params_to_set = {
     # ATC_RAT_RLL_P: 0.04 -> 0.03。PSC_NE_POS_P 5.0->4.0 で全体は改善したが、ロール方向のみ
     # ハンチングが残るため、ロールレートPを下げて位相余裕を確保する。ピッチ(0.05)は振動なしの
     # ため変更しない。最終的にロール/ピッチの非対称が残る場合は、どちらへ寄せるかを再検討する。
-    'ATC_RAT_RLL_P': (0.03, 'AP_Float', 'Roll P（ロールハンチング対策で0.04から低減）'),
+    'ATC_RAT_RLL_P': (0.04, 'AP_Float', 'Roll P（ロールハンチング対策で0.04から低減）'),
     'ATC_RAT_RLL_I': (0.05, 'AP_Float', 'Roll I'),
     'ATC_RAT_RLL_D': (0.0012, 'AP_Float', 'Roll D'),
     'ATC_RAT_PIT_P': (0.05, 'AP_Float', 'Pitch P'),
