@@ -195,7 +195,7 @@ params_to_set = {
     # f37b820 (2026-05-11, 機体振動を止める) で 5.0 -> 2.0 にして振動が止まった実績がある。
     # Loiter 振動の切り分けのため 4.0 に戻す。
     'PSC_NE_POS_P': (4.0, 'AP_Float', '水平位置制御P（旧PSC_POSXY_P / 安定版775a238の値）'),
-    'PSC_NE_VEL_P': (6.0, 'AP_Float', '水平速度制御P（旧PSC_VELXY_P）'),
+    'PSC_NE_VEL_P': (4.0, 'AP_Float', '水平速度制御P（旧PSC_VELXY_P）'),
     'PSC_NE_VEL_I': (2.5, 'AP_Float', '水平速度制御I（旧PSC_VELXY_I）'),
     'PSC_NE_VEL_D': (1.0, 'AP_Float', '水平速度制御D（旧PSC_VELXY_D）'),
 
