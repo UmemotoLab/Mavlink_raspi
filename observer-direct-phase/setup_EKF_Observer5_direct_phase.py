@@ -236,7 +236,7 @@ params_to_set = {
     'OBS_EKF_Q_D':      (9.5367432e-12, 'AP_Float', '外乱状態 d のプロセスノイズ分散（現ファームスケール; live値）'),
     'OBS_EKF_Q_DD':     (2.3841858e-11, 'AP_Float', '外乱速度状態 d_dot のプロセスノイズ分散（現ファームスケール; live値）'),
     'OBS_EKF_Q_C':      (4.7683716e-13, 'AP_Float', 'DCオフセット状態 c のプロセスノイズ分散（現ファームスケール; live値）'),
-    'OBS_W_FREEZE':     (0, 'AP_Int8', 'ωを初期値に固定 (0=無効, 1=有効)'),
+    'OBS_W_FREEZE':     (1, 'AP_Int8', 'ωを初期値に固定 (0=無効, 1=有効)'),
     'OBS_EKF_Q_W':      (0.0005, 'AP_Float', '周波数状態 omega のプロセスノイズ分散'),
     'OBS_EKF_R_MEAS':   (46.0, 'AP_Float', 'ペイロード力の観測値に対する観測ノイズ分散'),
 
@@ -244,7 +244,7 @@ params_to_set = {
     # 'OBS_EKF_W_INIT':   (3.7699, 'AP_Float', '初期角周波数 [rad/s] (0.60 Hz)'), # 0.69m換算
     # 'OBS_EKF_W_INIT':   (5.0000, 'AP_Float', '初期角周波数 [rad/s] (0.60 Hz)'),
     # 'OBS_EKF_W_INIT':   (2.9523, 'AP_Float', '初期角周波数 [rad/s] (0.4699 Hz)'), # L=1.04m FFT平均
-    'OBS_EKF_W_INIT':   (3.7699, 'AP_Float', '初期角周波数 [rad/s] (0.60 Hz)'), # 0.69m換算（現ファーム値; Observer4の2.5569は別途調整で判断）
+    'OBS_EKF_W_INIT':   (3.3929, 'AP_Float', '初期角周波数 [rad/s] (0.54 Hz)'), # 0.85m換算（2π×0.54 = 3.3929）
     'OBS_EKF_W_MIN':    (2.1991, 'AP_Float', '最小角周波数 [rad/s] (0.35 Hz)'), # 2.00m換算
     'OBS_EKF_W_MAX':    (5.718, 'AP_Float', '最大角周波数 [rad/s] (0.91 Hz)'), # 0.30m換算（live値に丸め）
 
