@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # simple_init_test.py - 初期化テスト
 
-from sdcard_adapter import Pin, SPI, const
+from archive.microSD.sdcard_adapter import Pin, SPI, const
 
 try:
     print("=== 初期化テスト ===")
@@ -22,7 +22,7 @@ try:
     
     # SDCard初期化テスト
     print("4. SDCard初期化テスト")
-    from sdcard import SDCard
+    from archive.microSD.sdcard import SDCard
     sd = SDCard(spi, cs)
     print(f"✓ SDCard初期化成功（セクタ数: {sd.sectors}）")
     

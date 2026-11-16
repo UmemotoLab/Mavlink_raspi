@@ -6,8 +6,8 @@ import sys
 from datetime import datetime
 
 try:
-    from sdcard_adapter import Pin, SPI, const
-    from sdcard import SDCard
+    from archive.microSD.sdcard_adapter import Pin, SPI, const
+    from archive.microSD.sdcard import SDCard
 except ImportError as e:
     print(f"インポートエラー: {e}")
     print("sdcard_adapter.py と sdcard.py が同じディレクトリにあることを確認してください")
