@@ -1794,7 +1794,7 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                     if guided_mode_active and initial_target_set:
                         # 高度設定に一定値ではなく追跡値 target['z'] を利用
                         lat, lon, alt = local_xyz_to_gps(target_x, target_y, target['z'])
-                            send_setpoint(m, int(lat*1e7), int(lon*1e7), alt)
+                        send_setpoint(m, int(lat*1e7), int(lon*1e7), alt)
 
                 else:
                     # 荷物が検出されていない場合
