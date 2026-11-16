@@ -33,6 +33,7 @@ AR_MEASUREMENT_FPS = 40
 AR_LOG_HZ = 40
 AR_FRAME_DURATION_US = round(1_000_000 / AR_MEASUREMENT_FPS)
 MASK = 0x09F8
+TARGET_YAW_DEG = 0.0  # 北向き固定（MAVLink NED yaw）
 CAMERA_WIDTH = 1640
 CAMERA_HEIGHT = 1232
 # ───── ArUco・カメラ追跡設定 ─────
@@ -145,7 +146,6 @@ data_records = []
 origin = None
 io_lock = threading.Lock()
 initial_target_set = False
-initial_yaw, yaw_t_deg, yaw_acquired = None, 180.0, False
 guided_mode_active = False  # Guidedモード判定用
 # 最後に確定した荷物中心と回転ベクトル（カメラ座標系）を保持
 last_center_cam = None
@@ -804,25 +804,11 @@ def set_msg_rate(m):
 def send_takeoff_command(m, alt):
     m.mav.command_long_send(m.target_system, m.target_component,
         mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0,0,0,0,0,0,0, alt)
-def send_setpoint(m, lat_i, lon_i, alt, yaw_deg):
+def send_setpoint(m, lat_i, lon_i, alt):
     m.mav.set_position_target_global_int_send(0, m.target_system, m.target_component,
         mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, MASK,
         lat_i, lon_i, alt, 0,0,0,0,0,0,
-        math.radians(yaw_deg), 0)
-    m.mav.command_long_send(m.target_system, m.target_component,
-        mavutil.mavlink.MAV_CMD_CONDITION_YAW,
-        0, yaw_deg, 20, 0,0,0,0,0)
-# ───── ヨー角取得 ─────
-def get_initial_yaw(m):
-    print("現在のヨー角取得中...")
-    for _ in range(10):
-        att = m.recv_match(type='ATTITUDE', blocking=True, timeout=1)
-        if att:
-            yaw = (math.degrees(att.yaw) + 360) % 360
-            print(f"✓ 基準ヨー角設定: {yaw:.1f}°")
-            return yaw
-    print("⚠ ヨー角取得失敗、デフォルト180°使用")
-    return 180.0
+        math.radians(TARGET_YAW_DEG), 0)
 # ───── 座標変換 ─────
 def gps_to_local_xyz(lat, lon, alt):
     north = (lat - REF_LAT) * 111319.5
@@ -1077,7 +1063,7 @@ def estimate_square_center_from_marker(corner, marker_id, marker_size, camera_ma
 
 # ───── 状態監視スレッド ─────
 def monitor_vehicle(m):
-    global running, gps_now, gps_origin, origin, initial_yaw, yaw_t_deg, yaw_acquired, initial_target_set, guided_mode_active, current_yaw_deg
+    global running, gps_now, gps_origin, origin, initial_target_set, guided_mode_active, current_yaw_deg
     global current_roll_rad, current_pitch_rad, current_yaw_rad
     guided, armed, takeoff_sent, takeoff_reached = False, False, False, False
     start_time = 0
@@ -1091,9 +1077,7 @@ def monitor_vehicle(m):
             if is_guided and new_armed and not guided:
                 print("✓ Guidedモード検出 → 離陸準備")
                 start_time, guided = time.time(), True
-                if not yaw_acquired:
-                    initial_yaw = get_initial_yaw(m)
-                    yaw_t_deg, yaw_acquired = initial_yaw, True
+                print("✓ 目標Yawを北向き (0°) に固定")
             if guided and not takeoff_sent and time.time() - start_time > 3:
                 send_takeoff_command(m, TAKEOFF_ALT)
                 print(f"✓ 離陸指令（{TAKEOFF_ALT:.1f}m）")
@@ -1810,7 +1794,7 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                     if guided_mode_active and initial_target_set:
                         # 高度設定に一定値ではなく追跡値 target['z'] を利用
                         lat, lon, alt = local_xyz_to_gps(target_x, target_y, target['z'])
-                        send_setpoint(m, int(lat*1e7), int(lon*1e7), alt, yaw_t_deg)
+                            send_setpoint(m, int(lat*1e7), int(lon*1e7), alt)
 
                 else:
                     # 荷物が検出されていない場合
@@ -2053,26 +2037,24 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
             cv2.destroyAllWindows()
 # ───── キーボード操作 ─────
 def control_loop(m):
-    global running, target, yaw_t_deg, initial_target_set
+    global running, target, initial_target_set
     fd, old = sys.stdin.fileno(), termios.tcgetattr(sys.stdin.fileno())
     tty.setcbreak(fd)
     try:
         print("\n" + "="*60)
-        print("キーボード制御モード（u/m/h/l:XY, w/z:Z, a/d:Yaw, t:基準点）")
+        print("キーボード制御モード（u/m/h/l:XY, w/z:Z, t:基準点）")
         print("※ ArUco追跡動作中は、マーカー検出により目標が自動更新されます")
         print("="*60)
         while running:
             key, moved, echo = get_key(), False, None
             if key == 'q': running = False; break
-            elif key in 'umhlwzadt':
+            elif key in 'umhlwzt':
                 if key == 'u': target['x'] -= STEP; echo = "u South"
                 elif key == 'm': target['x'] += STEP; echo = "m North"
                 elif key == 'h': target['y'] += STEP; echo = "h East"
                 elif key == 'l': target['y'] -= STEP; echo = "l West"
                 elif key == 'w' and initial_target_set: target['z'] -= STEP; echo = "w Up"
                 elif key == 'z' and initial_target_set and target['z'] + STEP <= -0.05: target['z'] += STEP; echo = "z Down"
-                elif key == 'a': yaw_t_deg = (yaw_t_deg - 5) % 360; echo = "a Yaw-5"
-                elif key == 'd': yaw_t_deg = (yaw_t_deg + 5) % 360; echo = "d Yaw+5"
                 elif key == 't' and initial_target_set:
                     target['x'], target['y'], target['z'] = gps_to_local_xyz(36.0757693, 136.2132945, REF_ALT)
                     target['z'] = -TARGET_HEIGHT_ABOVE_TAKEOFF
@@ -2080,7 +2062,7 @@ def control_loop(m):
                 if echo: moved = True; print(f"KEY: {echo}")
                 if moved:
                     lat, lon, alt = local_xyz_to_gps(target['x'], target['y'], target['z'])
-                    send_setpoint(m, int(lat*1e7), int(lon*1e7), alt, yaw_t_deg)
+                    send_setpoint(m, int(lat*1e7), int(lon*1e7), alt)
             time.sleep(0.05)  # 100% CPU使用率を防ぐためにスリープを追加
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)

@@ -13,7 +13,7 @@ from marker_pose_calibration import (
 
 
 # Edit these limits to adjust the plotted axes. Use None for automatic limits.
-PLOT_X_RANGE_S = (10,100)
+PLOT_X_RANGE_S = (10,200)
 POSE_INTERPOLATION_MAX_GAP_S = 0.1
 POSITION_Y_RANGES_M = {
     "hand": {"N": (None, None), "E": (None, None), "D": (None, None)},
