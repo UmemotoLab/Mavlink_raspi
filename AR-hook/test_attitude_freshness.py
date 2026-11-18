@@ -217,7 +217,13 @@ def test_message_intervals_in_source():
     with open(AR_HOOK, encoding="utf-8") as source_file:
         source = source_file.read()
     assert "for mid in (24, 33):" in source
-    assert "0, 30, ATTITUDE_MSG_INTERVAL_US" in source
+    # 19d3881 の通信部移行で送信が comm.set_message_interval() 経由になったため、
+    # 生の command_long_send ではなく、ID 30 への 40Hz 要求が 1 箇所だけ残っていることを見る。
+    assert "comm.set_message_interval(30, ATTITUDE_MSG_INTERVAL_US)" in source
+    # ATTITUDE_MSG_INTERVAL_US の出現は「定数定義 + 要求 1 回」だけ（二重発行なし）
+    assert source.count("ATTITUDE_MSG_INTERVAL_US") == 2, source.count(
+        "ATTITUDE_MSG_INTERVAL_US"
+    )
 
 
 def test_csv_appends_only_freshness_columns():

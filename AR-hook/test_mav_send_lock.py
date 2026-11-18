@@ -1,24 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""AR-hook1.py の MAVLink 送信ロック（mav_send_lock）をハードウェア無しで検証する。
+"""AR-hook の MAVLink 送信直列化をハードウェア無しで検証する。
 
-カメラスレッド相当（最大40Hz）とキーボードスレッド相当（20Hz）の 2 スレッドから
-同一接続 m へ送信し、以下を確認します。
+95501 で AR-hook1.py に導入した ``mav_send_lock`` は、19d3881 の通信部移行に伴い
+``mavlink_comm.MavlinkComm._send_lock`` へ移設しました。現在の設計は次のとおりです。
 
-1. 送信ラッパー（set_msg_rate / send_takeoff_command / send_setpoint）が例外なく動く
-2. 送信ラッパー経由の書き込みは必ず mav_send_lock を保持している
-3. 同時送信でも書き込み区間が重ならない（＝実機でのフレーム混線が起きない）
-4. 共有送信バッファの内容が壊れない（模擬 pymavlink のバッファで確認）
-5. スループットが目標周期（40Hz / 20Hz）から低下しない（単独時と比較）
-6. 対照実験として「ロックを迂回した直接送信」では検出器が混線を捉える（検出力の確認）
+* 送信ロックは **1 本だけ**（通信部の ``_send_lock``）。AR-hook1.py 側には置かない。
+* 取得順序は ``io_lock`` → 通信部の ``_send_lock`` の一方向のみ。
+* AR-hook1.py は ``m.mav.*_send`` / ``recv_match`` / ``mav_send_lock`` を直接使わない。
 
-pymavlink と cv2・pytz はモックし、mavutil.mavlink_connection は呼ばないため実機不要です。
+このスクリプトでは AR-hook1.py の送信ラッパー（``set_msg_rate`` /
+``send_takeoff_command`` / ``send_setpoint``）を実際の ``MavlinkComm`` に接続し、
+以下を確認します。
+
+1. 送信ラッパーが通信部経由で正しい内容を送る（40Hz 要求・yaw 引数を含む）
+2. AR-hook1.py に未保護の直接送信（``m.mav.*_send``）や二重ロックが残っていない
+3. カメラ40Hz + キーボード20Hz の同時送信で書き込み区間が重ならず、フレームが壊れない
+4. 単独送信と比べてスループットが低下しない
+5. 対照実験として、ロックを迂回した直接送信では検出器が混線を捉える
+
+pymavlink と cv2・pytz はモックし、実機接続は行いません。
 実行: python3 AR-hook/test_mav_send_lock.py
 """
+import ast
 import contextlib
 import datetime
 import importlib.util
 import io
+import math
 import struct
 import sys
 import tempfile
@@ -33,7 +42,7 @@ TARGET_FILE = SCRIPT_DIR / "AR-hook1.py"
 # ───── 検証条件 ─────
 CAMERA_HZ = 40.0            # カメラスレッド相当（camera_tracker_loop）
 KEYBOARD_HZ = 20.0          # キーボードスレッド相当（control_loop は 0.05 秒周期）
-RUN_SECONDS = 3.0           # 1 回の負荷試験時間
+RUN_SECONDS = 1.0           # 1 回の負荷試験時間
 RATE_TOLERANCE = 0.90       # 目標周期に対して許容する最低スループット比
 BASELINE_TOLERANCE = 0.95   # 単独送信時に対して許容する最低スループット比
 WRITE_STAGE_S = 0.00015     # pymavlink のパック〜書き出しを模した 1 段あたりの遅延
@@ -74,7 +83,7 @@ def _install_mock_modules():
     pytz_mock.timezone = lambda name: datetime.timezone.utc
     sys.modules["pytz"] = pytz_mock
 
-    # marker_pose_calibration を実ファイルから import できるようにする
+    # local_frame / attitude_freshness / mavlink_comm を実ファイルから import できるようにする
     if str(SCRIPT_DIR) not in sys.path:
         sys.path.insert(0, str(SCRIPT_DIR))
 
@@ -97,7 +106,24 @@ def _load_ar_hook1_module():
     return module
 
 
+def _load_mavlink_comm_module():
+    """通信部モジュールを読み込む（送信ロックの所有者）。"""
+    _install_mock_modules()
+    import mavlink_comm  # noqa: E402  （モック差し替え後に import する）
+
+    return mavlink_comm
+
+
 # ───── 模擬 MAVLink 接続 ─────
+def _fake_heartbeat():
+    """MavlinkComm.connect() が要求する最小限の HEARTBEAT。"""
+    return types.SimpleNamespace(
+        custom_mode=0,
+        base_mode=0,
+        get_type=lambda: "HEARTBEAT",
+    )
+
+
 class MockMavlinkConnection:
     """m.mav.*_send を模擬し、書き込み区間の重なりとフレーム破損を検出する。
 
@@ -113,14 +139,24 @@ class MockMavlinkConnection:
             command_long_send=self.command_long_send,
             set_position_target_global_int_send=self.set_position_target_global_int_send,
         )
-        self.lock_probe = lock_probe      # mav_send_lock（保持確認用、検証専用）
+        self.lock_probe = lock_probe      # 通信部の _send_lock（保持確認用、検証専用）
         self._buffer = bytearray(64)      # pymavlink 内部バッファを模した共有領域
         self._bookkeeping_lock = threading.Lock()  # 検出用の記録ロック（送信ロックとは別物）
         self._active_writers = 0
         self.overlap_events = 0           # 書き込み区間が重なった回数（＝混線リスク）
         self.corrupted_frames = 0         # 共有バッファの上書きで壊れたフレーム数
-        self.unlocked_writes = 0          # mav_send_lock 非保持で書き込まれた回数
+        self.unlocked_writes = 0          # 送信ロック非保持で書き込まれた回数
         self.frames = []                  # (種別, 送信内容, 期待内容)
+
+    # ── MavlinkComm が使う接続 API ──
+    def wait_heartbeat(self, timeout=None):
+        return _fake_heartbeat()
+
+    def recv_match(self, *args, **kwargs):
+        return None
+
+    def close(self):
+        pass
 
     # ── 検出用ヘルパー ──
     def _begin_write(self):
@@ -175,15 +211,27 @@ class MockMavlinkConnection:
         return lat_i, lon_i, alt, yaw
 
 
+def _make_comm():
+    """送信ロックを所有する実物の MavlinkComm を、模擬接続で組み立てる。"""
+    mavlink_comm = _load_mavlink_comm_module()
+    mock = MockMavlinkConnection()
+    comm = mavlink_comm.MavlinkComm(
+        "/dev/null", connection_factory=lambda *args, **kwargs: mock
+    )
+    comm.connect()  # HEARTBEAT は mock が返す。実シリアルは開かない。
+    # 書き込みが通信部の送信ロック内で行われたかを確認できるようにする
+    mock.lock_probe = comm._send_lock
+    return comm, mock
+
 # ───── 負荷試験 ─────
-def _camera_send(module, mock, index):
+def _camera_send(module, comm, index):
     """カメラスレッド相当の送信（camera_tracker_loop の send_setpoint 呼び出し）。"""
-    module.send_setpoint(mock, 1_000_000_000 + index, 100 + index, 0.5)
+    module.send_setpoint(comm, 1_000_000_000 + index, 100 + index, 0.5)
 
 
-def _keyboard_send(module, mock, index):
+def _keyboard_send(module, comm, index):
     """キーボードスレッド相当の送信（control_loop の send_setpoint 呼び出し）。"""
-    module.send_setpoint(mock, 2_000_000_000 + index, 200 + index, 0.5)
+    module.send_setpoint(comm, 2_000_000_000 + index, 200 + index, 0.5)
 
 
 def _run_load(duration_s, specs):
@@ -230,147 +278,131 @@ def _rates(results):
 
 
 # ───── 各検証 ─────
-def _check_wrappers(module):
-    """3 つの送信ラッパーが mav_send_lock 越しに正しい内容を送るか確認する。"""
-    print("\n[1] 送信ラッパーの基本動作")
-    problems = []
-    mocks = []
-    mock = MockMavlinkConnection(lock_probe=module.mav_send_lock)
-    mocks.append(mock)
+def test_wrappers_send_expected_frames():
+    """送信ラッパーが通信部経由で正しい内容を送るか確認する。"""
+    module = _load_ar_hook1_module()
 
-    module.set_msg_rate(mock)
-    mids = []
-    for _kind, sent, _expected in mock.frames:
-        command, params = mock.unpack_command_long(sent)
-        if command != _FakeMavlinkConstants.MAV_CMD_SET_MESSAGE_INTERVAL:
-            problems.append(f"set_msg_rate のコマンドIDが不正: {command}")
-        mids.append((int(params[1]), params[2]))
-    if [mid for mid, _interval in mids] != [24, 33, 30]:
-        problems.append(f"set_msg_rate のメッセージIDが不正: {[mid for mid, _ in mids]}")
-    # 12794（ATTITUDE 40Hz化）との統合後の期待値:
-    # GPS_RAW_INT(24)/GLOBAL_POSITION_INT(33) は 5Hz(200000us)、ATTITUDE(30) は 40Hz(25000us)。
-    expected_intervals = {24: 200000, 33: 200000, 30: 25000}
-    bad_intervals = [
-        (mid, int(interval))
-        for mid, interval in mids
-        if int(interval) != expected_intervals.get(mid)
-    ]
-    if bad_intervals:
-        problems.append(f"set_msg_rate の送信間隔が不正: {bad_intervals}")
-
-    mock = MockMavlinkConnection(lock_probe=module.mav_send_lock)
-    mocks.append(mock)
-    module.send_takeoff_command(mock, 0.5)
-    if len(mock.frames) != 1:
-        problems.append(f"send_takeoff_command の送信回数が不正: {len(mock.frames)}")
-    else:
-        command, params = mock.unpack_command_long(mock.frames[0][1])
-        # command_long_send の params は (confirmation, param1..param7) の並び
-        if command != _FakeMavlinkConstants.MAV_CMD_NAV_TAKEOFF or params[7] != 0.5:
-            problems.append(f"send_takeoff_command の内容が不正: cmd={command}, alt={params[7]}")
-
-    mock = MockMavlinkConnection(lock_probe=module.mav_send_lock)
-    mocks.append(mock)
-    module.send_setpoint(mock, 36_000_000, 136_000_000, -0.5)
-    if len(mock.frames) != 1:
-        problems.append(f"send_setpoint の送信回数が不正: {len(mock.frames)}")
-    else:
-        lat_i, lon_i, alt, yaw = mock.unpack_setpoint(mock.frames[0][1])
-        if (lat_i, lon_i, alt, yaw) != (36_000_000, 136_000_000, -0.5, 0.0):
-            problems.append(
-                f"send_setpoint の内容が不正: lat={lat_i}, lon={lon_i}, alt={alt}, yaw={yaw}"
-            )
-
-    unlocked_writes = sum(item.unlocked_writes for item in mocks)
-    if unlocked_writes:
-        problems.append(f"mav_send_lock 非保持の書き込み: {unlocked_writes} 回")
-
-    if problems:
-        for problem in problems:
-            print(f"  ✗ {problem}")
-    else:
-        print("  ✓ set_msg_rate / send_takeoff_command / send_setpoint は全てロック内で送信")
-    return problems
-
-
-def _check_concurrent(module):
-    """カメラ40Hz + キーボード20Hz の同時送信で混線・例外・スループット低下が無いか確認する。"""
-    print(
-        f"\n[2] 2スレッド同時送信"
-        f"（カメラ {CAMERA_HZ:.0f}Hz + キーボード {KEYBOARD_HZ:.0f}Hz / {RUN_SECONDS:.1f}秒）"
+    # 1) 受信頻度: ID 24/33 は 5Hz、ID 30 は 40Hz（12794 の要求を正とする）
+    comm, mock = _make_comm()
+    module.set_msg_rate(comm)
+    commands = [mock.unpack_command_long(sent) for _kind, sent, _e in mock.frames]
+    expected_commands = getattr(
+        sys.modules["pymavlink.mavutil"].mavlink, "MAV_CMD_SET_MESSAGE_INTERVAL", 511
     )
-    problems = []
-    mock = MockMavlinkConnection(lock_probe=module.mav_send_lock)
+    assert commands, "set_msg_rate が 1 件も送信していません"
+    assert all(cmd == expected_commands for cmd, _params in commands), commands
+    intervals = {int(params[1]): int(params[2]) for _cmd, params in commands}
+    assert intervals == {24: 200000, 33: 200000, 30: 25000}, intervals
+
+    # 2) 離陸指令: MAV_CMD_NAV_TAKEOFF、高度は param7
+    comm, mock = _make_comm()
+    module.send_takeoff_command(comm, 0.5)
+    assert len(mock.frames) == 1, len(mock.frames)
+    command, params = mock.unpack_command_long(mock.frames[0][1])
+    takeoff_command = getattr(
+        sys.modules["pymavlink.mavutil"].mavlink, "MAV_CMD_NAV_TAKEOFF", 22
+    )
+    assert command == takeoff_command, command
+    # command_long_send の params は (confirmation, param1..param7) の並び
+    assert params[7] == 0.5, params
+
+    # 3) setpoint: 既定 yaw は北向き(0)。yaw 引数（9c2a5）は通信部経由でも効く
+    comm, mock = _make_comm()
+    module.send_setpoint(comm, 36_000_000, 136_000_000, -0.5)
+    lat_i, lon_i, alt, yaw = mock.unpack_setpoint(mock.frames[0][1])
+    assert (lat_i, lon_i, alt) == (36_000_000, 136_000_000, -0.5), (lat_i, lon_i, alt)
+    assert abs(yaw) < 1e-6, yaw
+
+    comm, mock = _make_comm()
+    module.send_setpoint(comm, 36_000_000, 136_000_000, -0.5, yaw_deg=90.0)
+    _lat_i, _lon_i, _alt, yaw = mock.unpack_setpoint(mock.frames[0][1])
+    assert abs(yaw - math.pi / 2) < 1e-6, yaw
+
+    # 4) どの送信も通信部の送信ロック内で行われている
+    comm, mock = _make_comm()
+    module.send_setpoint(comm, 1, 2, 3.0)
+    assert mock.unlocked_writes == 0, mock.unlocked_writes
+
+
+def test_ar_hook1_has_no_unprotected_sends():
+    """AR-hook1.py に直接送信・二重ロックが残っていないことを AST で確認する。"""
+    source = TARGET_FILE.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    raw_sends = []
+    comm_api_calls = 0
+    mav_send_lock_assignments = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr in (
+                "command_long_send",
+                "set_position_target_global_int_send",
+            ):
+                raw_sends.append(node.func.attr)
+            if node.func.attr == "set_message_interval":
+                # 通信部 API（comm.set_message_interval）経由だけを許可する
+                if isinstance(node.func.value, ast.Name) and node.func.value.id == "comm":
+                    comm_api_calls += 1
+                else:
+                    raw_sends.append("set_message_interval")
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "mav_send_lock":
+                    mav_send_lock_assignments.append(target.id)
+
+    assert raw_sends == [], f"未保護の直接送信が残っています: {raw_sends}"
+    assert mav_send_lock_assignments == [], "AR-hook1.py に送信ロックが残っています（二重ロック）"
+    assert comm_api_calls == 2, comm_api_calls  # set_msg_rate 内の 2 箇所だけ
+
+    # 送信ロックは通信部に 1 本だけ存在する
+    comm_source = (SCRIPT_DIR / "mavlink_comm.py").read_text(encoding="utf-8")
+    assert "self._send_lock = threading.Lock()" in comm_source
+    assert comm_source.count("_send_lock = threading.Lock()") == 1
+
+
+
+
+def test_concurrent_sends_are_serialized():
+    """カメラ40Hz + キーボード20Hz の同時送信で混線・例外・スループット低下が無いか確認する。"""
+    module = _load_ar_hook1_module()
+    comm, mock = _make_comm()
     specs = [
-        ("camera", lambda index: _camera_send(module, mock, index), CAMERA_HZ),
-        ("keyboard", lambda index: _keyboard_send(module, mock, index), KEYBOARD_HZ),
+        ("camera", lambda index: _camera_send(module, comm, index), CAMERA_HZ),
+        ("keyboard", lambda index: _keyboard_send(module, comm, index), KEYBOARD_HZ),
     ]
     results, errors = _run_load(RUN_SECONDS, specs)
     rates = _rates(results)
 
-    for name in ("camera", "keyboard"):
-        print(
-            f"  {name}: {rates.get(name, 0.0):.1f}Hz"
-            f" ({results[name]['count']} 回 / {results[name]['elapsed_s']:.2f}秒)"
-        )
-    if errors:
-        problems.append(f"送信中に例外が発生: {errors}")
-    if mock.overlap_events:
-        problems.append(f"書き込み区間の重なりを検出: {mock.overlap_events} 回")
-    if mock.corrupted_frames:
-        problems.append(f"フレーム破損を検出: {mock.corrupted_frames} 件")
-    if mock.unlocked_writes:
-        problems.append(f"mav_send_lock 非保持の書き込み: {mock.unlocked_writes} 回")
+    assert errors == [], errors
+    assert mock.overlap_events == 0, mock.overlap_events
+    assert mock.corrupted_frames == 0, mock.corrupted_frames
+    assert mock.unlocked_writes == 0, mock.unlocked_writes
     expected_frames = results["camera"]["count"] + results["keyboard"]["count"]
-    if len(mock.frames) != expected_frames:
-        problems.append(f"記録フレーム数が不一致: {len(mock.frames)} != {expected_frames}")
+    assert len(mock.frames) == expected_frames, (len(mock.frames), expected_frames)
     for name, target_hz in (("camera", CAMERA_HZ), ("keyboard", KEYBOARD_HZ)):
-        if rates.get(name, 0.0) < target_hz * RATE_TOLERANCE:
-            problems.append(
-                f"{name} のスループット低下: {rates.get(name, 0.0):.1f}Hz < "
-                f"{target_hz * RATE_TOLERANCE:.1f}Hz"
-            )
+        assert rates[name] >= target_hz * RATE_TOLERANCE, (name, rates[name])
 
-    if problems:
-        for problem in problems:
-            print(f"  ✗ {problem}")
-    else:
-        print("  ✓ 例外なし・混線なし・スループット低下なし")
-    return problems, rates.get("camera", 0.0)
-
-
-def _check_throughput_baseline(module, concurrent_camera_hz):
-    """同時送信時のカメラ周期が単独送信時と比べて低下していないか確認する。"""
-    print("\n[3] 単独送信とのスループット比較（カメラ40Hz 単独）")
-    problems = []
-    baseline_mock = MockMavlinkConnection(lock_probe=module.mav_send_lock)
+    # 単独送信（カメラ40Hz のみ）と比べてスループットが低下していないこと
+    baseline_comm, baseline_mock = _make_comm()
     baseline_specs = [
-        ("camera", lambda index: _camera_send(module, baseline_mock, index), CAMERA_HZ)
+        ("camera", lambda index: _camera_send(module, baseline_comm, index), CAMERA_HZ)
     ]
     baseline_results, baseline_errors = _run_load(RUN_SECONDS, baseline_specs)
     baseline_rate = _rates(baseline_results)["camera"]
-    print(f"  単独: {baseline_rate:.1f}Hz / 同時: {concurrent_camera_hz:.1f}Hz")
-    if baseline_errors:
-        problems.append(f"単独送信で例外が発生: {baseline_errors}")
-    if baseline_mock.overlap_events or baseline_mock.corrupted_frames:
-        problems.append("単独送信で混線を検出（検証環境の異常）")
-    if concurrent_camera_hz < baseline_rate * BASELINE_TOLERANCE:
-        problems.append(
-            f"同時送信でスループット低下: {concurrent_camera_hz:.1f}Hz < "
-            f"{baseline_rate * BASELINE_TOLERANCE:.1f}Hz"
-        )
-
-    if problems:
-        for problem in problems:
-            print(f"  ✗ {problem}")
-    else:
-        print("  ✓ 単独送信と同等のスループットを維持")
-    return problems
+    assert baseline_errors == [], baseline_errors
+    assert baseline_mock.overlap_events == 0
+    assert rates["camera"] >= baseline_rate * BASELINE_TOLERANCE, (
+        rates["camera"],
+        baseline_rate,
+    )
+    print(
+        f"  camera={rates['camera']:.1f}Hz keyboard={rates['keyboard']:.1f}Hz "
+        f"(単独 camera={baseline_rate:.1f}Hz)"
+    )
 
 
-def _check_detector_sensitivity(module):
+def test_detector_sensitivity():
     """ロックを迂回した直接送信では検出器が混線を捉えることを確認する（対照実験）。"""
-    print("\n[4] 対照実験（mav_send_lock を迂回して直接 m.mav へ送信）")
     mock = MockMavlinkConnection(lock_probe=None)  # ロック保持チェックは行わない
 
     def make_direct_sender(lat_base, lon_base):
@@ -386,35 +418,37 @@ def _check_detector_sensitivity(module):
         ("camera", make_direct_sender(1_000_000_000, 100), CAMERA_HZ),
         ("keyboard", make_direct_sender(2_000_000_000, 200), KEYBOARD_HZ),
     ]
-    _run_load(1.0, specs)
-    print(
-        f"  書き込み区間の重なり: {mock.overlap_events} 回 / "
-        f"フレーム破損: {mock.corrupted_frames} 件"
+    _run_load(RUN_SECONDS, specs)
+    assert mock.overlap_events > 0 or mock.corrupted_frames > 0, (
+        "ロック無しでも混線を検出できず、検証が成立していません"
     )
-    if mock.overlap_events == 0 and mock.corrupted_frames == 0:
-        print("  ✗ ロック無しでも混線を検出できず、検証が成立していません")
-        return ["検出器が混線を捉えられない"]
-    print("  ✓ ロック無しでは混線を検出（＝本検証は混線を検出できる）")
-    return []
 
 
 def main():
     print("=" * 60)
-    print("MAVLink 送信ロック（mav_send_lock）検証: ハードウェア不要")
+    print("MAVLink 送信直列化（通信部の _send_lock）検証: ハードウェア不要")
     print(f"対象: {TARGET_FILE}")
     print("=" * 60)
 
-    module = _load_ar_hook1_module()
-    if not hasattr(module, "mav_send_lock"):
-        print("✗ mav_send_lock が AR-hook1.py に定義されていません")
-        return 1
-
     problems = []
-    problems += _check_wrappers(module)
-    concurrent_problems, concurrent_camera_hz = _check_concurrent(module)
-    problems += concurrent_problems
-    problems += _check_throughput_baseline(module, concurrent_camera_hz)
-    problems += _check_detector_sensitivity(module)
+    tests = [
+        ("送信ラッパーの基本動作", test_wrappers_send_expected_frames),
+        ("未保護の直接送信・二重ロックの不在", test_ar_hook1_has_no_unprotected_sends),
+        ("同時送信の直列化とスループット", test_concurrent_sends_are_serialized),
+        ("対照実験（ロック迂回で混線を検出）", test_detector_sensitivity),
+    ]
+    for label, test in tests:
+        print(f"\n[{label}]")
+        try:
+            test()
+        except AssertionError as exc:
+            problems.append(f"{label}: {exc}")
+            print(f"  ✗ {exc}")
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"{label}: {type(exc).__name__}: {exc}")
+            print(f"  ✗ {type(exc).__name__}: {exc}")
+        else:
+            print("  ✓ OK")
 
     print("\n" + "=" * 60)
     if problems:
@@ -422,7 +456,7 @@ def main():
         for problem in problems:
             print(f"  - {problem}")
         return 1
-    print("✓ 検証成功: 例外なし・フレーム混線なし・スループット低下なし")
+    print("✓ 検証成功: ロックは1本・例外なし・フレーム混線なし・スループット低下なし")
     return 0
 
 

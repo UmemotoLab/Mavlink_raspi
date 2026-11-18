@@ -33,8 +33,14 @@ from attitude_freshness import (
     attitude_fallback_used_for_target,
     attitude_stale_timeout_s_from_env,
 )
-# pyrefly: ignore [missing-import]
-from pymavlink import mavutil
+# ✅ MAVLink の接続・受信・送信は mavlink_comm.MavlinkComm が唯一の所有者です。
+#    本ファイルは mavutil / recv_match / wait_heartbeat / m.mav.*_send を直接使いません
+#    （19d3881 の通信部移行。pymavlink 依存は通信部モジュール側に閉じ込める）。
+from mavlink_comm import (
+    MavlinkComm,
+    MavlinkConnectionError,
+    MavlinkTimeoutError,
+)
 import pytz
 # Raspberry Pi 5 カメラサポート
 try:
@@ -260,14 +266,13 @@ current_yaw_deg = 180.0  # MAVLinkから取得する実時間ヨー角（度）
 data_records = []
 origin = None
 io_lock = threading.Lock()
-# ───── MAVLink 送信専用ロック ─────
-# pymavlink の書き込み（m.mav.*_send）はスレッドセーフではないため、同一接続 m への
-# 送信を mav_send_lock で直列化します（カメラスレッド最大40Hz + キーボードスレッド20Hz）。
-# 取得順序は「io_lock → mav_send_lock」の一方向のみとします。
+# ───── MAVLink 送信の排他（通信部へ移設済み） ─────
+# 95501 で導入した mav_send_lock は、19d3881 の通信部移行に伴い
+# MavlinkComm._send_lock へ移設しました（このファイルには送信ロックを置きません）。
+# ・pymavlink の書き込み（m.mav.*_send）は通信部だけが行い、そこ 1 本のロックで直列化します。
+# ・取得順序は「io_lock → 通信部の _send_lock」の一方向のみです。
 # ・io_lock を保持したまま送信ラッパーを呼ばないこと（保持区間で送信しない）。
-# ・mav_send_lock を保持したまま io_lock を取得しないこと。
-# 送信は必ず「MAVLink 送信ラッパー」セクションの関数経由で行い、m.mav.*_send を直接呼びません。
-mav_send_lock = threading.Lock()
+# ・送信は必ず「MAVLink 送受信ラッパー」セクションの関数経由で行います。
 initial_target_set = False
 guided_mode_active = False  # Guidedモード判定用
 # 最後に確定した荷物中心と回転ベクトル（カメラ座標系）を保持
@@ -892,6 +897,11 @@ def input_with_timeout(prompt, timeout=5, default='1'):
         return default
 
 def connect_mavlink():
+    """MAVLink 通信部を生成して接続する（シリアルを開くのはここ 1 回だけ）。
+
+    実体は mavlink_comm.MavlinkComm が持つため、AR-hook1.py 側では
+    mavutil.mavlink_connection / wait_heartbeat を直接呼びません。
+    """
     print("\n" + "="*50)
     print(" 接続方法を選択してください")
     print(" 1: Serial接続 (/dev/ttyAMA0, 1000000 baud, RTS/CTS有効) ※デフォルト")
@@ -909,24 +919,25 @@ def connect_mavlink():
         baud = 1000000
         rtscts = True
 
-    print(f"\n✓ MAVLink接続を開始します: {device} (BaudRate: {baud}, RTS/CTS: {rtscts})")
-    m = mavutil.mavlink_connection(device, baud=baud, rtscts=rtscts)
-    
-    print("ハートビート信号を待機中 (タイムアウト: 10秒)...")
-    hb = m.wait_heartbeat(timeout=10)
-    if hb is None:
+    comm = MavlinkComm(device, baud=baud, rtscts=rtscts)
+    try:
+        comm.connect()  # 接続・HEARTBEAT 待ちの表示は通信部が行います
+    except MavlinkTimeoutError:
         print("❌ ハートビートの受信タイムアウト: Pixhawkからの応答がありません。")
         print("配線やPixhawkの電源、BaudRate設定を確認してください。")
         sys.exit(1)
-        
-    print(f"✓ MAVLink接続完了 (System ID: {m.target_system}, Component ID: {m.target_component})")
-    return m
-# ───── MAVLink 送信ラッパー（mav_send_lock で直列化） ─────
-# ここが m へ書き込む唯一のセクションです。m.mav.*_send を直接呼ばず、必ずこの関数群を経由します。
-# ・ロックは関数内で取得するため、呼び出し側で with を書く必要はありません。
-# ・ロック保持区間は送信処理のみです（sleep・受信・print・ファイル I/O を入れない）。
-# ・io_lock を保持したままこれらの関数を呼ばないでください（取得順序は io_lock → mav_send_lock のみ）。
-# 将来モジュール分割する場合は、このセクションをそのまま送信モジュールへ移します。
+    except MavlinkConnectionError as exc:
+        print(f"❌ MAVLink接続エラー: {exc}")
+        print("配線やPixhawkの電源、BaudRate設定を確認してください。")
+        sys.exit(1)
+    return comm
+# ───── MAVLink 送受信ラッパー ─────
+# ここから下は「どのスレッドから何を送るか」だけを書きます。実際の送信は
+# MavlinkComm の内部ロック（前提タスク 95501 の mav_send_lock を _send_lock へ移設したもの）
+# で直列化されます。送信ロックはこの 1 本だけなので二重取得はありません。
+# ・m.mav.*_send を直接呼ばないこと。
+# ・io_lock を保持したままこれらの関数を呼ばないこと
+#   （取得順序は io_lock → 通信部の _send_lock の一方向のみ）。
 # ───── MAVLink 受信周期 ─────
 # ATTITUDE (id 30): 25000us = 40Hz。
 #   AR_MEASUREMENT_FPS = 40Hz で目標を生成するため、従来の 200000us (5Hz) では
@@ -944,41 +955,43 @@ ATTITUDE_MSG_INTERVAL_US = 25000
 POSITION_MSG_INTERVAL_US = 200000
 
 
-def set_msg_rate(m):
-    with mav_send_lock:
-        for mid in (24, 33):
-            m.mav.command_long_send(m.target_system, m.target_component,
-                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
-                0, mid, POSITION_MSG_INTERVAL_US, 0,0,0,0,0)
-        m.mav.command_long_send(m.target_system, m.target_component,
-            mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
-            0, 30, ATTITUDE_MSG_INTERVAL_US, 0,0,0,0,0)
-def send_takeoff_command(m, alt):
-    with mav_send_lock:
-        m.mav.command_long_send(m.target_system, m.target_component,
-            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0,0,0,0,0,0,0, alt)
-def send_setpoint(m, lat_i, lon_i, alt, yaw_deg=None):
+def set_msg_rate(comm):
+    """受信頻度の要求（起動時に 1 回だけ呼ぶ）。
+
+    周期の値は 12794（ATTITUDE 40Hz 化）の要求を正とする。
+    mavlink_comm の set_message_interval() は周期を決めない薄い送信 API なので、
+    40Hz の要求が通信部側から二重に発行されることはない（発行箇所はここ 1 箇所）。
+    """
+    for mid in (24, 33):
+        comm.set_message_interval(mid, POSITION_MSG_INTERVAL_US)
+    # ATTITUDE(30) は 40Hz（1 フレーム 25ms）を要求する
+    comm.set_message_interval(30, ATTITUDE_MSG_INTERVAL_US)
+
+
+def send_takeoff_command(comm, alt):
+    """離陸指令（MAV_CMD_NAV_TAKEOFF）。"""
+    comm.takeoff(alt)
+
+
+def send_setpoint(comm, lat_i, lon_i, alt, yaw_deg=None):
     """Guided 目標（SET_POSITION_TARGET_GLOBAL_INT）を送信する。
 
     Args:
-        lat_i, lon_i: 緯度・経度（度 × 1e7 の整数）
-        alt: 相対高度 [m]
+        lat_i, lon_i: 緯度・経度（度 × 1e7 の整数）。
+        alt: 相対高度 [m]（MAV_FRAME_GLOBAL_RELATIVE_ALT_INT = EKF home 相対）。
         yaw_deg: 目標ヨー角 [deg]（MAVLink NED, 0=北）。省略時は設定値
-                 TARGET_YAW_SEND_DEG（既定 0.0、環境変数で上書き可）を使う。
+                 TARGET_YAW_SEND_DEG（既定 0.0、環境変数 AR_HOOK_TARGET_YAW_DEG で
+                 上書き可）を使う。9c2a5 の yaw 引数は通信部経由でも維持する。
     """
     if yaw_deg is None:
         yaw_deg = TARGET_YAW_SEND_DEG
-    yaw_rad = math.radians(yaw_deg)  # ロック内の処理を減らすため事前に計算
-    with mav_send_lock:
-        m.mav.set_position_target_global_int_send(0, m.target_system, m.target_component,
-            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, MASK,
-            lat_i, lon_i, alt, 0,0,0,0,0,0,
-            yaw_rad, 0)
+    yaw_rad = math.radians(yaw_deg)  # 送信ロック取得前に変換しておく
+    comm.setpoint(lat_i, lon_i, alt, yaw_rad=yaw_rad, type_mask=MASK)
 # ───── 座標変換 ─────
 # ✅ gps_to_local_xyz() / local_xyz_to_gps() の実体は local_frame.py に移しました。
 #    ローカル NED 原点は REF_LAT/REF_LON/REF_ALT の 1 箇所だけで、
 #    gps_now も gps_origin も同じ原点を参照します（起動時原点の正規化は廃止）。
-def send_local_target(m, x, y, z, home_down_m):
+def send_local_target(comm, x, y, z, home_down_m):
     """REF原点基準のローカル目標を、home相対高度のGLOBAL_INT指令として送信します。
 
     MAV_FRAME_GLOBAL_RELATIVE_ALT_INT は EKF home（離陸地点）からの高度を要求する
@@ -986,7 +999,7 @@ def send_local_target(m, x, y, z, home_down_m):
     で home 相対高度へ変換してから送ります（変換はこの 1 関数経由に統一）。
 
     Args:
-        m: MAVLink 接続
+        comm: MAVLink 通信部（MavlinkComm）
         x, y: REF原点基準の北・東 [m]
         z: REF原点基準の Down [m]
         home_down_m: 離陸地点の Down 座標 [m]（gps_origin['z']）
@@ -998,7 +1011,7 @@ def send_local_target(m, x, y, z, home_down_m):
     alt_above_home = local_down_to_home_relative_alt(z, home_down_m)
     # ヨーは固定ヨー設定（TARGET_YAW_DEG / AR_HOOK_TARGET_YAW_DEG、既定 0.0=北向き）
     send_setpoint(
-        m, int(lat * 1e7), int(lon * 1e7), alt_above_home,
+        comm, int(lat * 1e7), int(lon * 1e7), alt_above_home,
         yaw_deg=TARGET_YAW_SEND_DEG,
     )
     return alt_above_home
@@ -1265,123 +1278,125 @@ def estimate_square_center_from_marker(corner, marker_id, marker_size, camera_ma
     return center
 
 # ───── 状態監視スレッド ─────
-# ATTITUDE を 40Hz 要求で受けるため、受信ループは 5ms 周期（200Hz）で回す。
+# ATTITUDE を 40Hz 要求で受けるため、監視ループは 5ms 周期（200Hz）で回す。
 # 5ms は 40Hz の 25ms 周期に対して十分細かく、姿勢の取り込み遅れを数msに抑える。
 MAVLINK_POLL_INTERVAL_S = 0.005
-# 監視対象のメッセージ種別（これ以外は読み捨てる）
-MAVLINK_MONITORED_TYPES = ("HEARTBEAT", "ATTITUDE", "GLOBAL_POSITION_INT")
+# 受信キューを 1 パスで空にして種別ごとの最新値を残す処理（12794 の drain 受信）は、
+# 19d3881 の通信部移行で MavlinkComm._rx_loop へ移設しました。ここでは
+# comm.snapshot() が返す最新値キャッシュの seq 変化だけを見ます。
 
+# ※ m の受信（recv_msg / wait_heartbeat）は通信部の受信スレッド 1 本だけが行います。
+#    送信は通信部の _send_lock のみを取得し、受信側は _send_lock を取得しないため、
+#    送信ロック内で受信待ちに入ることはありません。
+def monitor_vehicle(comm):
+    """Pixhawk の状態監視（200Hz ポーリング）。受信そのものは MAVLink 通信部の 1 スレッドが行い、
+    ここでは最新値キャッシュ（comm.snapshot()）を読むだけです。
 
-def _drain_mavlink_messages(m):
-    """受信キューを 1 回で空にし、監視対象メッセージの最新値を返す。
-
-    従来は種別ごとに recv_match(type=...) を呼んでいたが、recv_match は目的の
-    種別が見つかるまで他の種別を読み捨てる。ATTITUDE を高レートで受けるために
-    ポーリング間隔を短くすると、その読み捨てで GLOBAL_POSITION_INT を
-    取りこぼす恐れがあるため、1 パスで全種別を取り出して最新値だけを残す。
+    シーケンス番号（heartbeat_seq / attitude_seq / position_seq）が変わったときだけ
+    処理するため、同じメッセージを二重に処理しません（従来の recv_match 1 件ずつと等価）。
     """
-    latest = {msg_type: None for msg_type in MAVLINK_MONITORED_TYPES}
-    while True:
-        msg = m.recv_msg()
-        if msg is None:
-            break
-        msg_type = msg.get_type()
-        if msg_type in latest:
-            latest[msg_type] = msg
-    return latest
-
-
-# ※ m の受信（recv_match / wait_heartbeat）は現状この monitor_vehicle スレッドのみが行います。
-#    送信ラッパーは mav_send_lock のみを取得し、受信側は mav_send_lock を取得しないため、
-#    送信ロック内で受信待ちに入ることはありません（将来の受信集約タスクの前提）。
-def monitor_vehicle(m):
     global running, gps_now, gps_origin, origin, initial_target_set, guided_mode_active, current_yaw_deg
     global current_roll_rad, current_pitch_rad, current_yaw_rad
     guided, armed, takeoff_sent, takeoff_reached = False, False, False, False
     start_time = 0
     gps_origin_set = False
+    last_heartbeat_seq = -1
+    last_attitude_seq = -1
+    last_position_seq = -1
     while running:
-        latest = _drain_mavlink_messages(m)
-        hb = latest["HEARTBEAT"]
-        if hb:
-            is_guided = hb.custom_mode == 4
-            new_armed = bool(hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
-            guided_mode_active = is_guided  # ← 状態を記録用に更新
-            if is_guided and new_armed and not guided:
-                print("✓ Guidedモード検出 → 離陸準備")
-                start_time, guided = time.time(), True
-                print(
-                    f"✓ 目標Yawを {TARGET_YAW_SEND_DEG:.1f}° に固定"
-                    f"（設定ソース: {TARGET_YAW_SOURCE}）"
-                )
-            if guided and not takeoff_sent and time.time() - start_time > 3:
-                send_takeoff_command(m, TAKEOFF_ALT)
-                print(f"✓ 離陸指令（{TAKEOFF_ALT:.1f}m）")
-                takeoff_sent = True
-            if not is_guided:
-                guided, takeoff_sent, takeoff_reached, initial_target_set = False, False, False, False
-            if armed and not new_armed:  # アームされていた状態からディスアームされた場合のみ終了
-                print("\n✓ ディスアーム検出")
-                running = False  # プログラム停止（記録は最後に保存）
-            armed = new_armed  # アーム状態を更新
-        # 実時間の機体姿勢(ロール、ピッチ、ヨー角)情報の取得
-        # ATTITUDE を受信した時刻を monotonic で記録し、鮮度判定に使う（要件2）。
-        att = latest["ATTITUDE"]
-        if att:
-            with io_lock:
-                current_roll_rad = att.roll
-                current_pitch_rad = att.pitch
-                current_yaw_rad = att.yaw
-                current_yaw_deg = (math.degrees(att.yaw) + 360) % 360
-            _attitude_freshness.mark_received()
-        pos = latest["GLOBAL_POSITION_INT"]
-        if pos:
-            lat, lon = pos.lat / 1e7, pos.lon / 1e7
-            # ✅ 高度は REF_ALT と同じスケール（AMSL）で扱います。
-            #    relative_alt（EKF home 相対）をそのまま Down にすると、起動が
-            #    離陸後だと z 基準がずれるため、REF基準の Down は alt(AMSL) から求めます。
-            alt_amsl = pos.alt / 1000
-            alt_rel = pos.relative_alt / 1000
-            if origin is None:
-                # ✅ origin は起動時の GPS メッセージを残すだけのログ用変数です。
-                #    ローカル座標の原点は local_frame.REF_* 固定（ここでは作りません）。
-                origin = pos
-                print(f"✓ 起動時のGPS位置（ログ用）: lat={lat:.7f}, lon={lon:.7f}")
-            # ✅ 起動時原点による正規化は廃止しました（原点は local_frame.REF_* 固定）。
-            #    旧実装は初回位置を gps_origin として減算していたため、離陸地点と REF の
-            #    差が追従目標に一定バイアスとして乗っていました。
-            north, east, down = gps_to_local_xyz(lat, lon, alt_amsl)
-            origin_log = None
-            takeoff_log = None
-            with io_lock:
-                # ✅ 原点関連（gps_origin / gps_now / target）の読み書きは必ずこのロック内
-                if not gps_origin_set:
-                    gps_origin['x'] = north
-                    gps_origin['y'] = east
-                    # 離陸地点（EKF home）の Down。起動が離陸後でも home 基準で求まります。
-                    gps_origin['z'] = home_down_from_position(alt_amsl, alt_rel)
-                    gps_origin_set = True
-                    origin_log = (north, east, gps_origin['z'])
-                gps_now.update({'x': north, 'y': east, 'z': down})
-                # ✅ 離陸判定は home 相対高度（上正）で行います（高度基準の統一）
-                if takeoff_sent and not takeoff_reached and alt_rel >= TAKEOFF_ALT * 0.9:
-                    takeoff_reached = True
-                    # ✅ TAKEOFF_ALT は「離陸地点からの高さ」なので Down へ変換して設定
-                    target['z'] = alt_above_home_to_local_down(
-                        TAKEOFF_ALT, gps_origin['z']
+        state = comm.snapshot()
+        if state.link_lost:
+            print("❌ MAVLinkリンク切断を検出 → プログラムを終了します")
+            running = False
+            break
+        if state.heartbeat_seq != last_heartbeat_seq:
+            last_heartbeat_seq = state.heartbeat_seq
+            hb = state.heartbeat
+            if hb:
+                is_guided = state.guided
+                new_armed = state.armed
+                guided_mode_active = is_guided  # ← 状態を記録用に更新
+                if is_guided and new_armed and not guided:
+                    print("✓ Guidedモード検出 → 離陸準備")
+                    start_time, guided = time.time(), True
+                    print(
+                        f"✓ 目標Yawを {TARGET_YAW_SEND_DEG:.1f}° に固定"
+                        f"（設定ソース: {TARGET_YAW_SOURCE}）"
                     )
-                    initial_target_set = True
-                    takeoff_log = target['z']
-            if origin_log is not None:
-                print(
-                    f"✓ 離陸地点のREF座標: X={origin_log[0]:.3f}, Y={origin_log[1]:.3f}, "
-                    f"Down={origin_log[2]:.3f}"
-                )
-            if takeoff_log is not None:
-                print(
-                    f"✓ 離陸高度到達: home相対 {TAKEOFF_ALT:.2f}m "
-                    f"(target Down={takeoff_log:.2f}m)"
-                )
+                if guided and not takeoff_sent and time.time() - start_time > 3:
+                    send_takeoff_command(comm, TAKEOFF_ALT)
+                    print(f"✓ 離陸指令（{TAKEOFF_ALT:.1f}m）")
+                    takeoff_sent = True
+                if not is_guided:
+                    guided, takeoff_sent, takeoff_reached, initial_target_set = False, False, False, False
+                if armed and not new_armed:  # アームされていた状態からディスアームされた場合のみ終了
+                    print("\n✓ ディスアーム検出")
+                    running = False  # プログラム停止（記録は最後に保存）
+                armed = new_armed  # アーム状態を更新
+        # 実時間の機体姿勢(ロール、ピッチ、ヨー角)情報の取得
+        # ATTITUDE は通信部が 40Hz で受信（drain）し、ここは seq の変化だけを見る。
+        # ATTITUDE を受信した時刻を monotonic で記録し、鮮度判定に使う（要件2）。
+        if state.attitude_seq != last_attitude_seq:
+            last_attitude_seq = state.attitude_seq
+            att = state.attitude
+            if att:
+                with io_lock:
+                    current_roll_rad = att.roll
+                    current_pitch_rad = att.pitch
+                    current_yaw_rad = att.yaw
+                    current_yaw_deg = (math.degrees(att.yaw) + 360) % 360
+                # seq が進んだ直後を「ATTITUDE を受信した時刻」として鮮度判定に使う
+                _attitude_freshness.mark_received()
+        if state.position_seq != last_position_seq:
+            last_position_seq = state.position_seq
+            pos = state.position
+            if pos:
+                lat, lon = pos.lat / 1e7, pos.lon / 1e7
+                # ✅ 高度は REF_ALT と同じスケール（AMSL）で扱います。
+                #    relative_alt（EKF home 相対）をそのまま Down にすると、起動が
+                #    離陸後だと z 基準がずれるため、REF基準の Down は alt(AMSL) から求めます。
+                alt_amsl = pos.alt / 1000
+                alt_rel = pos.relative_alt / 1000
+                if origin is None:
+                    # ✅ origin は起動時の GPS メッセージを残すだけのログ用変数です。
+                    #    ローカル座標の原点は local_frame.REF_* 固定（ここでは作りません）。
+                    origin = pos
+                    print(f"✓ 起動時のGPS位置（ログ用）: lat={lat:.7f}, lon={lon:.7f}")
+                # ✅ 起動時原点による正規化は廃止しました（原点は local_frame.REF_* 固定）。
+                #    旧実装は初回位置を gps_origin として減算していたため、離陸地点と REF の
+                #    差が追従目標に一定バイアスとして乗っていました。
+                north, east, down = gps_to_local_xyz(lat, lon, alt_amsl)
+                origin_log = None
+                takeoff_log = None
+                with io_lock:
+                    # ✅ 原点関連（gps_origin / gps_now / target）の読み書きは必ずこのロック内
+                    if not gps_origin_set:
+                        gps_origin['x'] = north
+                        gps_origin['y'] = east
+                        # 離陸地点（EKF home）の Down。起動が離陸後でも home 基準で求まります。
+                        gps_origin['z'] = home_down_from_position(alt_amsl, alt_rel)
+                        gps_origin_set = True
+                        origin_log = (north, east, gps_origin['z'])
+                    gps_now.update({'x': north, 'y': east, 'z': down})
+                    # ✅ 離陸判定は home 相対高度（上正）で行います（高度基準の統一）
+                    if takeoff_sent and not takeoff_reached and alt_rel >= TAKEOFF_ALT * 0.9:
+                        takeoff_reached = True
+                        # ✅ TAKEOFF_ALT は「離陸地点からの高さ」なので Down へ変換して設定
+                        target['z'] = alt_above_home_to_local_down(
+                            TAKEOFF_ALT, gps_origin['z']
+                        )
+                        initial_target_set = True
+                        takeoff_log = target['z']
+                if origin_log is not None:
+                    print(
+                        f"✓ 離陸地点のREF座標: X={origin_log[0]:.3f}, Y={origin_log[1]:.3f}, "
+                        f"Down={origin_log[2]:.3f}"
+                    )
+                if takeoff_log is not None:
+                    print(
+                        f"✓ 離陸高度到達: home相対 {TAKEOFF_ALT:.2f}m "
+                        f"(target Down={takeoff_log:.2f}m)"
+                    )
         # 従来は 1/SEND_HZ = 100ms 周期だったが、ATTITUDE 40Hz 要求に合わせて
         # 5ms 周期に短縮する。GLOBAL_POSITION_INT は 5Hz のままなので、位置更新の
         # 実効レートは従来と同じ（受信したときだけ更新）である。
@@ -1441,7 +1456,7 @@ def start_camera_stream_server(port=CAMERA_STREAM_PORT):
     return server
 
 
-def camera_tracker_loop(m, show_window=False, stream_enabled=False):
+def camera_tracker_loop(comm, show_window=False, stream_enabled=False):
     global running, target, gps_now, current_yaw_deg, initial_target_set, guided_mode_active
     global last_center_cam, last_rvec_cargo
     global cargo_center_world, cargo_detected, id1_detected
@@ -2080,8 +2095,8 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                             cargo_center_cam_x = u - W / 2.0
                             cargo_center_cam_y = v - H / 2.0
 
-                        # 送信は send_setpoint() 内の mav_send_lock で直列化される。
-                        # ここは io_lock を保持していない区間なので、取得順序（io_lock → mav_send_lock）に反しない。
+                        # 送信は send_setpoint() → 通信部の _send_lock で直列化される。
+                        # ここは io_lock を保持していない区間なので、取得順序（io_lock → 通信部の _send_lock）に反しない。
                         # 自動で誘導目標コマンドを送信
                         if guided_mode_active and target_ready and math.isfinite(home_down_m):
                             # ✅ 高度設定に一定値ではなく追跡値 target['z'] を利用。
@@ -2090,7 +2105,7 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                             #    （旧実装は REF_ALT 基準の高度をそのまま送っていた）。
                             # ヨーはユーザー設定（TARGET_YAW_DEG、既定 0.0=北向き）に従う
                             # （send_local_target() が TARGET_YAW_SEND_DEG を渡す）。
-                            send_local_target(m, send_x, send_y, send_z, home_down_m)
+                            send_local_target(comm, send_x, send_y, send_z, home_down_m)
 
                 else:
                     # 荷物が検出されていない場合
@@ -2332,7 +2347,7 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
         if show_window:
             cv2.destroyAllWindows()
 # ───── キーボード操作 ─────
-def control_loop(m):
+def control_loop(comm):
     global running, target, initial_target_set
     fd, old = sys.stdin.fileno(), termios.tcgetattr(sys.stdin.fileno())
     tty.setcbreak(fd)
@@ -2371,8 +2386,8 @@ def control_loop(m):
                         TARGET_HEIGHT_ABOVE_TAKEOFF, home_down_m)
                     echo = f"t → N={target['x']:.2f} E={target['y']:.2f} D={target['z']:.2f}"
                 if echo: moved = True; print(f"KEY: {echo}")
-                # カメラスレッドと同じ m へ送信するため、send_setpoint() 内の mav_send_lock で直列化される。
-                # ここは io_lock を保持していない区間なので、取得順序（io_lock → mav_send_lock）に反しない。
+                # カメラスレッドと同じ接続へ送信するため、send_setpoint() → 通信部の _send_lock で直列化される。
+                # ここは io_lock を保持していない区間なので、取得順序（io_lock → 通信部の _send_lock）に反しない。
                 if moved:
                     # ✅ 目標と原点はロック内で確定させてから送信します
                     with io_lock:
@@ -2382,7 +2397,7 @@ def control_loop(m):
                     if math.isfinite(home_down_m):
                         # 自動追従と同じ固定ヨー設定（TARGET_YAW_DEG, 既定 0.0=北向き）
                         send_local_target(
-                            m, key_target_x, key_target_y, key_target_z, home_down_m)
+                            comm, key_target_x, key_target_y, key_target_z, home_down_m)
                     else:
                         print("⚠ 離陸地点の高度が未確定のため目標を送信しません")
             time.sleep(0.05)  # 100% CPU使用率を防ぐためにスリープを追加
@@ -2651,6 +2666,7 @@ def save_csv():
 def main():
     global running
     stream_server = None
+    comm = None
     print("="*50)
     print("ArduPilot 精密制御 - 下向きカメラ用 (ID1センサ利用)")
     print("="*50)
@@ -2663,8 +2679,10 @@ def main():
     )
     
     try:
-        mav = connect_mavlink()
-        set_msg_rate(mav)
+        # 統合プログラムとしての役割: 接続 → 各機能の起動 → 異常時の終了処理
+        comm = connect_mavlink()      # シリアルを開くのは通信部だけ（1 回）
+        set_msg_rate(comm)            # 受信頻度の要求（送信ロック内）
+        comm.start()                  # 受信スレッドを 1 本だけ開始
         
         # ───── カメラ向きソースの選択 ─────
         global CAMERA_ORIENTATION_SOURCE
@@ -2685,8 +2703,8 @@ def main():
             print("✓ カメラ向きソース: Motive (カメラ rigid body)")
             print(f"  Motive用光学中心オフセット: {selected_offset.tolist()} m")
         
-        # スレッド起動
-        threading.Thread(target=monitor_vehicle, args=(mav,), daemon=True).start()
+        # スレッド起動（MAVLink 受信は通信部の 1 スレッド、状態監視はその最新値キャッシュを読む）
+        threading.Thread(target=monitor_vehicle, args=(comm,), daemon=True).start()
         threading.Thread(target=record_data, daemon=True).start()
         threading.Thread(
             target=motive_rigid_body_pose_udp_listener, daemon=True
@@ -2718,11 +2736,11 @@ def main():
                 print(f"⚠ SSH映像配信を開始できません ({exc})")
         
         # コントロールループをサブスレッドで起動 (キー入力を別スレッドに逃がす)
-        control_thread = threading.Thread(target=control_loop, args=(mav,), daemon=False)
+        control_thread = threading.Thread(target=control_loop, args=(comm,), daemon=False)
         control_thread.start()
         
         # カメラ追跡ループをメインスレッドで実行 (OpenCV GUI of main thread workaround)
-        camera_tracker_loop(mav, show_camera_window, stream_camera)
+        camera_tracker_loop(comm, show_camera_window, stream_camera)
         
     except KeyboardInterrupt:
         print("\n⚠ ユーザーによる強制終了 (Ctrl+C) を検出しました。")
@@ -2734,6 +2752,9 @@ def main():
         # コントロールスレッドの終了待機
         if 'control_thread' in locals() and control_thread.is_alive():
             control_thread.join()
+        # 統合プログラムからの停止要求: 受信スレッドを止めてシリアルを閉じる
+        if comm is not None:
+            comm.stop()
         print("\n記録終了、CSV保存中...")
         save_csv()
         print("✓ プログラム終了")
