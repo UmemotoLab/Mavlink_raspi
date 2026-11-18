@@ -50,10 +50,66 @@ SEND_HZ = 10  # 従来の状態監視周期（10Hz）。現在は MAVLINK_POLL_I
 AR_MEASUREMENT_FPS = 40
 AR_LOG_HZ = 40
 AR_FRAME_DURATION_US = round(1_000_000 / AR_MEASUREMENT_FPS)
+# SET_POSITION_TARGET_GLOBAL_INT の type_mask（デフォルト 0x09F8 は yaw 有効）
 MASK = 0x09F8
-TARGET_YAW_DEG = 0.0  # 北向き固定（MAVLink NED yaw）
+# 固定ヨー角 [deg]（MAVLink NED yaw: 0=北, 90=東, 180=南）
+# デフォルト 0.0 は従来通り北向き。EKF/circle_params.json の fixed_yaw_deg と
+# 同じ扱いで、環境変数 AR_HOOK_TARGET_YAW_DEG により起動時に上書きできる。
+TARGET_YAW_DEG = 0.0
+TARGET_YAW_ENV_VAR = "AR_HOOK_TARGET_YAW_DEG"
+MASK_ENV_VAR = "AR_HOOK_MASK"
 CAMERA_WIDTH = 1640
 CAMERA_HEIGHT = 1232
+
+# ───── 環境変数による上書き（固定ヨー角・type_mask） ─────
+# 既定値（TARGET_YAW_DEG = 0.0, MASK = 0x09F8）は維持したまま、実行時だけ
+# 切り替えたい場合に使う。標準ライブラリの os のみを使い、外部依存は増やさない。
+#   AR_HOOK_TARGET_YAW_DEG=180.0  → 南向き固定
+#   AR_HOOK_MASK=0x0DF8           → yaw を無効化（機体任せ）
+def _env_float_param(env_name, default, label, minimum, maximum):
+    """環境変数の実数値を読み、範囲を検証する（未設定ならデフォルト）。"""
+    raw = os.environ.get(env_name)
+    if raw is None or not raw.strip():
+        return float(default), "デフォルト"
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        sys.exit(
+            f"❌ 環境変数 {env_name} の値が数値ではありません: '{raw}'"
+            f"（{label}は {minimum} 〜 {maximum} で指定してください）"
+        )
+    if not math.isfinite(value) or not (minimum <= value <= maximum):
+        sys.exit(
+            f"❌ 環境変数 {env_name} の値が範囲外です: {raw}"
+            f"（{label}は {minimum} 〜 {maximum} で指定してください）"
+        )
+    return value, f"環境変数 {env_name}"
+
+
+def _env_mask_param(env_name, default):
+    """type_mask を環境変数から読む（'0x09F8' のような16進表記も可）。"""
+    raw = os.environ.get(env_name)
+    if raw is None or not raw.strip():
+        return int(default), "デフォルト"
+    try:
+        value = int(raw.strip(), 0)
+    except ValueError:
+        sys.exit(
+            f"❌ 環境変数 {env_name} の値が整数ではありません: '{raw}'"
+            "（例: 0x09F8）"
+        )
+    if not (0 <= value <= 0xFFFF):
+        sys.exit(
+            f"❌ 環境変数 {env_name} の値が範囲外です: {raw}"
+            "（0x0000 〜 0xFFFF で指定してください）"
+        )
+    return value, f"環境変数 {env_name}"
+
+
+TARGET_YAW_DEG, TARGET_YAW_SOURCE = _env_float_param(
+    TARGET_YAW_ENV_VAR, TARGET_YAW_DEG, "目標ヨー角 [deg]", 0.0, 360.0
+)
+MASK, MASK_SOURCE = _env_mask_param(MASK_ENV_VAR, MASK)
 # ───── ArUco・カメラ追跡設定 ─────
 MARKER_SIZE = 0.04  # マーカーの一辺の長さ（メートル、4cm）
 ID_CENTER_MARKER = 1  # 正方形の中心に配置されるマーカーID（ID 1）
@@ -64,6 +120,25 @@ CAMERA_RIGID_BODY_ID = 3  # カメラに取り付けたMotiveセンサのID（Mo
 # 'front' : 前向きカメラ（テスト用）  OpenCV Z(前)=body X, X(右)=body Y, Y(下)=body Z
 # 'down'  : 下向きカメラ（実機用）   OpenCV Z(下)=body Z, X(右)=body Y, Y(画像下=機体後方)=-body X
 CAMERA_MOUNT_DIRECTION = 'down'
+# ───── 下向きカメラの取付ヨーと yaw 指令の関係 ─────
+# CAMERA_MOUNT_DIRECTION = 'down' のとき、画像座標系と機体座標系のずれ
+# （カメラの取付ヨー）は座標変換側ですでに吸収している:
+#   * _camera_to_ned_rotation_from_euler() / _camera_rotation_from_motive() の
+#     R_cv_to_body が「OpenCV +X = body +Y、画像下 = 機体後方」を表現している
+#   * Motive カメラ rigid body の姿勢、および CAMERA_ROT_OFFSET
+#   * camera_extrinsics.json（光学中心オフセット）、
+#     marker_pose_offsets.json（マーカーと剛体の固定姿勢）
+# そのため TARGET_YAW_DEG は「機体の向き（NED heading, 0=北）」だけを指定し、
+# 画像側の目標方向は上記の変換結果から求まる。ここへ取付ヨーを再加算すると
+# 上記の座標変換・校正値と二重補正になり、marker_pose_offsets.json /
+# camera_extrinsics.json の校正内容と矛盾するので、追加オフセットは
+# 既定で 0.0（= 補正なし）とする。
+# 上記の校正で吸収しきれない残留分がある場合に限り、この定数へ残留角 [deg] を
+# 設定して TARGET_YAW_SEND_DEG として指令へ反映する（校正ファイル側の値を
+# 変更したうえで併用しないこと）。
+CAMERA_MOUNT_YAW_OFFSET_DEG = 0.0
+# SET_POSITION_TARGET_GLOBAL_INT に載せる実際の目標ヨー [deg]
+TARGET_YAW_SEND_DEG = TARGET_YAW_DEG + CAMERA_MOUNT_YAW_OFFSET_DEG
 # Camera optical origin relative to the selected pose/GPS reference, expressed
 # in the OpenCV camera frame (meters). camera_extrinsics.json can override it.
 CAMERA_OPTICAL_OFFSET = np.array([0.0, 0.0, 0.0], dtype=np.float32)
@@ -866,11 +941,21 @@ def set_msg_rate(m):
 def send_takeoff_command(m, alt):
     m.mav.command_long_send(m.target_system, m.target_component,
         mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0,0,0,0,0,0,0, alt)
-def send_setpoint(m, lat_i, lon_i, alt):
+def send_setpoint(m, lat_i, lon_i, alt, yaw_deg=None):
+    """Guided 目標（SET_POSITION_TARGET_GLOBAL_INT）を送信する。
+
+    Args:
+        lat_i, lon_i: 緯度・経度（度 × 1e7 の整数）
+        alt: 相対高度 [m]
+        yaw_deg: 目標ヨー角 [deg]（MAVLink NED, 0=北）。省略時は設定値
+                 TARGET_YAW_SEND_DEG（既定 0.0、環境変数で上書き可）を使う。
+    """
+    if yaw_deg is None:
+        yaw_deg = TARGET_YAW_SEND_DEG
     m.mav.set_position_target_global_int_send(0, m.target_system, m.target_component,
         mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, MASK,
         lat_i, lon_i, alt, 0,0,0,0,0,0,
-        math.radians(TARGET_YAW_DEG), 0)
+        math.radians(yaw_deg), 0)
 # ───── 座標変換 ─────
 # ✅ gps_to_local_xyz() / local_xyz_to_gps() の実体は local_frame.py に移しました。
 #    ローカル NED 原点は REF_LAT/REF_LON/REF_ALT の 1 箇所だけで、
@@ -893,7 +978,11 @@ def send_local_target(m, x, y, z, home_down_m):
     """
     lat, lon, _alt_ref = local_xyz_to_gps(x, y, z)
     alt_above_home = local_down_to_home_relative_alt(z, home_down_m)
-    send_setpoint(m, int(lat * 1e7), int(lon * 1e7), alt_above_home)
+    # ヨーは固定ヨー設定（TARGET_YAW_DEG / AR_HOOK_TARGET_YAW_DEG、既定 0.0=北向き）
+    send_setpoint(
+        m, int(lat * 1e7), int(lon * 1e7), alt_above_home,
+        yaw_deg=TARGET_YAW_SEND_DEG,
+    )
     return alt_above_home
 
 
@@ -1200,7 +1289,10 @@ def monitor_vehicle(m):
             if is_guided and new_armed and not guided:
                 print("✓ Guidedモード検出 → 離陸準備")
                 start_time, guided = time.time(), True
-                print("✓ 目標Yawを北向き (0°) に固定")
+                print(
+                    f"✓ 目標Yawを {TARGET_YAW_SEND_DEG:.1f}° に固定"
+                    f"（設定ソース: {TARGET_YAW_SOURCE}）"
+                )
             if guided and not takeoff_sent and time.time() - start_time > 3:
                 send_takeoff_command(m, TAKEOFF_ALT)
                 print(f"✓ 離陸指令（{TAKEOFF_ALT:.1f}m）")
@@ -1973,6 +2065,8 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                             #    ローカル Down → 送信 alt の変換は send_local_target() に集約し、
                             #    MAV_FRAME_GLOBAL_RELATIVE_ALT_INT が要求する home 相対高度で送ります
                             #    （旧実装は REF_ALT 基準の高度をそのまま送っていた）。
+                            # ヨーはユーザー設定（TARGET_YAW_DEG、既定 0.0=北向き）に従う
+                            # （send_local_target() が TARGET_YAW_SEND_DEG を渡す）。
                             send_local_target(m, send_x, send_y, send_z, home_down_m)
 
                 else:
@@ -2261,6 +2355,7 @@ def control_loop(m):
                             target['x'], target['y'], target['z'])
                         home_down_m = gps_origin['z']
                     if math.isfinite(home_down_m):
+                        # 自動追従と同じ固定ヨー設定（TARGET_YAW_DEG, 既定 0.0=北向き）
                         send_local_target(
                             m, key_target_x, key_target_y, key_target_z, home_down_m)
                     else:
@@ -2534,6 +2629,13 @@ def main():
     print("="*50)
     print("ArduPilot 精密制御 - 下向きカメラ用 (ID1センサ利用)")
     print("="*50)
+    # 実際に送信する yaw と、その設定ソース（デフォルト / 環境変数）を1行で表示
+    print(
+        f"ℹ 目標ヨー: {TARGET_YAW_SEND_DEG:.1f}deg"
+        f" (設定ソース: {TARGET_YAW_SOURCE}"
+        f" / 取付ヨーオフセット: {CAMERA_MOUNT_YAW_OFFSET_DEG:.1f}deg)"
+        f" | MASK: 0x{MASK:04X} (設定ソース: {MASK_SOURCE})"
+    )
     
     try:
         mav = connect_mavlink()
