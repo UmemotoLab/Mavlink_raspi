@@ -223,6 +223,7 @@ motive_rigid_body_pose_history = {
 }
 ar_marker_pose_log = {
     name: {
+        "no_offset_position_ned": [float('nan')] * 3,
         "pre_offset_position_ned": [float('nan')] * 3,
         "pre_offset_quaternion_ned": [float('nan')] * 4,
         "position_ned": [float('nan')] * 3,
@@ -459,9 +460,9 @@ def _camera_pose_at_frame_time(frame_timestamp_s):
     if pose is None:
         return None
 
-    position_ned, quaternion = pose
+    position_ned_raw, quaternion = pose
     rotation = _camera_rotation_from_motive(*quaternion)
-    position_ned = position_ned + rotation @ CAMERA_OPTICAL_OFFSET
+    position_ned = position_ned_raw + rotation @ CAMERA_OPTICAL_OFFSET
     sample_times = [sample[0] for sample in samples]
     insertion = bisect_right(sample_times, frame_timestamp_s)
     pose_timestamp_s = (
@@ -469,7 +470,7 @@ def _camera_pose_at_frame_time(frame_timestamp_s):
         if insertion and insertion < len(sample_times)
         else sample_times[max(0, min(insertion, len(sample_times) - 1))]
     )
-    return rotation, position_ned, pose_timestamp_s
+    return rotation, position_ned, pose_timestamp_s, position_ned_raw
 
 
 def _camera_sensor_timestamp_to_unix(sensor_timestamp_ns):
@@ -977,7 +978,7 @@ def camera_to_world_xyz_motive(tvec, debug=False, camera_pose=None):
     """
     global _debug_cargo_log_time
     if camera_pose is not None:
-        R, t, _ = camera_pose
+        R, t, _ = camera_pose[:3]
         received = True
     else:
         with io_lock:
@@ -1371,6 +1372,7 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                         R_imu_camera_to_ned,
                         camera_position_ned,
                         motive_frame_timestamp_s,
+                        vehicle_position_ned,
                     )
 
                 if (
@@ -1590,10 +1592,12 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                         calibration_camera_rotation,
                         calibration_camera_position,
                         calibration_camera_time,
+                        no_offset_camera_position,
                     ) = frame_camera_pose
                     for (
                         name,
                         detected,
+                        no_offset_position_cam,
                         pre_offset_position,
                         pre_offset_rotation,
                         marker_position,
@@ -1602,6 +1606,7 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                         (
                             "hand",
                             has_id1,
+                            raw_id1_cam if has_id1 else None,
                             hand_pre_offset_position_cam if has_id1 else None,
                             hand_pre_offset_rotation_cam if has_id1 else None,
                             id1_cam,
@@ -1610,6 +1615,7 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                         (
                             "cargo",
                             has_cargo and not used_last_center,
+                            raw_center_cam if center_cam is not None else None,
                             cargo_pre_offset_position_cam if center_cam is not None else None,
                             cargo_pre_offset_rotation_cam if center_cam is not None else None,
                             center_cam,
@@ -1618,9 +1624,15 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                     ):
                         if (
                             detected
+                            and no_offset_position_cam is not None
                             and marker_position is not None
                             and marker_rotation is not None
                         ):
+                            no_offset_position_ned = (
+                                calibration_camera_rotation
+                                @ np.asarray(no_offset_position_cam, dtype=np.float64)
+                                + no_offset_camera_position
+                            )
                             pre_offset_position_ned = (
                                 calibration_camera_rotation
                                 @ np.asarray(pre_offset_position, dtype=np.float64)
@@ -1640,6 +1652,7 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                                 @ np.asarray(marker_rotation, dtype=np.float64)
                             )
                             ar_pose_updates[name] = {
+                                "no_offset_position_ned": no_offset_position_ned.tolist(),
                                 "pre_offset_position_ned": pre_offset_position_ned.tolist(),
                                 "pre_offset_quaternion_ned": list(
                                     rotation_matrix_to_quaternion_xyzw(
@@ -1660,6 +1673,7 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                             name,
                             {
                                 "pre_offset_position_ned": [float('nan')] * 3,
+                                "no_offset_position_ned": [float('nan')] * 3,
                                 "pre_offset_quaternion_ned": [float('nan')] * 4,
                                 "position_ned": [float('nan')] * 3,
                                 "quaternion_ned": [float('nan')] * 4,
@@ -2157,6 +2171,11 @@ def record_data():
                     1 if ar_marker_pose_log[name]["received"] else 0,
                 )
             ]
+            ar_pose_no_offset_log_values = [
+                component
+                for name in ("hand", "cargo")
+                for component in ar_marker_pose_log[name]["no_offset_position_ned"]
+            ]
             ar_pose_pre_offset_log_values = [
                 component
                 for name in ("hand", "cargo")
@@ -2203,6 +2222,7 @@ def record_data():
             *motive_pose_log,
             *motive_pose_calibration_log,
             *ar_pose_log_values,
+            *ar_pose_no_offset_log_values,
             *ar_pose_pre_offset_log_values,
         ])
         time.sleep(1 / AR_LOG_HZ)
@@ -2291,6 +2311,15 @@ def save_csv():
                     f'AR_{name}_Pose_Time_s',
                     f'AR_{name}_Camera_Pose_Time_s',
                     f'AR_{name}_Pose_Received',
+                )
+            ],
+            *[
+                column
+                for name in ("Hand", "Cargo")
+                for column in (
+                    f'AR_{name}_NoOffset_X_NED_m',
+                    f'AR_{name}_NoOffset_Y_NED_m',
+                    f'AR_{name}_NoOffset_Z_NED_m',
                 )
             ],
             *[
