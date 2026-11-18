@@ -260,6 +260,14 @@ current_yaw_deg = 180.0  # MAVLinkから取得する実時間ヨー角（度）
 data_records = []
 origin = None
 io_lock = threading.Lock()
+# ───── MAVLink 送信専用ロック ─────
+# pymavlink の書き込み（m.mav.*_send）はスレッドセーフではないため、同一接続 m への
+# 送信を mav_send_lock で直列化します（カメラスレッド最大40Hz + キーボードスレッド20Hz）。
+# 取得順序は「io_lock → mav_send_lock」の一方向のみとします。
+# ・io_lock を保持したまま送信ラッパーを呼ばないこと（保持区間で送信しない）。
+# ・mav_send_lock を保持したまま io_lock を取得しないこと。
+# 送信は必ず「MAVLink 送信ラッパー」セクションの関数経由で行い、m.mav.*_send を直接呼びません。
+mav_send_lock = threading.Lock()
 initial_target_set = False
 guided_mode_active = False  # Guidedモード判定用
 # 最後に確定した荷物中心と回転ベクトル（カメラ座標系）を保持
@@ -913,6 +921,12 @@ def connect_mavlink():
         
     print(f"✓ MAVLink接続完了 (System ID: {m.target_system}, Component ID: {m.target_component})")
     return m
+# ───── MAVLink 送信ラッパー（mav_send_lock で直列化） ─────
+# ここが m へ書き込む唯一のセクションです。m.mav.*_send を直接呼ばず、必ずこの関数群を経由します。
+# ・ロックは関数内で取得するため、呼び出し側で with を書く必要はありません。
+# ・ロック保持区間は送信処理のみです（sleep・受信・print・ファイル I/O を入れない）。
+# ・io_lock を保持したままこれらの関数を呼ばないでください（取得順序は io_lock → mav_send_lock のみ）。
+# 将来モジュール分割する場合は、このセクションをそのまま送信モジュールへ移します。
 # ───── MAVLink 受信周期 ─────
 # ATTITUDE (id 30): 25000us = 40Hz。
 #   AR_MEASUREMENT_FPS = 40Hz で目標を生成するため、従来の 200000us (5Hz) では
@@ -931,16 +945,18 @@ POSITION_MSG_INTERVAL_US = 200000
 
 
 def set_msg_rate(m):
-    for mid in (24, 33):
+    with mav_send_lock:
+        for mid in (24, 33):
+            m.mav.command_long_send(m.target_system, m.target_component,
+                mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                0, mid, POSITION_MSG_INTERVAL_US, 0,0,0,0,0)
         m.mav.command_long_send(m.target_system, m.target_component,
             mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
-            0, mid, POSITION_MSG_INTERVAL_US, 0,0,0,0,0)
-    m.mav.command_long_send(m.target_system, m.target_component,
-        mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
-        0, 30, ATTITUDE_MSG_INTERVAL_US, 0,0,0,0,0)
+            0, 30, ATTITUDE_MSG_INTERVAL_US, 0,0,0,0,0)
 def send_takeoff_command(m, alt):
-    m.mav.command_long_send(m.target_system, m.target_component,
-        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0,0,0,0,0,0,0, alt)
+    with mav_send_lock:
+        m.mav.command_long_send(m.target_system, m.target_component,
+            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0,0,0,0,0,0,0, alt)
 def send_setpoint(m, lat_i, lon_i, alt, yaw_deg=None):
     """Guided 目標（SET_POSITION_TARGET_GLOBAL_INT）を送信する。
 
@@ -952,10 +968,12 @@ def send_setpoint(m, lat_i, lon_i, alt, yaw_deg=None):
     """
     if yaw_deg is None:
         yaw_deg = TARGET_YAW_SEND_DEG
-    m.mav.set_position_target_global_int_send(0, m.target_system, m.target_component,
-        mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, MASK,
-        lat_i, lon_i, alt, 0,0,0,0,0,0,
-        math.radians(yaw_deg), 0)
+    yaw_rad = math.radians(yaw_deg)  # ロック内の処理を減らすため事前に計算
+    with mav_send_lock:
+        m.mav.set_position_target_global_int_send(0, m.target_system, m.target_component,
+            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, MASK,
+            lat_i, lon_i, alt, 0,0,0,0,0,0,
+            yaw_rad, 0)
 # ───── 座標変換 ─────
 # ✅ gps_to_local_xyz() / local_xyz_to_gps() の実体は local_frame.py に移しました。
 #    ローカル NED 原点は REF_LAT/REF_LON/REF_ALT の 1 箇所だけで、
@@ -1273,6 +1291,9 @@ def _drain_mavlink_messages(m):
     return latest
 
 
+# ※ m の受信（recv_match / wait_heartbeat）は現状この monitor_vehicle スレッドのみが行います。
+#    送信ラッパーは mav_send_lock のみを取得し、受信側は mav_send_lock を取得しないため、
+#    送信ロック内で受信待ちに入ることはありません（将来の受信集約タスクの前提）。
 def monitor_vehicle(m):
     global running, gps_now, gps_origin, origin, initial_target_set, guided_mode_active, current_yaw_deg
     global current_roll_rad, current_pitch_rad, current_yaw_rad
@@ -2059,6 +2080,8 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                             cargo_center_cam_x = u - W / 2.0
                             cargo_center_cam_y = v - H / 2.0
 
+                        # 送信は send_setpoint() 内の mav_send_lock で直列化される。
+                        # ここは io_lock を保持していない区間なので、取得順序（io_lock → mav_send_lock）に反しない。
                         # 自動で誘導目標コマンドを送信
                         if guided_mode_active and target_ready and math.isfinite(home_down_m):
                             # ✅ 高度設定に一定値ではなく追跡値 target['z'] を利用。
@@ -2348,6 +2371,8 @@ def control_loop(m):
                         TARGET_HEIGHT_ABOVE_TAKEOFF, home_down_m)
                     echo = f"t → N={target['x']:.2f} E={target['y']:.2f} D={target['z']:.2f}"
                 if echo: moved = True; print(f"KEY: {echo}")
+                # カメラスレッドと同じ m へ送信するため、send_setpoint() 内の mav_send_lock で直列化される。
+                # ここは io_lock を保持していない区間なので、取得順序（io_lock → mav_send_lock）に反しない。
                 if moved:
                     # ✅ 目標と原点はロック内で確定させてから送信します
                     with io_lock:
