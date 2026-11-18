@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-import os,sys,select,time,math,threading,termios,tty,csv,datetime,signal
+import os,sys,select,time,math,threading,termios,tty,csv,datetime,signal,argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from bisect import bisect_right
 from collections import deque
 import numpy as np
-import cv2
-from cv2 import aruco
+# ✅ SITL / 接続先確認だけを行う PC では OpenCV が無いことがあります。
+#    --help や通信部の起動までを妨げないよう、カメラ依存は遅延エラーにします。
+try:
+    import cv2
+    from cv2 import aruco
+except ImportError:  # pragma: no cover - カメラ無し環境向け
+    cv2 = None
+    aruco = None
 from marker_pose_calibration import (
     apply_pose_offset,
     interpolate_pose,
@@ -41,12 +47,35 @@ from mavlink_comm import (
     MavlinkConnectionError,
     MavlinkTimeoutError,
 )
+# ✅ 接続先は本番デフォルト（/dev/ttyAMA0, 1000000bps, RTS/CTS）のまま、
+#    環境変数 / 起動引数 / 対話入力で SITL（UDP）へ切り替えられます。
+#    既定値とプロンプトの既定（1=Serial）は connection_config.py が保持します。
+from connection_config import (
+    PRODUCTION_BAUD,
+    PRODUCTION_DEVICE,
+    SITL_CONNECTION,
+    add_connection_arguments,
+    connection_selection_forced,
+    resolve_connection_from_args,
+)
 from target_limiter import (
     frame_step_limit,
     limit_target,
     lost_target_desired,
 )
-import pytz
+try:
+    import pytz
+except ImportError:  # pragma: no cover - 標準ライブラリで代替
+    class _PytzFallback:
+        """pytz が無い環境向けの最小限の timezone 代替。"""
+
+        @staticmethod
+        def timezone(name):
+            if name == "Asia/Tokyo":
+                return datetime.timezone(datetime.timedelta(hours=9))
+            return datetime.timezone.utc
+
+    pytz = _PytzFallback()
 # Raspberry Pi 5 カメラサポート
 try:
     # pyrefly: ignore [missing-import]
@@ -939,35 +968,82 @@ def input_with_timeout(prompt, timeout=5, default='1'):
         print(f"\n[タイムアウト] {timeout}秒間入力がなかったため、デフォルト値 '{default}' を使用します。")
         return default
 
-def connect_mavlink():
+def build_arg_parser():
+    """起動引数（MAVLink 接続先の切り替え）を定義します。
+
+    本番デフォルトを変えないため、引数を省略した場合は従来どおり
+    対話プロンプト（既定 1=Serial）で接続先を選びます。
+    """
+    parser = argparse.ArgumentParser(
+        description=(
+            "AR-hook: ArUco 追従 + MAVLink"
+            "（本番シリアル / SITL UDP 切替）"
+        )
+    )
+    add_connection_arguments(parser)
+    return parser
+
+
+def _print_connection_menu():
+    """従来の接続方法メニュー（既定は 1=Serial のまま）に SITL を追加表示。"""
+    print("\n" + "="*50)
+    print(" 接続方法を選択してください")
+    print(
+        f" 1: Serial接続 ({PRODUCTION_DEVICE}, {PRODUCTION_BAUD} baud, "
+        "RTS/CTS有効) ※デフォルト"
+    )
+    print(" 2: USB接続 (/dev/ttyACM0, 115200 baud)")
+    print(f" 3: SITL接続 ({SITL_CONNECTION}) ※UDP")
+    print("    （--sitl / AR_HOOK_SITL=1 でも選択できます）")
+    print("="*50)
+
+
+def connect_mavlink(connection=None, args=None):
     """MAVLink 通信部を生成して接続する（シリアルを開くのはここ 1 回だけ）。
 
     実体は mavlink_comm.MavlinkComm が持つため、AR-hook1.py 側では
     mavutil.mavlink_connection / wait_heartbeat を直接呼びません。
-    """
-    print("\n" + "="*50)
-    print(" 接続方法を選択してください")
-    print(" 1: Serial接続 (/dev/ttyAMA0, 1000000 baud, RTS/CTS有効) ※デフォルト")
-    print(" 2: USB接続 (/dev/ttyACM0, 115200 baud)")
-    print("="*50)
-    
-    choice = input_with_timeout("選択 (1 または 2): ", timeout=5, default='1')
-    
-    if choice == '2':
-        device = '/dev/ttyACM0'
-        baud = 115200
-        rtscts = False
-    else:
-        device = '/dev/ttyAMA0'
-        baud = 1000000
-        rtscts = True
 
-    comm = MavlinkComm(device, baud=baud, rtscts=rtscts)
+    Args:
+        connection: connection_config.ConnectionConfig。指定時は対話しない
+            （検証スクリプト・自動実行向け）。
+        args: argparse の Namespace。--connection / --device / --sitl が
+            指定されていれば対話プロンプトを省略します。
+    """
+    try:
+        if connection is None:
+            if connection_selection_forced(args):
+                connection = resolve_connection_from_args(args)
+                print(
+                    "\n✓ 接続先（環境変数/起動引数）: "
+                    f"{connection.describe()}"
+                )
+            else:
+                _print_connection_menu()
+                choice = input_with_timeout(
+                    "選択 (1, 2 または 3): ", timeout=5, default='1'
+                )
+                connection = resolve_connection_from_args(args, choice=choice)
+                print(f"✓ 接続先: {connection.describe()}")
+        else:
+            print(f"\n✓ 接続先: {connection.describe()}")
+    except ValueError as exc:
+        print(f"❌ 接続設定エラー: {exc}")
+        sys.exit(1)
+
+    comm = MavlinkComm(
+        connection.device,
+        baud=connection.baud,
+        rtscts=connection.rtscts,
+    )
     try:
         comm.connect()  # 接続・HEARTBEAT 待ちの表示は通信部が行います
     except MavlinkTimeoutError:
         print("❌ ハートビートの受信タイムアウト: Pixhawkからの応答がありません。")
-        print("配線やPixhawkの電源、BaudRate設定を確認してください。")
+        if connection.is_network:
+            print("SITL の起動と接続方向（udpin / udpout）を確認してください。")
+        else:
+            print("配線やPixhawkの電源、BaudRate設定を確認してください。")
         sys.exit(1)
     except MavlinkConnectionError as exc:
         print(f"❌ MAVLink接続エラー: {exc}")
@@ -1058,6 +1134,27 @@ def send_local_target(comm, x, y, z, home_down_m):
         yaw_deg=TARGET_YAW_SEND_DEG,
     )
     return alt_above_home
+
+
+def can_send_guided_setpoint(guided_active, target_ready, home_down_m):
+    """Guided 目標を送信してよいかを判定する唯一の入口。
+
+    - ``guided_active``: monitor_vehicle() が HEARTBEAT から更新する GUIDED 判定。
+      GUIDED 以外（STABILIZE / LOITER / LAND など）では setpoint を送らない。
+    - ``target_ready``: 離陸高度到達後に True になる ``initial_target_set``。
+      キーボードの u/m/h/l は離陸前から操作できるため ``None`` を渡して
+      この条件を課さない。
+    - ``home_down_m``: 離陸地点の Down 座標。未確定（nan/None）の間は、
+      home 相対高度へ変換できないため送らない。
+
+    カメラ追従・検出ロスト時・キーボード操作の 3 経路すべてがこの関数を使い、
+    「GUIDED 以外では送らない」を 1 箇所で保証する。
+    """
+    if not guided_active:
+        return False
+    if target_ready is not None and not target_ready:
+        return False
+    return home_down_m is not None and math.isfinite(home_down_m)
 
 
 def rotation_matrix_to_euler_rpy(rotation):
@@ -1196,6 +1293,16 @@ def _selected_camera_optical_offset():
     return CAMERA_OPTICAL_OFFSETS.get(
         CAMERA_ORIENTATION_SOURCE, CAMERA_OPTICAL_OFFSETS["motive"]
     )
+
+
+def auto_target_blocked_by_stale_attitude(attitude_fallback_used, attitude_is_stale):
+    """古い ATTITUDE で自動誘導目標を更新・送信してよいかのゲート。
+
+    ``attitude_fallback_used`` が True のときだけ ATTITUDE が目標姿勢のソース
+    なので、その経路で古い（``attitude_is_stale``）場合に目標更新と setpoint
+    送信を止める。Motive 姿勢で直接変換できる場合は対象外（False）。
+    """
+    return bool(attitude_fallback_used) and bool(attitude_is_stale)
 
 
 def _print_stale_attitude_warning(age_s):
@@ -1624,14 +1731,14 @@ def update_target_on_detection_lost(comm):
         decay_active=decay_active,
     )
 
-    if guided_mode_active and initial_target_set:
+    # ✅ 送信可否は can_send_guided_setpoint() に集約（GUIDED 以外では送らない）。
+    with io_lock:
+        home_down_m = gps_origin['z']
+    if can_send_guided_setpoint(guided_mode_active, initial_target_set, home_down_m):
         # ✅ クランプ後の目標（REF基準のNED Down）を、水平=REF基準 / 高度=home相対 に
         #    変換して送る（変換は send_local_target に集約。f6152 の高度基準を維持）。
-        with io_lock:
-            home_down_m = gps_origin['z']
-        if math.isfinite(home_down_m):
-            send_local_target(
-                comm, target_cmd[0], target_cmd[1], target_cmd[2], home_down_m)
+        send_local_target(
+            comm, target_cmd[0], target_cmd[1], target_cmd[2], home_down_m)
 
 
 def camera_tracker_loop(comm, show_window=False, stream_enabled=False):
@@ -1644,7 +1751,15 @@ def camera_tracker_loop(comm, show_window=False, stream_enabled=False):
     global ar_hand_attitude_cam, ar_hand_attitude_world
     global _coord_source_log
     global _camera_stream_jpeg
-    
+
+    if cv2 is None:
+        print(
+            "❌ OpenCV (cv2) が見つからないため、カメラ追従を開始できません。"
+            "requirements.txt をインストールしてください。"
+            "SITL の接続・送信だけを確認する場合は verify_sitl.py を使用します。"
+        )
+        return
+
     print(f"カメラ初期化中（解像度: {CAMERA_WIDTH}x{CAMERA_HEIGHT}）...")
     picam2 = None
     cap = None
@@ -2135,7 +2250,9 @@ def camera_tracker_loop(comm, show_window=False, stream_enabled=False):
                     attitude_age_s = _attitude_freshness.age_s()
                     attitude_is_stale = _attitude_freshness.is_stale()
                     stale_fallback_blocks_target = (
-                        attitude_fallback_used and attitude_is_stale
+                        auto_target_blocked_by_stale_attitude(
+                            attitude_fallback_used, attitude_is_stale
+                        )
                     )
                     # ✅ テレメトリおよび姿勢（Roll, Pitch, Yaw）データの取得
                     # ID1センサから取得したドローン真値を優先使用
@@ -2283,7 +2400,9 @@ def camera_tracker_loop(comm, show_window=False, stream_enabled=False):
                         # 送信は send_setpoint() → 通信部の _send_lock で直列化される。
                         # ここは io_lock を保持していない区間なので、取得順序（io_lock → 通信部の _send_lock）に反しない。
                         # 自動で誘導目標コマンドを送信
-                        if guided_mode_active and target_ready and math.isfinite(home_down_m):
+                        if can_send_guided_setpoint(
+                            guided_mode_active, target_ready, home_down_m
+                        ):
                             # ✅ クランプ・レート制限を適用した目標（target_cmd）を送る。
                             #    ローカル Down → 送信 alt の変換は send_local_target() に集約し、
                             #    MAV_FRAME_GLOBAL_RELATIVE_ALT_INT が要求する home 相対高度で送ります
@@ -2599,10 +2718,16 @@ def control_loop(comm):
                     with io_lock:
                         key_target_x, key_target_y, key_target_z = target_cmd
                         home_down_m = gps_origin['z']
-                    if math.isfinite(home_down_m):
+                    # ✅ キーボード経路も GUIDED 以外では送らない（カメラ経路と同じ判定）。
+                    #    離陸前の u/m/h/l を許可するため target_ready は課さない（None）。
+                    if can_send_guided_setpoint(
+                        guided_mode_active, None, home_down_m
+                    ):
                         # 自動追従と同じ固定ヨー設定（TARGET_YAW_DEG, 既定 0.0=北向き）
                         send_local_target(
                             comm, key_target_x, key_target_y, key_target_z, home_down_m)
+                    elif not guided_mode_active:
+                        print("⚠ Guidedモードではないため目標を送信しません")
                     else:
                         print("⚠ 離陸地点の高度が未確定のため目標を送信しません")
             time.sleep(0.05)  # 100% CPU使用率を防ぐためにスリープを追加
@@ -2894,8 +3019,10 @@ def save_csv():
         writer.writerows(data_records)
     print(f"\n✓ CSV保存完了: {path} ({len(data_records)} 行)")
 # ───── メイン関数 ─────
-def main():
+def main(argv=None):
     global running
+    # 接続先の切り替え引数だけを解釈する（引数なしなら従来どおり対話プロンプト）。
+    args = build_arg_parser().parse_args(argv)
     stream_server = None
     comm = None
     print("="*50)
@@ -2911,7 +3038,9 @@ def main():
     
     try:
         # 統合プログラムとしての役割: 接続 → 各機能の起動 → 異常時の終了処理
-        comm = connect_mavlink()      # シリアルを開くのは通信部だけ（1 回）
+        # シリアル/UDP を開くのは通信部だけ（1 回）。
+        # 接続先は args / 環境変数 → 未指定なら従来の対話プロンプト。
+        comm = connect_mavlink(args=args)
         set_msg_rate(comm)            # 受信頻度の要求（送信ロック内）
         comm.start()                  # 受信スレッドを 1 本だけ開始
         
