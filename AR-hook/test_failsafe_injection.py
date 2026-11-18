@@ -448,8 +448,14 @@ def test_disarm_stops_and_csv_is_saved():
 
     src = AR_HOOK.read_text(encoding="utf-8")
     assert "running = False  # プログラム停止（記録は最後に保存）" in src
+    # 終了処理は finalize_shutdown() に集約した（join タイムアウト + CSV 保存の
+    # finally 保証）。順序（comm.stop() → save_csv()）は従来どおりであること。
+    shutdown_start = src.index("def finalize_shutdown(")
+    shutdown_end = src.index("# ───── メイン関数 ─────", shutdown_start)
+    shutdown_src = src[shutdown_start:shutdown_end]
+    assert shutdown_src.index("comm.stop()") < shutdown_src.index("save_csv()")
     main_src = src[src.index("def main("):]
-    assert main_src.index("comm.stop()") < main_src.index("save_csv()")
+    assert "finalize_shutdown(comm, control_thread, stream_server)" in main_src
 
 
 # ───── 4. ATTITUDE 停止（モック）: 追従停止・目標保持・警告 1 秒 1 回 ─────

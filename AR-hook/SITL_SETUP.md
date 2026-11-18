@@ -388,8 +388,8 @@ python3 sitl_command.py --connection udpin:0.0.0.0:14551 param DISARM_DELAY 0
 
 | 制約 | 内容 |
 | --- | --- |
-| OpenCV のバージョン | `install-prereqs-mac.sh` は opencv-python **5.1.0.95** を入れます。本番の `requirements.txt` は 4.10.0.84 です。OpenCV 5 では ArUco の `ids` の形が変わり、`AR-hook1.py` の `int(ids[i][0])` で `IndexError` になります（実測）。カメラ追従を SITL で動かす場合は `pip install 'opencv-python==4.10.0.84'` で本番と同じ版に戻してください。 |
-| キーボード制御 | `control_loop()` は TTY を要求します。stdin が `/dev/null` やパイプだと `termios.error: (19, 'Operation not supported by device')` でスレッドだけ停止します（MAVLink・記録は継続）。対話実行するか `script -q /dev/null python3 AR-hook1.py ...` で疑似 TTY を与えてください。 |
+| OpenCV のバージョン | `install-prereqs-mac.sh` は opencv-python **5.1.0.95** を入れます。本番の `requirements.txt` は 4.10.0.84 です。OpenCV 5 では ArUco の `ids` が `(N,)` 形状になりますが、`AR-hook1.py` は `aruco_ids_to_list()` で `(N,1)` / `(N,)` の両方を扱うため、SITL 用に OpenCV をダウングレードする必要はありません（最初期版では `int(ids[i][0])` が `IndexError` になりました）。 |
+| キーボード制御 | `control_loop()` は起動時に TTY を初期化できない場合（stdin が `/dev/null` やパイプ）、キーボード制御だけを無効化して継続します（MAVLink・記録・CSV は正常）。キー操作を試す場合のみ対話実行するか `script -q /dev/null python3 AR-hook1.py ...` で疑似 TTY を与えてください。 |
 | Motive | この環境には Motive が無いため、`Motive_*` 列は N/A のままです。 |
 | 実カメラ | macOS のカメラ権限が無い実行経路では `VideoCapture(0)` が開けません（`isOpened() == False`）。その場合 AR-hook は「カメラ追跡を開始できません」と表示して終了し、CSV は保存されます。 |
 

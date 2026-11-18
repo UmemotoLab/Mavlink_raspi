@@ -46,6 +46,9 @@ mypy-extensions==0.4.3
 numpy==1.26.4
 oauthlib==3.2.2
 olefile==0.46
+# OpenCV 4.10 を前提に固定しています（このバージョンでは aruco.detectMarkers() の
+# ids が (N,1) 形状）。OpenCV 5.x の (N,) 形状でも動くよう、ids の参照は
+# AR-hook1.py の aruco_ids_to_list() に集約しています（環境の入れ替えは不要）。
 opencv-python==4.10.0.84
 parso==0.8.3
 pexpect==4.8.0

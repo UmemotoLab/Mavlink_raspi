@@ -408,6 +408,8 @@ macOS 上でビルドして動かした結果** です。スタブの結果は�
 `python3 AR-hook1.py --connection udpin:0.0.0.0:14550` を実 SITL 相手に実行し、
 起動 → 接続 → 自動離陸 → 記録 → 終了 → CSV 保存までを確認しました。
 
+### 10.1 修正前の実測（2026-11-18 16:55–16:58 JST / タスク 190db）
+
 | 実行 | 条件 | 結果 |
 | --- | --- | --- |
 | 1 | 疑似 TTY（`script -q /dev/null`） | 接続・GUIDED 検出・**離陸指令 0.5m**・**離陸高度到達 0.50 m**・カメラ追跡（約 30 Hz）まで動作。LAND で disarm → 追跡ループ終了。ただし TTY のキーボード制御スレッドの join で停止し、CSV は未保存（下記の制約） |
@@ -423,7 +425,7 @@ Target_Update_Source = none
 Target_Limit_Rate_Active / XY_Clamp / Z_Clamp_Up / Z_Clamp_Down = 0（未作動）
 ```
 
-**制約（実測）**
+**制約（修正前の実測）**
 
 - `control_loop()` は TTY を要求します。stdin が `/dev/null` の実行 2・3 では
   `termios.error: (19, 'Operation not supported by device')` でキーボード制御
@@ -437,6 +439,85 @@ Target_Limit_Rate_Active / XY_Clamp / Z_Clamp_Up / Z_Clamp_Down = 0（未作動�
   の 4.10.0.84 に戻せば従来どおりの想定ですが、**OpenCV 4.10 での再実行は
   NOT RUN** です。
 
+### 10.2 修正内容（2026-11-18 17:20 JST）と修正後の再検証（17:25–17:27 JST）
+
+#### 修正 A: 終了時に CSV が保存されない（フェイルセーフ）
+
+- `AR-hook1.py` の終了処理を `finalize_shutdown(comm, control_thread,
+  stream_server)` に集約し、`main()` の `finally` から呼ぶようにしました。
+  - `control_thread.join(timeout=timeout)`（既定
+    `CONTROL_THREAD_JOIN_TIMEOUT_S = 2.0` 秒）。join が戻らない環境でも打ち切ります。
+  - `comm.stop()` → `save_csv()` を `try/finally` で囲み、join のタイムアウトや
+    `comm.stop()` の例外でも `save_csv()` を必ず実行します。
+  - 順序（`running=False` → スレッド停止 → `comm.stop()` → `save_csv()`）と
+    CSV の列・内容は変更していません。
+- `control_loop()`:
+  - `termios` の初期化を `try` 内へ移し、`termios.error` / `OSError` 等では
+    **キーボード制御だけを無効化して即座に戻る**（MAVLink・記録・CSV は継続）。
+  - TTY 設定の復元は `finally` + 例外ガードで必ず実行。
+  - `running=False` 後は最大 50 ms でループを抜ける。
+  - スレッド生成を `daemon=True` にし、join タイムアウト時もプロセス終了を
+    妨げないようにしました。
+- `get_key()` も `select` / `read` の例外を捕捉して `None` を返します
+  （端末が無い・閉じた fd でもスレッドを落とさない）。
+
+#### 修正 B: OpenCV 5.x の ArUco `ids` 形状
+
+- `aruco_ids_to_list(ids)` を `AR-hook1.py` に追加し、`int(ids[i][0])` の直接参照を
+  廃止しました。`(N,1)`（OpenCV 4.x）/ `(N,)`（OpenCV 5.x）/ `None` /
+  空配列を扱い、未検出・0 件は `[]` を返します。numpy の API は使わず
+  `tolist()` と反復だけを使うため、numpy が無くても動作します。
+- グローバル環境の OpenCV は変更していません（5.1.0 のまま）。
+  `requirements.txt` は `opencv-python==4.10.0.84` を維持し、5.x でも動く旨を
+  コメントで追記しました。
+
+#### 再検証の結果（実 SITL）
+
+1. `./run_sitl_verify.sh`（実 ArduPilot Copter SITL）
+   - 出力の実測: 5 シナリオのログ + 合計 6 項目が **6/6 PASS**、`総合: PASS`、
+     終了メッセージ `✅ すべて PASS`。
+   - 内訳: `[takeoff] PASS` / `[f6152] PASS` / `[7f03b] PASS` / `[9c2a5] PASS` /
+     `[12794] PASS` / `[disarm] PASS`
+   - ログ: `~/arhook_sitl_logs/run_sitl_verify_fixcheck/run.log`
+2. end-to-end（実 SITL、`AR-hook1.py --connection udpin:0.0.0.0:14550`）
+
+| 実行 | 条件 | 実測結果 |
+| --- | --- | --- |
+| 修正後 1 | stdin=`/dev/null` | 接続 → GUIDED 検出 → **離陸指令 0.5m** → **離陸高度到達 0.50 m** → disarm 検出 → 終了コード **0**。CSV は **170 列 / 2459 行**（`~/LOGS_Pixhawk6c/20261118_172613_1.csv`、`missing_columns=[]`）。`termios.error` は「⚠ キーボード制御を無効化します…」として処理し、MAVLink・記録・CSV は継続 |
+| 修正後 2 | 疑似 TTY（`script -q /dev/null`） | TTY のキーボード制御モードで動作 → 離陸指令 0.5m → 離陸高度到達 0.50 m → disarm 検出 → 終了コード **0**。CSV は **170 列 / 2092 行**（`~/LOGS_Pixhawk6c/20261118_172736_1.csv`、`missing_columns=[]`） |
+
+- 実行 2 のログ: `~/arhook_sitl_logs/e2e_tty_20261118_172615/arhook.log`
+- 実行 1 のログ: `~/arhook_sitl_logs/e2e_null_20261118_172451/arhook.log`
+- 疑似 TTY の再実行では、今回は `control_thread.join()` が 2 秒以内に戻り
+  タイムアウト警告は出ませんでした（**旧実行 1 の停止そのものは再現せず**）。
+  join が戻らない状況は回帰テスト
+  `test_arhook_sitl_fixes.py::test_finalize_shutdown_saves_csv_when_control_thread_never_joins`
+  で模擬し、タイムアウト後に CSV が保存されることを確認しています。
+
+#### 修正前後の比較
+
+| 項目 | 修正前（2026-11-18 16:55–16:58） | 修正後（2026-11-18 17:25–17:27） |
+| --- | --- | --- |
+| disarm 終了時の CSV（疑似 TTY） | 未保存（join が戻らず `save_csv()` に到達しない） | **保存（170 列 / 2092 行）** |
+| stdin=`/dev/null` | `termios.error` でキーボード制御スレッドだけ停止（CSV は保存） | 警告を出してキーボード制御のみ無効化、**CSV 2459 行 / 170 列**で正常終了 |
+| OpenCV 5.1.0 の ArUco `ids` | `int(ids[i][0])` で `IndexError`（実行 2） | `IndexError` なし（`ids` 未検出のカメラ映像で end-to-end 完走） |
+| join が戻らない場合 | CSV 未保存 | **join タイムアウト 2 秒後に CSV 保存**（回帰テストで実証） |
+
+#### 「修正済み（実測）」と「未確認」
+
+- **修正済み（実測）**
+  - 終了処理の join タイムアウト + `save_csv()` の finally 保証
+    （回帰テスト 9 件のうち A 系 4 件、実 SITL の end-to-end 1・2）
+  - stdin=`/dev/null` でキーボード制御だけを無効化して継続
+  - OpenCV 5.1.0 環境で ArUco `ids` の `IndexError` が出ないこと
+    （モック形状テスト + 実 SITL の end-to-end）
+- **未確認（NOT RUN）**
+  - 実機（Pi の実 TTY）での disarm 終了と CSV 保存。疑似 TTY では停止を
+    再現できなかったため、実端末での確認が必要です。
+  - 実マーカーを写した OpenCV 5.1.0 / 4.10.0.84 双方での追従
+    （SITL にはカメラ画像を注入していないため `ids` は未検出）。
+  - 旧実行 1 と同じ join 停止の再現（安全弁で回避できることは回帰テストで確認済み）。
+
 ---
 
 ## 11. 未実施（NOT RUN）と理由
@@ -445,13 +526,13 @@ Target_Limit_Rate_Active / XY_Clamp / Z_Clamp_Up / Z_Clamp_Down = 0（未作動�
 | --- | --- | --- |
 | `sim_vehicle.py --console --map`（MAVProxy の GUI） | NOT RUN | ヘッドレス環境のため `--no-mavproxy` で起動。MAVProxy 1.8.75 は導入済み |
 | ArUco マーカーを写した実写での閉ループ追従 | NOT RUN | SITL にカメラ画像を注入する仕組みが無い。実カメラ + マーカーが必要 |
-| OpenCV 4.10.0.84 での ArUco 動作 | NOT RUN | 環境には 5.1.0 が入っている。`pip install 'opencv-python==4.10.0.84'` 後に再実行すれば確認できる |
+| OpenCV 4.10.0.84 での ArUco 動作 | NOT RUN（形状は N,1 をモックテスト済み） | 環境には 5.1.0 が入っている。`aruco_ids_to_list()` は (N,1) も扱うが、4.10 実機での追従は未実行（環境の入れ替えは行っていない） |
 | Motive（`Motive_*` 列） | NOT RUN | Motive サーバが無い（UDP 15770 の送信側が必要） |
 | RTK / RTCM 注入 | NOT RUN | SITL では GPS が理想値。実機の `send_GPS3.py` / `mavlink_rtk` 経路で確認する |
 | 実シリアル（1 Mbps・RTS/CTS） | NOT RUN | SITL は UDP。Pixhawk 実機が必要 |
 | 風・外乱・振動 | NOT RUN | SITL の既定は無風。`SIM_WIND_*` を設定すれば追加可能 |
 | 実機フェイルセーフ（`FS_GCS_ENABLE` 等） | NOT RUN | 実機パラメータとプロポが必要 |
-| 実 TTY でのキーボード制御と終了処理 | NOT RUN | 本環境は疑似 TTY のみ。Pi の実端末で確認する |
+| 実 TTY でのキーボード制御と終了処理 | NOT RUN | 本環境は疑似 TTY のみ。Pi の実端末で確認する（疑似 TTY では join 停止を再現できず、CSV は保存された） |
 | 離陸の再現性（統計評価） | 部分実施 | 3 回の離陸で 0.454〜0.456 m（約 2 s）。回数・ばらつきの統計評価は未実施 |
 
 ---

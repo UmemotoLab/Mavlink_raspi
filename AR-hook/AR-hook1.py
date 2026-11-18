@@ -948,8 +948,16 @@ def motive_rigid_body_pose_udp_listener():
 
 # ───── キー入力処理 ─────
 def get_key():
-    if select.select([sys.stdin], [], [], 0):
-        return sys.stdin.read(1)
+    """1 文字のキー入力を非ブロッキングで読む（端末が無い場合は None）。
+
+    stdin が TTY でない（/dev/null・パイプ・閉じた fd）場合に
+    select/read が例外を出しても、キーボード制御スレッドを落とさない。
+    """
+    try:
+        if select.select([sys.stdin], [], [], 0)[0]:
+            return sys.stdin.read(1)
+    except (OSError, ValueError, AttributeError):
+        return None
     return None
 # ───── MAVLink接続と設定 ─────
 def input_with_timeout(prompt, timeout=5, default='1'):
@@ -1427,6 +1435,54 @@ def estimate_square_center_from_marker(corner, marker_id, marker_size, camera_ma
     )
     return center
 
+# ───── ArUco 検出 ID の取り出し（OpenCV 4.x / 5.x 共通） ─────
+def _flatten_aruco_ids(values):
+    """ArUco の ids を入れ子の深さに依存せず平坦化する（numpy 非依存）。
+
+    `cv2.aruco.detectMarkers()` の ids は OpenCV 4.x では (N, 1)、
+    5.x では (N,) 形状の ndarray で返る。ndarray の `tolist()` と
+    反復だけを使うため、numpy が無い環境（list/tuple を渡す場合）でも動く。
+    """
+    if values is None:
+        return []
+    # numpy 配列は tolist() で list へ落としてから再帰的に平坦化する。
+    # tolist を持たない型（list / tuple / int など）はそのまま扱う。
+    tolist = getattr(values, "tolist", None)
+    if callable(tolist):
+        try:
+            values = tolist()
+        except Exception:
+            # tolist の実装差で失敗しても反復で読めるので続行する
+            pass
+    if isinstance(values, (list, tuple)):
+        flat = []
+        for value in values:
+            flat.extend(_flatten_aruco_ids(value))
+        return flat
+    return [values]
+
+
+def aruco_ids_to_list(ids):
+    """ArUco の検出 ID を int のリストにして返す（形状非依存）。
+
+    対応する形状:
+      * (N, 1) … OpenCV 4.x（例: [[1], [2]]）
+      * (N,)   … OpenCV 5.x（例: [1, 2]）
+      * None   … 未検出
+      * 空配列 … 0 件検出
+    いずれも例外を出さず、未検出・0 件は [] を返す。
+    旧実装は ids を 2 次元前提で添字参照していたため、(N,) 形状で
+    IndexError になった。ids の参照はこの関数に集約する。
+    """
+    result = []
+    for value in _flatten_aruco_ids(ids):
+        try:
+            result.append(int(value))
+        except (TypeError, ValueError, OverflowError):
+            # 数値に変換できない要素は無視する（記録・追従を止めない）
+            continue
+    return result
+
 # ───── 状態監視スレッド ─────
 # ATTITUDE を 40Hz 要求で受けるため、監視ループは 5ms 周期（200Hz）で回す。
 # 5ms は 40Hz の 25ms 周期に対して十分細かく、姿勢の取り込み遅れを数msに抑える。
@@ -1895,7 +1951,9 @@ def camera_tracker_loop(comm, show_window=False, stream_enabled=False):
             fps_frame_count += 1
             # マーカー検出
             corners, ids, rejected = detector.detectMarkers(img)
-            detected_ids = [] if ids is None else [int(marker_id) for marker_id in ids.flatten()]
+            # ids の形状は OpenCV 4.x の (N,1) と 5.x の (N,) で異なるため、
+            # 形状非依存ヘルパに集約する（None / 0 件検出は []）。
+            detected_ids = aruco_ids_to_list(ids)
             needs_world_pose = any(
                 marker_id == ID_CENTER_MARKER
                 or marker_id in SQUARE_MARKER_IDS
@@ -1987,8 +2045,11 @@ def camera_tracker_loop(comm, show_window=False, stream_enabled=False):
             if ids is not None:
                 obj_points = []
                 img_points = []
-                for i, corner in enumerate(corners):
-                    marker_id = int(ids[i][0])
+                # ids の参照は aruco_ids_to_list() に集約する。
+                # 旧実装は 2 次元前提の添字参照だったため、OpenCV 5.x の
+                # (N,) 形状で IndexError になった（SITL_RESULT.md 10 章 実行 2）。
+                # detected_ids には従来どおり append するため、反復はコピーで行う。
+                for marker_id, corner in zip(list(detected_ids), corners):
                     detected_ids.append(marker_id)
                     # ID2-5: 荷物の頂点として中心を推定
                     if marker_id in MARKER_CENTER_OFFSETS:
@@ -2657,8 +2718,25 @@ def camera_tracker_loop(comm, show_window=False, stream_enabled=False):
 # ───── キーボード操作 ─────
 def control_loop(comm):
     global running, target, initial_target_set
-    fd, old = sys.stdin.fileno(), termios.tcgetattr(sys.stdin.fileno())
-    tty.setcbreak(fd)
+    # 端末（TTY）の初期化失敗でスレッドを落とさない。
+    # stdin が /dev/null やパイプの場合、termios.tcgetattr() は
+    # termios.error: (19, 'Operation not supported by device') を投げる（実測）。
+    # 旧実装は try の外で呼んでいたためスレッドが例外終了していた。
+    # ここではキーボード制御だけを無効化して即座に戻し、
+    # MAVLink・記録・CSV 保存はそのまま継続させる。
+    fd = None
+    old = None
+    try:
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+    except (termios.error, OSError, ValueError, AttributeError) as exc:
+        print(
+            "⚠ キーボード制御を無効化します"
+            f"（端末を初期化できません: {exc}）。"
+            "MAVLink・記録・CSV 保存は継続します。"
+        )
+        return
     try:
         print("\n" + "="*60)
         print("キーボード制御モード（u/m/h/l:XY, w/z:Z, t:基準点）")
@@ -2730,9 +2808,17 @@ def control_loop(comm):
                         print("⚠ Guidedモードではないため目標を送信しません")
                     else:
                         print("⚠ 離陸地点の高度が未確定のため目標を送信しません")
+            # running=False を受けたら最大 50ms でループを抜ける（速やかな終了）。
+            # 終了処理は join(timeout=...) で待つ設計だが、ここが長引くと
+            # 記録停止と CSV 保存が遅れるため、1 回の待機は 50ms に固定する。
             time.sleep(0.05)  # 100% CPU使用率を防ぐためにスリープを追加
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        # 例外終了でも TTY 設定を必ず戻す（端末が raw/cbreak のまま残らないように）。
+        try:
+            if fd is not None and old is not None:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        except (termios.error, OSError, ValueError):
+            pass
 # ───── データ記録 ─────
 # カメラ座標変換ソースを記録するためのスレッドセーフ変数
 _coord_source_log = "N/A"
@@ -3018,6 +3104,62 @@ def save_csv():
         ])
         writer.writerows(data_records)
     print(f"\n✓ CSV保存完了: {path} ({len(data_records)} 行)")
+# ───── 終了処理 ─────
+# 終了処理でキーボード制御スレッドを待つ上限 [s]。
+# macOS の疑似 TTY では disarm 後に control_thread.join() が戻らず、
+# save_csv() に到達しなかった（SITL_RESULT.md 10 章 実行 1）。
+# 実機でディスアーム終了時に記録を失わないための安全弁として上限を設ける。
+CONTROL_THREAD_JOIN_TIMEOUT_S = 2.0
+
+
+def finalize_shutdown(comm, control_thread=None, stream_server=None,
+                      join_timeout=None):
+    """終了処理を 1 箇所にまとめ、CSV 保存を必ず実行する。
+
+    順序は従来どおり変えない:
+      1. running=False（各スレッドへ停止を通知）
+      2. キーボード制御スレッドの終了待機（join はタイムアウト付き）
+      3. comm.stop()（受信スレッド停止・シリアル/UDP を閉じる）
+      4. save_csv()（記録の保存）
+
+    2 の join がタイムアウトしても 3・4 を続行する。save_csv() は finally で
+    呼ぶため、join のタイムアウト・comm.stop() の例外でも保存を試みる。
+    戻り値は「制御スレッドが期限内に終了したか」（終了不要なら True）。
+    """
+    global running
+    running = False
+    timeout = (
+        CONTROL_THREAD_JOIN_TIMEOUT_S if join_timeout is None else join_timeout
+    )
+    control_thread_stopped = True
+    try:
+        if stream_server is not None:
+            try:
+                stream_server.shutdown()
+                stream_server.server_close()
+            except Exception as exc:
+                print(f"⚠ 映像配信サーバの停止に失敗しました ({exc})")
+        if control_thread is not None and control_thread.is_alive():
+            # タイムアウト付き join: 戻らない環境でもここで打ち切る。
+            control_thread.join(timeout=timeout)
+            if control_thread.is_alive():
+                control_thread_stopped = False
+                print(
+                    "⚠ キーボード制御スレッドが"
+                    f" {timeout:.1f} 秒以内に終了しませんでした。"
+                    "記録を失わないため待機を打ち切り、CSV 保存へ進みます。"
+                )
+    finally:
+        try:
+            if comm is not None:
+                comm.stop()
+        finally:
+            print("\n記録終了、CSV保存中...")
+            save_csv()
+            print("✓ プログラム終了")
+    return control_thread_stopped
+
+
 # ───── メイン関数 ─────
 def main(argv=None):
     global running
@@ -3025,6 +3167,7 @@ def main(argv=None):
     args = build_arg_parser().parse_args(argv)
     stream_server = None
     comm = None
+    control_thread = None
     print("="*50)
     print("ArduPilot 精密制御 - 下向きカメラ用 (ID1センサ利用)")
     print("="*50)
@@ -3096,7 +3239,12 @@ def main(argv=None):
                 print(f"⚠ SSH映像配信を開始できません ({exc})")
         
         # コントロールループをサブスレッドで起動 (キー入力を別スレッドに逃がす)
-        control_thread = threading.Thread(target=control_loop, args=(comm,), daemon=False)
+        # daemon=True: 終了処理の join がタイムアウトしてもプロセス終了を
+        # 妨げない（CSV 保存を最優先するため）。
+        control_thread = threading.Thread(
+            target=control_loop, args=(comm,), daemon=True,
+            name="keyboard-control",
+        )
         control_thread.start()
         
         # カメラ追跡ループをメインスレッドで実行 (OpenCV GUI of main thread workaround)
@@ -3105,19 +3253,11 @@ def main(argv=None):
     except KeyboardInterrupt:
         print("\n⚠ ユーザーによる強制終了 (Ctrl+C) を検出しました。")
     finally:
-        running = False
-        if stream_server is not None:
-            stream_server.shutdown()
-            stream_server.server_close()
-        # コントロールスレッドの終了待機
-        if 'control_thread' in locals() and control_thread.is_alive():
-            control_thread.join()
-        # 統合プログラムからの停止要求: 受信スレッドを止めてシリアルを閉じる
-        if comm is not None:
-            comm.stop()
-        print("\n記録終了、CSV保存中...")
-        save_csv()
-        print("✓ プログラム終了")
+        # 終了処理の順序（running=False → スレッド停止 → comm.stop() →
+        # save_csv()）は変えずに finalize_shutdown() へ集約する。
+        # スレッド停止は join(timeout) で行うため、戻らない環境
+        # （macOS の疑似 TTY 等）でも save_csv() が必ず実行される。
+        finalize_shutdown(comm, control_thread, stream_server)
 if __name__ == "__main__":
     main()
 
