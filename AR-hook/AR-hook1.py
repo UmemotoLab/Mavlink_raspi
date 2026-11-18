@@ -141,6 +141,8 @@ gps_origin = {'x':0.0, 'y':0.0, 'z':0.0}  # ✅ GPS原点（ローカル座標�
 current_roll_rad = 0.0   # MAVLinkから取得する実時間ロール角（ラジアン）
 current_pitch_rad = 0.0  # MAVLinkから取得する実時間ピッチ角（ラジアン）
 current_yaw_rad = 0.0    # MAVLinkから取得する実時間ヨー角（ラジアン）
+pixhawk_attitude_time_s = float('nan')  # ATTITUDEを最後に受信したホスト時刻
+pixhawk_attitude_received = False
 current_yaw_deg = 180.0  # MAVLinkから取得する実時間ヨー角（度）
 data_records = []
 origin = None
@@ -1066,6 +1068,7 @@ def estimate_square_center_from_marker(corner, marker_id, marker_size, camera_ma
 def monitor_vehicle(m):
     global running, gps_now, gps_origin, origin, initial_target_set, guided_mode_active, current_yaw_deg
     global current_roll_rad, current_pitch_rad, current_yaw_rad
+    global pixhawk_attitude_time_s, pixhawk_attitude_received
     guided, armed, takeoff_sent, takeoff_reached = False, False, False, False
     start_time = 0
     gps_origin_set = False
@@ -1097,6 +1100,8 @@ def monitor_vehicle(m):
                 current_pitch_rad = att.pitch
                 current_yaw_rad = att.yaw
                 current_yaw_deg = (math.degrees(att.yaw) + 360) % 360
+                pixhawk_attitude_time_s = time.time()
+                pixhawk_attitude_received = True
         pos = m.recv_match(type='GLOBAL_POSITION_INT', blocking=False)
         if pos:
             lat, lon, alt = pos.lat / 1e7, pos.lon / 1e7, pos.relative_alt / 1000
@@ -1862,6 +1867,13 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                     )
                     motive_drone_available = motive_drone_pos_received
                     motive_camera_available = motive_camera_received
+                    pixhawk_attitude = (
+                        current_roll_rad,
+                        current_pitch_rad,
+                        current_yaw_rad,
+                        pixhawk_attitude_time_s,
+                        pixhawk_attitude_received,
+                    )
                     motive_cargo_available = (
                         motive_cargo_available
                         or motive_rigid_body_attitude_received[2]
@@ -1886,6 +1898,18 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                     for rigid_body_id, (attitude, quaternion, received)
                     in motive_attitudes.items()
                 )
+                p_roll, p_pitch, p_yaw, p_attitude_time, p_attitude_received = (
+                    pixhawk_attitude
+                )
+                if p_attitude_received:
+                    pixhawk_age_s = max(0.0, time.time() - p_attitude_time)
+                    pixhawk_attitude_text = (
+                        f"RPY[deg]=({math.degrees(p_roll):+.1f},"
+                        f"{math.degrees(p_pitch):+.1f},{math.degrees(p_yaw):+.1f}) "
+                        f"age={pixhawk_age_s:.3f}s"
+                    )
+                else:
+                    pixhawk_attitude_text = "N/A (no ATTITUDE received)"
                 ar_cam_text = ",".join(
                     f"{math.degrees(angle):.1f}" for angle in ar_attitude_cam_log
                 )
@@ -1920,6 +1944,7 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                     f"AR Position[m] hand-Cam=[{ar_hand_position_text}] "
                     f"cargo-NED=[{ar_cargo_position_text}] "
                     f"target-NED=[{ar_target_position_text}] | "
+                    f"Pixhawk {pixhawk_attitude_text} | "
                     f"Motive {motive_attitude_text} | "
                     f"Position NED[m] drone="
                     f"{motive_drone if motive_drone_available else 'N/A'} cargo="
@@ -2133,6 +2158,8 @@ def record_data():
             p_roll = current_roll_rad
             p_pitch = current_pitch_rad
             p_yaw = current_yaw_rad
+            p_attitude_time = pixhawk_attitude_time_s
+            p_attitude_received = 1 if pixhawk_attitude_received else 0
             
             # カメラ座標系生値とMotive逆投影真値のコピー
             c_cam_raw = cargo_cam_raw.copy()
@@ -2211,6 +2238,7 @@ def record_data():
             coord_src, CAMERA_ORIENTATION_SOURCE,
             # Pixhawk姿勢 カラム
             p_roll, p_pitch, p_yaw,
+            p_attitude_time, p_attitude_received,
             # ✅ 新規追加：カメラ座標系 生データとMotive逆投影真値
             c_cam_raw[0], c_cam_raw[1], c_cam_raw[2],
             h_cam_raw[0], h_cam_raw[1], h_cam_raw[2],
@@ -2258,6 +2286,7 @@ def save_csv():
             'Motive_Camera_R20', 'Motive_Camera_R21', 'Motive_Camera_R22',
             'Coord_Source', 'Camera_Orientation_Source',
             'Pixhawk_Roll_rad', 'Pixhawk_Pitch_rad', 'Pixhawk_Yaw_rad',
+            'Pixhawk_Attitude_Time_s', 'Pixhawk_Attitude_Received',
             # ✅ カメラ座標系 生データ
             'Cargo_Cam_Raw_X_m', 'Cargo_Cam_Raw_Y_m', 'Cargo_Cam_Raw_Z_m',
             'Hand_Cam_Raw_X_m', 'Hand_Cam_Raw_Y_m', 'Hand_Cam_Raw_Z_m',
