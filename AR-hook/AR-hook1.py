@@ -28,6 +28,11 @@ from local_frame import (
     local_down_to_home_relative_alt,
     local_xyz_to_gps,
 )
+from attitude_freshness import (
+    AttitudeFreshness,
+    attitude_fallback_used_for_target,
+    attitude_stale_timeout_s_from_env,
+)
 # pyrefly: ignore [missing-import]
 from pymavlink import mavutil
 import pytz
@@ -41,7 +46,7 @@ except ImportError:
 # ───── ユーザー設定 ─────
 STEP = 0.10
 TAKEOFF_ALT = 0.50
-SEND_HZ = 10
+SEND_HZ = 10  # 従来の状態監視周期（10Hz）。現在は MAVLINK_POLL_INTERVAL_S（5ms）を使用。
 AR_MEASUREMENT_FPS = 40
 AR_LOG_HZ = 40
 AR_FRAME_DURATION_US = round(1_000_000 / AR_MEASUREMENT_FPS)
@@ -146,6 +151,19 @@ CSV_DIR.mkdir(exist_ok=True)
 # ───── カメラ向きソース設定 ─────
 # "motive" = Motive rigid body (デフォルト), "ardupilot" = ArduPilot磁気センサー(IMU姿勢)
 CAMERA_ORIENTATION_SOURCE = "motive"
+# ───── MAVLink ATTITUDE 鮮度設定 ─────
+# CAMERA_ORIENTATION_SOURCE == "ardupilot" では姿勢を MAVLink ATTITUDE から取得する。
+# "motive" でも Motive 姿勢（カメラ rigid body / ID1 rigid body）が未受信のときは
+# ATTITUDE へフォールバックする（_active_camera_to_ned_rotation 参照）。
+# 古い ATTITUDE でフォールバック目標を作り続けると誤誘導になるため、受信からの
+# 経過時間がしきい値を超えたら自動誘導目標の更新を停止し、前回目標を保持する。
+# しきい値の既定は 100ms。環境変数 ARHOOK_ATTITUDE_STALE_TIMEOUT_MS で変更可能。
+ATTITUDE_STALE_TIMEOUT_S = attitude_stale_timeout_s_from_env()
+ATTITUDE_STALE_WARN_INTERVAL_S = 1.0  # 警告ログのレート制限（1秒に1回）
+_attitude_freshness = AttitudeFreshness(
+    stale_timeout_s=ATTITUDE_STALE_TIMEOUT_S,
+    warning_interval_s=ATTITUDE_STALE_WARN_INTERVAL_S,
+)
 CAMERA_STREAM_PORT = 8765
 _camera_stream_lock = threading.Lock()
 _camera_stream_jpeg = None
@@ -820,11 +838,31 @@ def connect_mavlink():
         
     print(f"✓ MAVLink接続完了 (System ID: {m.target_system}, Component ID: {m.target_component})")
     return m
+# ───── MAVLink 受信周期 ─────
+# ATTITUDE (id 30): 25000us = 40Hz。
+#   AR_MEASUREMENT_FPS = 40Hz で目標を生成するため、従来の 200000us (5Hz) では
+#   姿勢が最大 200ms 古くなり、40Hz の Motive 経路と精度差が出る。
+#   そこで 40Hz 相当まで引き上げる。ATTITUDE は payload 28 バイト・フレーム全体で
+#   40 バイト程度なので 40Hz でも約 1.6kB/s（1Mbps リンクの 1.5% 前後）であり、
+#   TELEM1 の帯域に対して十分余裕がある。
+#   25000us が通らない/帯域が厳しい環境では 20000us (50Hz) を代替値として使う
+#   （姿勢鮮度はさらに上がるが、40Hz のカメラ計測には 25000us で十分）。
+# GPS_RAW_INT (24) / GLOBAL_POSITION_INT (33): 200000us (5Hz) を据え置く。
+#   位置は従来の状態監視（10Hz）で扱うが、GPS 自体の更新が 5Hz であり、
+#   周期を上げても情報が増えずリンク帯域だけ消費するため現状維持とする。
+#   （GPS_RAW_INT は本スクリプトの位置計測には使用していない）
+ATTITUDE_MSG_INTERVAL_US = 25000
+POSITION_MSG_INTERVAL_US = 200000
+
+
 def set_msg_rate(m):
-    for mid in (24, 33, 30):
+    for mid in (24, 33):
         m.mav.command_long_send(m.target_system, m.target_component,
             mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
-            0, mid, 200000, 0,0,0,0,0)
+            0, mid, POSITION_MSG_INTERVAL_US, 0,0,0,0,0)
+    m.mav.command_long_send(m.target_system, m.target_component,
+        mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+        0, 30, ATTITUDE_MSG_INTERVAL_US, 0,0,0,0,0)
 def send_takeoff_command(m, alt):
     m.mav.command_long_send(m.target_system, m.target_component,
         mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0,0,0,0,0,0,0, alt)
@@ -956,6 +994,14 @@ def _camera_to_ned_rotation_from_euler(roll_rad, pitch_rad, yaw_rad):
 
 
 def _active_camera_to_ned_rotation():
+    """現在の姿勢ソースからカメラ→NED回転行列を返す。
+
+    motive モードで Motive カメラ rigid body / ID1 rigid body の姿勢が受信できて
+    いる場合は Motive 姿勢を使う。それらが無い場合と ardupilot モードでは
+    MAVLink ATTITUDE（current_roll/pitch/yaw）にフォールバックする。
+    フォールバックを使う経路だけが ATTITUDE 鮮度判定の対象になる
+    （attitude_fallback_used_for_target() 参照）。
+    """
     with io_lock:
         if CAMERA_ORIENTATION_SOURCE == "motive":
             camera_received = motive_camera_received
@@ -986,6 +1032,19 @@ def _active_camera_to_ned_rotation():
 def _selected_camera_optical_offset():
     return CAMERA_OPTICAL_OFFSETS.get(
         CAMERA_ORIENTATION_SOURCE, CAMERA_OPTICAL_OFFSETS["motive"]
+    )
+
+
+def _print_stale_attitude_warning(age_s):
+    """ATTITUDE が古く目標更新を止めたことを警告する（呼び出し側でレート制限）。"""
+    if math.isfinite(age_s):
+        age_text = f"{age_s * 1000.0:.0f}ms"
+    else:
+        age_text = "未受信"
+    print(
+        "⚠ MAVLink ATTITUDE が古いため自動誘導目標の更新を停止し、前回目標を保持します "
+        f"(age={age_text}, しきい値={ATTITUDE_STALE_TIMEOUT_S * 1000.0:.0f}ms, "
+        f"source={CAMERA_ORIENTATION_SOURCE})"
     )
 
 
@@ -1099,6 +1158,32 @@ def estimate_square_center_from_marker(corner, marker_id, marker_size, camera_ma
     return center
 
 # ───── 状態監視スレッド ─────
+# ATTITUDE を 40Hz 要求で受けるため、受信ループは 5ms 周期（200Hz）で回す。
+# 5ms は 40Hz の 25ms 周期に対して十分細かく、姿勢の取り込み遅れを数msに抑える。
+MAVLINK_POLL_INTERVAL_S = 0.005
+# 監視対象のメッセージ種別（これ以外は読み捨てる）
+MAVLINK_MONITORED_TYPES = ("HEARTBEAT", "ATTITUDE", "GLOBAL_POSITION_INT")
+
+
+def _drain_mavlink_messages(m):
+    """受信キューを 1 回で空にし、監視対象メッセージの最新値を返す。
+
+    従来は種別ごとに recv_match(type=...) を呼んでいたが、recv_match は目的の
+    種別が見つかるまで他の種別を読み捨てる。ATTITUDE を高レートで受けるために
+    ポーリング間隔を短くすると、その読み捨てで GLOBAL_POSITION_INT を
+    取りこぼす恐れがあるため、1 パスで全種別を取り出して最新値だけを残す。
+    """
+    latest = {msg_type: None for msg_type in MAVLINK_MONITORED_TYPES}
+    while True:
+        msg = m.recv_msg()
+        if msg is None:
+            break
+        msg_type = msg.get_type()
+        if msg_type in latest:
+            latest[msg_type] = msg
+    return latest
+
+
 def monitor_vehicle(m):
     global running, gps_now, gps_origin, origin, initial_target_set, guided_mode_active, current_yaw_deg
     global current_roll_rad, current_pitch_rad, current_yaw_rad
@@ -1106,7 +1191,8 @@ def monitor_vehicle(m):
     start_time = 0
     gps_origin_set = False
     while running:
-        hb = m.recv_match(type='HEARTBEAT', blocking=False, timeout=0.05)
+        latest = _drain_mavlink_messages(m)
+        hb = latest["HEARTBEAT"]
         if hb:
             is_guided = hb.custom_mode == 4
             new_armed = bool(hb.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
@@ -1126,14 +1212,16 @@ def monitor_vehicle(m):
                 running = False  # プログラム停止（記録は最後に保存）
             armed = new_armed  # アーム状態を更新
         # 実時間の機体姿勢(ロール、ピッチ、ヨー角)情報の取得
-        att = m.recv_match(type='ATTITUDE', blocking=False)
+        # ATTITUDE を受信した時刻を monotonic で記録し、鮮度判定に使う（要件2）。
+        att = latest["ATTITUDE"]
         if att:
             with io_lock:
                 current_roll_rad = att.roll
                 current_pitch_rad = att.pitch
                 current_yaw_rad = att.yaw
                 current_yaw_deg = (math.degrees(att.yaw) + 360) % 360
-        pos = m.recv_match(type='GLOBAL_POSITION_INT', blocking=False)
+            _attitude_freshness.mark_received()
+        pos = latest["GLOBAL_POSITION_INT"]
         if pos:
             lat, lon = pos.lat / 1e7, pos.lon / 1e7
             # ✅ 高度は REF_ALT と同じスケール（AMSL）で扱います。
@@ -1181,7 +1269,10 @@ def monitor_vehicle(m):
                     f"✓ 離陸高度到達: home相対 {TAKEOFF_ALT:.2f}m "
                     f"(target Down={takeoff_log:.2f}m)"
                 )
-        time.sleep(1 / SEND_HZ)
+        # 従来は 1/SEND_HZ = 100ms 周期だったが、ATTITUDE 40Hz 要求に合わせて
+        # 5ms 周期に短縮する。GLOBAL_POSITION_INT は 5Hz のままなので、位置更新の
+        # 実効レートは従来と同じ（受信したときだけ更新）である。
+        time.sleep(MAVLINK_POLL_INTERVAL_S)
 # ───── バックグラウンド・カメラ追跡スレッド ─────
 def start_camera_stream_server(port=CAMERA_STREAM_PORT):
     """Serve the latest annotated camera frame on loopback for SSH tunneling."""
@@ -1724,6 +1815,22 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                         )
 
                 if has_cargo:
+                    # ─── MAVLink ATTITUDE の鮮度判定（要件2・要件4） ───
+                    # 姿勢ソースが motive で Motive 姿勢（カメラ rigid body または
+                    # ID1 rigid body）が受信できている場合は、ATTITUDE を目標計算に
+                    # 使わないため本判定の対象外とする。
+                    with io_lock:
+                        motive_attitude_available_local = motive_attitude_received
+                    attitude_fallback_used = attitude_fallback_used_for_target(
+                        CAMERA_ORIENTATION_SOURCE,
+                        frame_camera_pose is not None,
+                        motive_attitude_available_local,
+                    )
+                    attitude_age_s = _attitude_freshness.age_s()
+                    attitude_is_stale = _attitude_freshness.is_stale()
+                    stale_fallback_blocks_target = (
+                        attitude_fallback_used and attitude_is_stale
+                    )
                     # ✅ テレメトリおよび姿勢（Roll, Pitch, Yaw）データの取得
                     # ID1センサから取得したドローン真値を優先使用
                     with io_lock:
@@ -1814,49 +1921,59 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                             tvec_error, ap_roll, ap_pitch, ap_yaw, drone_gps)
 
                     # グローバル目標値等の更新
-                    # ✅ target は REF原点基準のローカルNED（Down）で保持し、
-                    #    送信時に home 相対高度へ変換します（高度基準の統一）。
-                    with io_lock:
-                        _coord_source_log = coord_source  # ✅ 座標変換ソースをCSV記録用に保存
-                        target['x'] = target_x
-                        target['y'] = target_y
-                        # NEDのDown(Z)方向もマーカー位置に追随
-                        target['z'] = target_z
-                        # ✅ 送信値はロック内で確定させる（キー操作スレッドとの競合防止）
-                        send_x, send_y, send_z = target_x, target_y, target_z
-                        home_down_m = gps_origin['z']
-                        target_ready = initial_target_set
-                        
-                        cargo_center_world['x'] = cargo_x
-                        cargo_center_world['y'] = cargo_y
-                        cargo_center_world['z'] = cargo_z
-                        ar_cargo_ned = (cargo_x, cargo_y, cargo_z)
-                        ar_target_ned = (target_x, target_y, target_z)
-                        cargo_detected = True
-                        id1_detected = has_id1
-                        dist_id1_to_cargo_x = dist_x
-                        dist_id1_to_cargo_y = dist_y
-                        dist_id1_to_cargo_z = dist_z
-                        # 荷物中心(center_cam)の画像上のピクセル座標(u, v)を計算し、画面中心からのずれ(px)を求める
-                        proj_pts, _ = cv2.projectPoints(
-                            np.array([[0.0, 0.0, 0.0]], dtype=np.float32), 
-                            np.zeros(3, dtype=np.float32), 
-                            center_cam.reshape(3), 
-                            camera_matrix, 
-                            distortion_coeff
-                        )
-                        u, v = proj_pts[0][0]
-                        H, W = img.shape[:2]
-                        cargo_center_cam_x = u - W / 2.0
-                        cargo_center_cam_y = v - H / 2.0
+                    if stale_fallback_blocks_target:
+                        # ATTITUDE がしきい値より古いため、フォールバック姿勢による
+                        # 自動誘導目標の更新を停止する。target は前回値を保持し、
+                        # setpoint も送らない（ArduPilot は最後の目標を保持する）。
+                        # 注意: motive モードで Motive 姿勢が受信できている場合は
+                        # attitude_fallback_used が False になり、この分岐には入らない。
+                        # 警告は 1 秒に 1 回に制限する（ATTITUDE_STALE_WARN_INTERVAL_S）。
+                        if _attitude_freshness.warning_due():
+                            _print_stale_attitude_warning(attitude_age_s)
+                    else:
+                        # ✅ target は REF原点基準のローカルNED（Down）で保持し、
+                        #    送信時に home 相対高度へ変換します（高度基準の統一）。
+                        with io_lock:
+                            _coord_source_log = coord_source  # ✅ 座標変換ソースをCSV記録用に保存
+                            target['x'] = target_x
+                            target['y'] = target_y
+                            # NEDのDown(Z)方向もマーカー位置に追随
+                            target['z'] = target_z
+                            # ✅ 送信値はロック内で確定させる（キー操作スレッドとの競合防止）
+                            send_x, send_y, send_z = target_x, target_y, target_z
+                            home_down_m = gps_origin['z']
+                            target_ready = initial_target_set
 
-                    # 自動で誘導目標コマンドを送信
-                    if guided_mode_active and target_ready and math.isfinite(home_down_m):
-                        # ✅ 高度設定に一定値ではなく追跡値 target['z'] を利用。
-                        #    ローカル Down → 送信 alt の変換は send_local_target() に集約し、
-                        #    MAV_FRAME_GLOBAL_RELATIVE_ALT_INT が要求する home 相対高度で送ります
-                        #    （旧実装は REF_ALT 基準の高度をそのまま送っていた）。
-                        send_local_target(m, send_x, send_y, send_z, home_down_m)
+                            cargo_center_world['x'] = cargo_x
+                            cargo_center_world['y'] = cargo_y
+                            cargo_center_world['z'] = cargo_z
+                            ar_cargo_ned = (cargo_x, cargo_y, cargo_z)
+                            ar_target_ned = (target_x, target_y, target_z)
+                            cargo_detected = True
+                            id1_detected = has_id1
+                            dist_id1_to_cargo_x = dist_x
+                            dist_id1_to_cargo_y = dist_y
+                            dist_id1_to_cargo_z = dist_z
+                            # 荷物中心(center_cam)の画像上のピクセル座標(u, v)を計算し、画面中心からのずれ(px)を求める
+                            proj_pts, _ = cv2.projectPoints(
+                                np.array([[0.0, 0.0, 0.0]], dtype=np.float32),
+                                np.zeros(3, dtype=np.float32),
+                                center_cam.reshape(3),
+                                camera_matrix,
+                                distortion_coeff
+                            )
+                            u, v = proj_pts[0][0]
+                            H, W = img.shape[:2]
+                            cargo_center_cam_x = u - W / 2.0
+                            cargo_center_cam_y = v - H / 2.0
+
+                        # 自動で誘導目標コマンドを送信
+                        if guided_mode_active and target_ready and math.isfinite(home_down_m):
+                            # ✅ 高度設定に一定値ではなく追跡値 target['z'] を利用。
+                            #    ローカル Down → 送信 alt の変換は send_local_target() に集約し、
+                            #    MAV_FRAME_GLOBAL_RELATIVE_ALT_INT が要求する home 相対高度で送ります
+                            #    （旧実装は REF_ALT 基準の高度をそのまま送っていた）。
+                            send_local_target(m, send_x, send_y, send_z, home_down_m)
 
                 else:
                     # 荷物が検出されていない場合
@@ -2204,6 +2321,14 @@ def record_data():
             p_roll = current_roll_rad
             p_pitch = current_pitch_rad
             p_yaw = current_yaw_rad
+
+            # MAVLink ATTITUDE の鮮度（CSV列追加のみ。既存列は変更しない）
+            # Attitude_Age_ms: 最終受信からの経過時間[ms]（未受信は nan）
+            # Attitude_Stale : しきい値超過または未受信なら 1
+            # 注意: 姿勢ソースが motive で Motive 姿勢を受信できている場合、この値は
+            # 参考情報であり目標計算には使われない（ATTITUDE は判定対象外）。
+            attitude_age_ms = _attitude_freshness.age_ms()
+            attitude_stale = 1 if _attitude_freshness.is_stale() else 0
             
             # カメラ座標系生値とMotive逆投影真値のコピー
             c_cam_raw = cargo_cam_raw.copy()
@@ -2289,6 +2414,9 @@ def record_data():
             *motive_pose_calibration_log,
             *ar_pose_log_values,
             *ar_pose_pre_offset_log_values,
+            # ✅ 新規追加：MAVLink ATTITUDE の鮮度（末尾に追加。既存列は変更しない）
+            attitude_age_ms,
+            attitude_stale,
         ])
         time.sleep(1 / AR_LOG_HZ)
 def save_csv():
@@ -2391,6 +2519,11 @@ def save_csv():
                     f'AR_{name}_PreOffset_QW_NED',
                 )
             ],
+            # ✅ 新規追加：MAVLink ATTITUDE の鮮度（末尾に追加。既存列は変更しない）
+            # Attitude_Age_ms は未受信時 nan、Attitude_Stale は古い/未受信なら 1。
+            # motive モードで Motive 姿勢を受信できている場合は参考情報。
+            'Attitude_Age_ms',
+            'Attitude_Stale',
         ])
         writer.writerows(data_records)
     print(f"\n✓ CSV保存完了: {path} ({len(data_records)} 行)")
