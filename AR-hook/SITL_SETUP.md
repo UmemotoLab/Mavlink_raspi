@@ -21,10 +21,11 @@
 `verify_sitl.py` は既定で同梱スタブを使います。ArduPilot SITL がある場合は
 `--external-connection` で実 SITL に向けられます。
 
-> **この作業環境について**: ArduPilot SITL (`sim_vehicle.py`) は未導入でした。
-> そのため [SITL_RESULT.md](./SITL_RESULT.md) の実測値は同梱スタブ
-> （MAVLink 契約を実装した SITL 代替）で取得しています。ArduPilot SITL を
-> 使う場合の手順は以下に残します。
+> **この作業環境について**: 当初 ArduPilot SITL (`sim_vehicle.py`) は未導入で、
+> [SITL_RESULT.md](./SITL_RESULT.md) の 1〜5 章は同梱スタブ（MAVLink 契約を
+> 実装した SITL 代替）で取得しました。2026-11-18 に **本物の ArduPilot SITL
+> (Copter) を macOS 上に導入できた**ため、実 SITL での結果を同ファイルの 9 章
+> 以降に追加しています。導入手順と実際のログはこのファイルの 7 章です。
 
 ---
 
@@ -47,14 +48,17 @@ Tools/environment_install/install-prereqs-ubuntu.sh -y
 ./waf copter
 ```
 
-macOS の場合:
+macOS の場合（実際に成功した手順は 7 章に記録）:
 
 ```bash
 brew install python3 gcc cmake
-Tools/environment_install/install-prereqs-macos.sh -y
-./waf configure --board sitl
+Tools/environment_install/install-prereqs-mac.sh -y   # スクリプト名は -mac.sh
+./waf configure --board sitl                          # Python 3.10 以上が必要
 ./waf copter
 ```
+
+`./waf configure` が `Python minimum supported version is 3.10.0` で失敗する場合は、
+Python 3.10 以上の venv を作って PATH の先頭に置いてから実行します（7.2 参照）。
 
 動作確認（GUI なしの最短確認）:
 
@@ -263,7 +267,135 @@ python3 AR-hook1.py --sitl
 
 ---
 
-## 7. 実機に引き継ぐ項目
+## 7. macOS で実際に導入した記録（2026-11-18 実測）
+
+上の 2 章は一般的な手順です。ここには **このリポジトリで実際に実行したコマンドと
+結果** をそのまま残します（macOS 26.6.2 / arm64 / Xcode 導入済み / Homebrew 6.0.19）。
+
+### 7.1 実行したコマンドと結果
+
+| # | コマンド | 結果 |
+| --- | --- | --- |
+| 1 | `git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/ArduPilot/ardupilot.git ~/ardupilot` | 成功。89 秒 / 1.6 GB。HEAD は `3c467f1`（2026-11-18 時点の master） |
+| 2 | `cd ~/ardupilot && printf 'n\nn\nn\nn\nn\n' \| ./Tools/environment_install/install-prereqs-mac.sh` | **成功（exit 0）**。スクリプト名は `install-prereqs-mac.sh`（`-macos.sh` ではない）。gawk / coreutils / wget / ccache を導入し、`python3 -m pip` で MAVProxy 1.8.75・opencv-python 5.1.0.95 などをユーザーサイトへ導入。pyenv / STM32 ツールチェーン / シェル設定の追記は `n` でスキップ |
+| 3 | `./waf configure --board sitl` | **失敗**。`ERROR: Python minimum supported version is 3.10.0 but you have 3.9.6`（システム Python が 3.9.6 のため） |
+| 4 | `/opt/homebrew/bin/python3.12 -m venv ~/sitl_venv && ~/sitl_venv/bin/pip install pymavlink MAVProxy 'empy==3.3.4' pexpect junitparser` | 成功。pymavlink 2.4.50 / MAVProxy 1.8.75 / empy 3.3.4 |
+| 5 | `PATH=~/sitl_venv/bin:$PATH ./waf configure --board sitl` | 成功（2.3 秒） |
+| 6 | `PATH=~/sitl_venv/bin:$PATH ./waf copter` | 1 回目は失敗（`you need to install pexpect with 'python3 -m pip install pexpect'`）。venv に pexpect を入れて再実行 → **成功 64.7 秒**、`build/sitl/bin/arducopter`（5.3 MB） |
+| 7 | `python3 Tools/autotest/sim_vehicle.py -v ArduCopter --no-rebuild --no-mavproxy -w --custom-location=36.0758249,136.2133456,3,0 --out=udpout:127.0.0.1:14550` | **失敗（起動しない）**。`--no-mavproxy` では SERIAL0（TCP 5760）の接続待ちで止まる（`Waiting for connection ....`） |
+
+### 7.2 つまずいた点と対処
+
+1. **Python 3.10 以上が必須**（3.9.6 では `./waf configure` が拒否する）。
+   pyenv を入れたくなければ、Homebrew の `python@3.12` で venv を作るのが最短です
+   （上の #4）。venv はリポジトリの外（`~/sitl_venv`）に置きます。
+2. **`--no-mavproxy` では SITL が SERIAL0 の接続待ちで止まる。**
+   MAVProxy を使わない場合は、SERIAL0/SERIAL1 を直接 UDP に向けます。
+
+   ```bash
+   cd ~/ardupilot
+   PATH=~/sitl_venv/bin:$PATH python3 Tools/autotest/sim_vehicle.py \
+     -v ArduCopter --no-rebuild --no-mavproxy -w \
+     --custom-location=36.0758249,136.2133456,3,0 \
+     -A '--serial0=udpclient:127.0.0.1:14550' \
+     -A '--serial1=udpclient:127.0.0.1:14551'
+   ```
+
+   14550 が AR-hook 用、14551 が後述の `sitl_command.py` 用です。
+3. **地上で armed のまま 10 秒経つと自動 disarm される**（`DISARM_DELAY` 既定 10）。
+   AR-hook は GUIDED+armed を検出して 3 秒後に離陸指令を出すため、その前に disarm
+   されると離陸しません。SITL では次のどちらかで回避してください。
+
+   ```bash
+   python3 sitl_command.py --connection udpin:0.0.0.0:14551 param DISARM_DELAY 0
+   ```
+
+4. **実 Copter は GUIDED の位置目標だけでは地上から離陸しない**（2026-11-18 実測）。
+   `MAV_CMD_NAV_TAKEOFF` を先に送る必要があります。AR-hook 本体は
+   `monitor_vehicle()` が自動で送るので問題ありませんが、外部スクリプトで
+   setpoint だけを送っても離陸しません。
+
+### 7.3 導入できたかの確認
+
+```bash
+ls -l ~/ardupilot/build/sitl/bin/arducopter        # 5.3 MB 程度
+python3 sitl_command.py --connection udpin:0.0.0.0:14551 status
+# → [sitl] heartbeat: system=1 component=0 mode=GUIDED armed=False ...
+```
+
+---
+
+## 8. 1 コマンドで検証する（SITL 導入後）
+
+SITL を導入したら、次の 1 コマンドで 6 項目をまとめて実行できます。
+SITL の起動・GUIDED/ARM・着陸・後片付けまで自動です。
+
+```bash
+cd AR-hook
+./run_sitl_verify.sh
+```
+
+- 実行内容: SITL 起動 → GPS/EKF 待ち → `DISARM_DELAY=0` → 自動離陸 → 原点・高度基準 →
+  クランプ → yaw → ATTITUDE 周期 → disarm 終了と CSV 保存
+- 出力: `~/arhook_sitl_logs/run_sitl_verify_<日時>/`（`run.log`, `sitl.log`,
+  シナリオごとの `result.json` / `observations.csv`）
+- 終了コード: 0 = すべて PASS / 1 = 失敗または SITL を起動できない
+- 環境変数: `SITL_DIR`（既定 `~/ardupilot`）, `SITL_VENV`（既定 `~/sitl_venv`）,
+  `SITL_PORT`（14550）, `SITL_CMD_PORT`（14551）, `SITL_LOCATION`,
+  `OUT_DIR`, `KEEP_SITL=1`（検証後も SITL を止めない）
+
+SITL を自分で起動している場合は、従来どおり `verify_sitl.py` を直接使えます。
+
+```bash
+python3 verify_sitl.py --external-connection udpin:0.0.0.0:14550
+python3 verify_sitl.py --external-connection udpin:0.0.0.0:14550 --only takeoff
+python3 verify_sitl.py --external-connection udpin:0.0.0.0:14550 --only disarm
+```
+
+`--external-connection` では、実 SITL 向けに次の下準備を自動で行います
+（同梱スタブでは従来どおりの動作です）。
+
+| 下準備 | 理由 |
+| --- | --- |
+| 接続直後に `set_msg_rate()` を 1 回呼ぶ | 既定のストリームに GLOBAL_POSITION_INT が無いリンクがある（本番と同じ状態にする） |
+| yaw 検証の前に 1.5 m まで離陸 | 実 Copter は地上で yaw 指令に追従しない |
+| f6152 の前に 0.5 m まで離陸 | 位置目標だけでは離陸しないため（本番も NAV_TAKEOFF を先に送る） |
+| setpoint を 10Hz で再送 | GUIDED の目標タイムアウトで止まらないようにする（本番は 40Hz） |
+
+---
+
+## 9. 補助ツール `sitl_command.py`
+
+MAVProxy のコンソールを使わずに、SITL / 実機へ指令を出せます（pymavlink のみ）。
+
+```bash
+python3 sitl_command.py --connection udpin:0.0.0.0:14551 status
+python3 sitl_command.py --connection udpin:0.0.0.0:14551 guided
+python3 sitl_command.py --connection udpin:0.0.0.0:14551 arm
+python3 sitl_command.py --connection udpin:0.0.0.0:14551 takeoff 0.5
+python3 sitl_command.py --connection udpin:0.0.0.0:14551 land
+python3 sitl_command.py --connection udpin:0.0.0.0:14551 disarm --force
+python3 sitl_command.py --connection udpin:0.0.0.0:14551 param DISARM_DELAY 0
+```
+
+- `arm` は EKF の準備が整うまで再送します（SITL 起動直後は ARM を拒否されるため）。
+- `land` は LAND モードへ切り替え、disarm（着陸完了）まで待ちます。
+- `param` は PARAM_SET を送り、`PARAM_VALUE` で反映を確認します。
+
+---
+
+## 10. この環境での既知の制約
+
+| 制約 | 内容 |
+| --- | --- |
+| OpenCV のバージョン | `install-prereqs-mac.sh` は opencv-python **5.1.0.95** を入れます。本番の `requirements.txt` は 4.10.0.84 です。OpenCV 5 では ArUco の `ids` の形が変わり、`AR-hook1.py` の `int(ids[i][0])` で `IndexError` になります（実測）。カメラ追従を SITL で動かす場合は `pip install 'opencv-python==4.10.0.84'` で本番と同じ版に戻してください。 |
+| キーボード制御 | `control_loop()` は TTY を要求します。stdin が `/dev/null` やパイプだと `termios.error: (19, 'Operation not supported by device')` でスレッドだけ停止します（MAVLink・記録は継続）。対話実行するか `script -q /dev/null python3 AR-hook1.py ...` で疑似 TTY を与えてください。 |
+| Motive | この環境には Motive が無いため、`Motive_*` 列は N/A のままです。 |
+| 実カメラ | macOS のカメラ権限が無い実行経路では `VideoCapture(0)` が開けません（`isOpened() == False`）。その場合 AR-hook は「カメラ追跡を開始できません」と表示して終了し、CSV は保存されます。 |
+
+---
+
+## 11. 実機に引き継ぐ項目
 
 SITL では次を確認できません。実機検証で確認してください。
 

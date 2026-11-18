@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""verify_sitl.py — AR-hook の座標・高度・yaw・クランプ・受信周期を SITL で検証。
+"""verify_sitl.py — AR-hook の座標・高度・yaw・クランプ・受信周期・離陸/終了を検証。
 
-ハードウェア（Pixhawk・カメラ・Motive）を使わずに、次の 4 項目を確認します。
+ハードウェア（Pixhawk・カメラ・Motive）を使わずに、次の 6 項目を確認します。
 
   f6152 : 原点・高度基準。home と REF をずらした条件で送信 alt と到達高度。
   7f03b : クランプ。段差目標に対する 1 フレーム移動量と目標偏差の上限。
   9c2a5 : yaw。yaw=0 / yaw=180 の指令と機首方位。
   12794 : ATTITUDE 周期。40Hz 要求と実測レート。
+  takeoff : 自動離陸。GUIDED+ARM 検出 → 3 秒後に NAV_TAKEOFF(0.5m) → 0.5m へ上昇。
+  disarm  : ディスアーム終了。disarm を検出して停止し、CSV が保存されるか。
 
 実行方法（ハードウェア不要）:
     cd AR-hook
@@ -34,13 +36,16 @@ import importlib.util
 import io
 import json
 import math
+import os
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from pymavlink import mavutil
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 AR_HOOK = SCRIPT_DIR / "AR-hook1.py"
@@ -64,6 +69,25 @@ F6152_HOME_NORTH_M = 5.0
 F6152_HOME_EAST_M = 5.0
 F6152_HOME_UP_M = 3.0
 
+# ── takeoff（自動離陸）──
+# GUIDED + armed を検出してから NAV_TAKEOFF を送るまでの待ち（AR-hook1.py は 3 秒）。
+TAKEOFF_CMD_DELAY_S = 3.0
+TAKEOFF_CMD_DELAY_TOL_S = 2.0     # 実測の許容幅（HEARTBEAT 1Hz の量子化を含む）
+TAKEOFF_REACH_TIMEOUT_S = 30.0    # 0.5m 到達までの待ち（実 SITL はホバリングまで数秒）
+TAKEOFF_REACH_RATIO = 0.9         # AR-hook1.py の離陸到達判定と同じ 90%
+
+# ── disarm（終了と CSV 保存）──
+DISARM_TRIGGER_DELAY_S = 4.0      # 記録を数秒取ってから disarm する
+DISARM_EXIT_TIMEOUT_S = 20.0
+CSV_EXPECTED_COLUMNS = 170        # save_csv() のヘッダ列数
+CSV_MIN_ROWS = 5
+
+# ── external（実 SITL）でのみ使う値 ──
+# 実 SITL は地上では yaw 指令に追従しないため、ホバリング高度まで上げてから測る。
+EXTERNAL_HOVER_ALT_M = 1.5
+EXTERNAL_HOVER_TIMEOUT_S = 20.0
+EXTERNAL_SETPOINT_KEEP_HZ = 10.0  # GUIDED の目標タイムアウトを避けるため再送する
+
 
 # ──────────────────────────────────────────────
 #  AR-hook1.py の読み込み（カメラ依存をモック）
@@ -80,8 +104,13 @@ def _install_optional_mocks():
     try:
         import pytz  # noqa: F401
     except ImportError:
+        # 注意: このモジュールは `from datetime import datetime` を使っているため、
+        # datetime はクラス（モジュールではない）。timezone は標準ライブラリの
+        # datetime モジュールから取る。
+        import datetime as datetime_module
+
         pytz_mock = type(sys)("pytz")
-        pytz_mock.timezone = lambda _name: datetime.timezone.utc
+        pytz_mock.timezone = lambda _name: datetime_module.timezone.utc
         sys.modules["pytz"] = pytz_mock
 
 
@@ -262,6 +291,15 @@ def vehicle_session(module, args, name, home=(0.0, 0.0, 0.0),
             ) from exc
         comm.start()
         records = instrument_comm(comm)
+        if args.external_connection:
+            # 実 SITL は既定のストリームに GLOBAL_POSITION_INT を含まないことがある。
+            # 本番（AR-hook1.main）は接続直後に set_msg_rate() を 1 回呼ぶので、
+            # 同じ状態にしてから各シナリオを始める。要求内容は 12794 と同じ値なので、
+            # 記録はクリアして 12794 側の「1 メッセージ 1 回」の判定を保つ。
+            module.set_msg_rate(comm)
+            time.sleep(0.5)
+            records["setpoints"].clear()
+            records["intervals"].clear()
         yield comm, records, port, out_dir
     finally:
         if comm is not None:
@@ -278,6 +316,63 @@ def _relative_alt_m(comm):
     if position is None:
         return None
     return position.relative_alt / 1000.0
+
+
+def ensure_airborne(module, comm, alt_m, timeout=EXTERNAL_HOVER_TIMEOUT_S):
+    """実 SITL 用: 地上にいれば NAV_TAKEOFF で離陸させる。
+
+    実 ArduPilot Copter は GUIDED の位置目標（SET_POSITION_TARGET_GLOBAL_INT）
+    だけでは地上から離陸しない（2026-11-18 の実測）。本番 AR-hook1.py も
+    GUIDED + armed を検出して NAV_TAKEOFF(0.5m) を送ってから位置目標を送るので、
+    検証でも同じ前提を作る。
+
+    Returns:
+        (離陸指令を送ったか, 待機後の高度 [m])
+    """
+    current = _relative_alt_m(comm)
+    if current is not None and current >= float(alt_m) * TAKEOFF_REACH_RATIO:
+        return False, current
+    module.send_takeoff_command(comm, float(alt_m))
+    wait_for(
+        lambda: (
+            None if _relative_alt_m(comm) is None
+            else _relative_alt_m(comm) >= float(alt_m) * TAKEOFF_REACH_RATIO
+        ),
+        timeout=timeout,
+        poll=0.02,
+    )
+    return True, _relative_alt_m(comm)
+
+
+@contextlib.contextmanager
+def setpoint_keeper(module, comm, x, y, z, home_down_m,
+                    hz=EXTERNAL_SETPOINT_KEEP_HZ):
+    """同じ setpoint を周期的に再送する（実 SITL の GUIDED 目標タイムアウト対策）。
+
+    AR-hook1.py のカメラ追従は 40Hz で送り続けるため、実 SITL では目標が
+    タイムアウトしない。検証ランナーは 1 回しか送らないので、待ち時間の間だけ
+    同じ目標を再送して本番と同じ条件にする（同梱スタブでは不要なので使わない）。
+    """
+    stop = threading.Event()
+
+    def run():
+        period = 1.0 / float(hz)
+        while not stop.is_set():
+            try:
+                module.send_local_target(comm, x, y, z, home_down_m)
+            except Exception:  # 送信失敗で検証スレッドを落とさない
+                return
+            stop.wait(period)
+
+    thread = threading.Thread(
+        target=run, name="verify_setpoint_keeper", daemon=True
+    )
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=2.0)
 
 
 # ──────────────────────────────────────────────
@@ -318,13 +413,27 @@ def scenario_f6152(module, args):
             -target_up, home_down
         )
 
-        arrived, arrival_elapsed = wait_for(
-            lambda: (
-                None if _relative_alt_m(comm) is None
-                else abs(_relative_alt_m(comm) - target_up) <= ARRIVAL_TOL_M
-            ),
-            timeout=8.0,
-        )
+        def _wait_arrival():
+            return wait_for(
+                lambda: (
+                    None if _relative_alt_m(comm) is None
+                    else abs(_relative_alt_m(comm) - target_up) <= ARRIVAL_TOL_M
+                ),
+                timeout=8.0,
+            )
+
+        takeoff_assist = False
+        if args.external_connection:
+            # 実 SITL は地上では位置目標だけでは離陸しない（本番も先に NAV_TAKEOFF）
+            takeoff_assist, alt_before = ensure_airborne(
+                module, comm, float(module.TAKEOFF_ALT)
+            )
+            # 実 SITL は目標を送り続けないと GUIDED のタイムアウトで止まるため再送する
+            with setpoint_keeper(module, comm, north, east, target_z, home_down):
+                arrived, arrival_elapsed = _wait_arrival()
+        else:
+            alt_before = _relative_alt_m(comm)
+            arrived, arrival_elapsed = _wait_arrival()
         arrival_alt = _relative_alt_m(comm)
 
         checks = {
@@ -360,6 +469,10 @@ def scenario_f6152(module, args):
             "arrival_elapsed_s": round(arrival_elapsed, 3),
             "naive_ref_basis_alt_m": round(naive_alt, 4),
             "alt_error_if_ref_basis_m": round(naive_alt - target_up, 4),
+            "takeoff_assist_sent": takeoff_assist,
+            "altitude_before_target_m": (
+                None if alt_before is None else round(alt_before, 3)
+            ),
         }
         observations.extend([
             ("f6152", "condition", "home_north_m", north, "m"),
@@ -575,6 +688,11 @@ def scenario_9c2a5(module, args):
         )
         original_yaw = module.TARGET_YAW_SEND_DEG
 
+        # 実 SITL は地上で yaw 指令に追従しないため、ホバリング高度まで上げる。
+        # 同梱スタブは高度 0（home 相対）でも yaw を反映するので従来どおり。
+        hover_alt = EXTERNAL_HOVER_ALT_M if args.external_connection else 0.0
+        target_z = module.alt_above_home_to_local_down(hover_alt, home_down)
+
         def wait_heading(target_deg, timeout):
             value, elapsed = wait_for(
                 lambda: (
@@ -587,24 +705,58 @@ def scenario_9c2a5(module, args):
             heading = _heading_deg(comm)
             return bool(value), heading, elapsed
 
+        takeoff_assist = False
         try:
-            # yaw=0（北）を送信。production 経路の send_local_target を使う。
+            # ── yaw=0（北）──
             module.TARGET_YAW_SEND_DEG = 0.0
-            module.send_local_target(
-                comm, north, east, home_down, home_down
-            )
-            ok0, heading0, elapsed0 = wait_heading(0.0, timeout=4.0)
+            index0 = len(records["setpoints"])
+            if args.external_connection:
+                # 実 SITL は地上では位置目標だけでは離陸しない（本番も先に NAV_TAKEOFF）
+                takeoff_assist, _alt = ensure_airborne(
+                    module, comm, hover_alt
+                )
+                # 実 SITL: 目標を送り続けて上昇・旋回させる（GUIDED タイムアウト対策）
+                with setpoint_keeper(
+                    module, comm, north, east, target_z, home_down
+                ):
+                    # ホバリング高度まで上昇するのを待つ（上昇中も yaw=0 を指令）
+                    wait_for(
+                        lambda: (
+                            None if _relative_alt_m(comm) is None
+                            else _relative_alt_m(comm) >= hover_alt * 0.9
+                        ),
+                        timeout=EXTERNAL_HOVER_TIMEOUT_S,
+                    )
+                    ok0, heading0, elapsed0 = wait_heading(0.0, timeout=6.0)
+            else:
+                module.send_local_target(
+                    comm, north, east, target_z, home_down
+                )
+                ok0, heading0, elapsed0 = wait_heading(0.0, timeout=4.0)
 
-            # yaw=180（南）を送信。
+            # ── yaw=180（南）──
             module.TARGET_YAW_SEND_DEG = 180.0
-            module.send_local_target(
-                comm, north, east, home_down, home_down
-            )
-            ok180, heading180, elapsed180 = wait_heading(180.0, timeout=8.0)
+            if args.external_connection:
+                with setpoint_keeper(
+                    module, comm, north, east, target_z, home_down
+                ):
+                    index180 = len(records["setpoints"]) - 1
+                    ok180, heading180, elapsed180 = wait_heading(
+                        180.0, timeout=10.0
+                    )
+            else:
+                index180 = len(records["setpoints"])
+                module.send_local_target(
+                    comm, north, east, target_z, home_down
+                )
+                ok180, heading180, elapsed180 = wait_heading(
+                    180.0, timeout=8.0
+                )
         finally:
             module.TARGET_YAW_SEND_DEG = original_yaw
 
-        setpoints = records["setpoints"][-2:]
+        # 各フェーズの最初の setpoint（外側の keeper が再送した分を含む）
+        setpoints = [records["setpoints"][index0], records["setpoints"][index180]]
         sent_yaws = [record["yaw_deg"] for record in setpoints]
         masks = [record["type_mask"] for record in setpoints]
 
@@ -643,6 +795,12 @@ def scenario_9c2a5(module, args):
             "convergence_s_yaw_0": round(elapsed0, 3),
             "convergence_s_yaw_180": round(elapsed180, 3),
             "tolerance_deg": YAW_TOL_DEG,
+            "hover_alt_above_home_m": hover_alt,
+            "takeoff_assist_sent": takeoff_assist,
+            "altitude_at_end_m": (
+                None if _relative_alt_m(comm) is None
+                else round(_relative_alt_m(comm), 3)
+            ),
         }
         observations.extend([
             ("9c2a5", "measurement", "sent_yaw_0_deg", sent_yaws[0], "deg"),
@@ -769,19 +927,384 @@ def scenario_12794(module, args):
     }
 
 
+# ──────────────────────────────────────────────
+#  takeoff / disarm で使うスレッド制御
+# ──────────────────────────────────────────────
+def _start_thread(target, *args, name=None):
+    thread = threading.Thread(target=target, args=args, name=name, daemon=True)
+    thread.start()
+    return thread
+
+
+def _stop_threads(module, threads, timeout=5.0):
+    """running を False にしてスレッドを止める（AR-hook1.py の終了処理と同じ）。"""
+    module.running = False
+    for thread in threads:
+        thread.join(timeout=timeout)
+    return [thread.name for thread in threads if thread.is_alive()]
+
+
+def _write_timeline(path, rows):
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["seq", "t_rel_s", "event", "detail"])
+        writer.writerows(rows)
+
+
+# ──────────────────────────────────────────────
+#  takeoff: 自動離陸（GUIDED + armed → 3 秒後 NAV_TAKEOFF → 0.5m）
+# ──────────────────────────────────────────────
+def scenario_takeoff(module, args):
+    """AR-hook1.monitor_vehicle() の自動離陸シーケンスをそのまま動かして測る。"""
+    with vehicle_session(module, args, "takeoff", port_offset=4) as (
+        comm, records, _port, out_dir
+    ):
+        wait_position(comm, timeout=10.0)
+        started = time.monotonic()
+        timeline = []
+
+        def mark(event, detail=""):
+            timeline.append([
+                len(timeline) + 1, round(time.monotonic() - started, 6),
+                event, detail,
+            ])
+
+        takeoff_calls = []
+        original_takeoff = comm.takeoff
+
+        def takeoff(alt_m):
+            takeoff_calls.append({
+                "t_s": time.monotonic(),
+                "alt_m": float(alt_m),
+            })
+            mark("nav_takeoff_sent", f"alt={float(alt_m):.3f} m")
+            return original_takeoff(alt_m)
+
+        comm.takeoff = takeoff
+        detection = {"t_s": None}
+
+        def watch_guided_armed():
+            limit = time.monotonic() + 20.0
+            while time.monotonic() < limit:
+                state = comm.snapshot()
+                if state.guided and state.armed:
+                    detection["t_s"] = time.monotonic()
+                    mark(
+                        "guided_armed_detected",
+                        f"mode={state.mode_name} armed={state.armed}",
+                    )
+                    return
+                time.sleep(0.01)
+
+        module.running = True
+        mark("monitor_start", "mode=AR-hook1.monitor_vehicle")
+        threads = [
+            _start_thread(watch_guided_armed, name="verify_arm_watch"),
+            _start_thread(module.monitor_vehicle, comm, name="verify_monitor"),
+        ]
+        try:
+            _sent, wait_sent_s = wait_for(
+                lambda: list(takeoff_calls) or None, timeout=20.0
+            )
+            mark(
+                "wait_result",
+                f"takeoff_seen={bool(takeoff_calls)} ({wait_sent_s:.2f} s)",
+            )
+
+            target_alt = float(module.TAKEOFF_ALT)
+            reached, reach_s = wait_for(
+                lambda: (
+                    None if _relative_alt_m(comm) is None
+                    else _relative_alt_m(comm) >= target_alt * TAKEOFF_REACH_RATIO
+                ),
+                timeout=TAKEOFF_REACH_TIMEOUT_S,
+                poll=0.02,
+            )
+            final_alt = _relative_alt_m(comm)
+            mark(
+                "altitude_reached" if reached else "altitude_timeout",
+                f"rel_alt={final_alt:.3f} m after {reach_s:.2f} s"
+                if final_alt is not None else "no position",
+            )
+        finally:
+            comm.takeoff = original_takeoff
+            alive = _stop_threads(module, threads)
+
+        _write_timeline(out_dir / "timeline.csv", timeline)
+
+        command = takeoff_calls[0] if takeoff_calls else None
+        delay_s = (
+            None if command is None or detection["t_s"] is None
+            else round(command["t_s"] - detection["t_s"], 3)
+        )
+        alt_tol = 0.10 if args.external_connection else ARRIVAL_TOL_M
+        checks = {
+            "takeoff_command_sent_once": len(takeoff_calls) == 1,
+            "takeoff_alt_matches_hook_constant": (
+                command is not None
+                and abs(command["alt_m"] - float(module.TAKEOFF_ALT)) <= 1e-6
+                and abs(float(module.TAKEOFF_ALT) - 0.5) <= 1e-9
+            ),
+            "command_delay_is_about_3s": (
+                delay_s is not None
+                and TAKEOFF_CMD_DELAY_S - TAKEOFF_CMD_DELAY_TOL_S
+                <= delay_s
+                <= TAKEOFF_CMD_DELAY_S + TAKEOFF_CMD_DELAY_TOL_S
+            ),
+            "climbed_to_takeoff_alt": bool(reached),
+            "altitude_within_tolerance": (
+                final_alt is not None
+                and abs(final_alt - float(module.TAKEOFF_ALT)) <= alt_tol
+            ),
+            "threads_stopped": not alive,
+        }
+        measurements = {
+            "takeoff_alt_constant_m": float(module.TAKEOFF_ALT),
+            "takeoff_command_count": len(takeoff_calls),
+            "takeoff_command_alt_m": (
+                None if command is None else round(command["alt_m"], 6)
+            ),
+            "delay_from_guided_armed_to_command_s": delay_s,
+            "delay_acceptance_s": [
+                TAKEOFF_CMD_DELAY_S - TAKEOFF_CMD_DELAY_TOL_S,
+                TAKEOFF_CMD_DELAY_S + TAKEOFF_CMD_DELAY_TOL_S,
+            ],
+            "relative_alt_after_wait_m": (
+                None if final_alt is None else round(final_alt, 3)
+            ),
+            "alt_tolerance_m": alt_tol,
+            "timeline": timeline,
+        }
+        write_observations(out_dir / "observations.csv", [
+            ("takeoff", "measurement", "takeoff_command_alt_m",
+             measurements["takeoff_command_alt_m"], "m"),
+            ("takeoff", "measurement", "delay_from_guided_armed_to_command_s",
+             delay_s, "s"),
+            ("takeoff", "measurement", "relative_alt_after_wait_m",
+             measurements["relative_alt_after_wait_m"], "m"),
+        ])
+
+    return {
+        "id": "takeoff",
+        "name": "自動離陸（GUIDED+ARM 検出 → 3 秒後 NAV_TAKEOFF → 0.5m）",
+        "conditions": {
+            "takeoff_alt_m": float(module.TAKEOFF_ALT),
+            "delay_s": TAKEOFF_CMD_DELAY_S,
+            "command_path": "AR-hook1.monitor_vehicle() -> send_takeoff_command()",
+        },
+        "measurements": measurements,
+        "checks": checks,
+        "pass": all(checks.values()),
+    }
+
+
+# ──────────────────────────────────────────────
+#  disarm: ディスアーム検出 → 終了 → CSV 保存
+# ──────────────────────────────────────────────
+LIMIT_COLUMNS = (
+    "Target_Limit_Rate_Active",
+    "Target_Limit_XY_Clamp_Active",
+    "Target_Limit_Z_Clamp_Up",
+    "Target_Limit_Z_Clamp_Down",
+)
+CSV_WATCH_COLUMNS = (
+    "Attitude_Age_ms", "Attitude_Stale",
+    *LIMIT_COLUMNS,
+    "Target_Desired_X_m", "Target_Update_Source",
+)
+
+
+def summarize_csv(path):
+    """CSV のヘッダ・行数・注目列の充足状況を返す（保存内容の確認用）。"""
+    with open(path, newline="", encoding="utf-8") as handle:
+        reader = csv.reader(handle)
+        header = next(reader, [])
+        rows = [row for row in reader if row]
+    index = {name: position for position, name in enumerate(header)}
+    first = rows[0] if rows else []
+
+    def cell(name):
+        position = index.get(name)
+        if position is None or position >= len(first):
+            return None
+        return first[position]
+
+    def numeric(name):
+        value = cell(name)
+        if value is None or value.strip() == "":
+            return None
+        try:
+            number = float(value)
+        except ValueError:
+            return None
+        return number if math.isfinite(number) else None
+
+    clamp_flags = {}
+    for name in LIMIT_COLUMNS:
+        position = index.get(name)
+        active = 0
+        if position is not None:
+            for row in rows:
+                if position < len(row) and row[position].strip() == "1":
+                    active += 1
+        clamp_flags[name] = active
+
+    return {
+        "path": str(path),
+        "columns": len(header),
+        "rows": len(rows),
+        "missing_columns": [
+            name for name in CSV_WATCH_COLUMNS if name not in index
+        ],
+        "attitude_age_ms_first_row": cell("Attitude_Age_ms"),
+        "attitude_age_ms_numeric": numeric("Attitude_Age_ms"),
+        "attitude_stale_first_row": cell("Attitude_Stale"),
+        "target_update_source_first_row": cell("Target_Update_Source"),
+        "clamp_active_rows": clamp_flags,
+        "header": header,
+    }
+
+
+def scenario_disarm(module, args):
+    """disarm を検出して running が False になり、CSV が保存されるか確認する。"""
+    csv_dir = Path(
+        os.path.expanduser(args.csv_dir or "~/LOGS_Pixhawk6c")
+    )
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    started_at = time.time()
+    with vehicle_session(module, args, "disarm", port_offset=5) as (
+        comm, records, _port, out_dir
+    ):
+        wait_position(comm, timeout=10.0)
+        module.CSV_DIR = csv_dir
+        module.data_records.clear()
+        disarm_sent = {"value": False, "t_s": None}
+
+        def trigger_disarm():
+            """一定時間後に GCS と同じ COMMAND_LONG で disarm する。"""
+            time.sleep(float(args.disarm_delay))
+            param2 = 21196 if args.disarm_force else 0
+            comm.command_long(
+                mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+                param1=0, param2=param2,
+            )
+            disarm_sent["t_s"] = time.monotonic()
+            disarm_sent["value"] = True
+
+        module.running = True
+        threads = [
+            _start_thread(module.monitor_vehicle, comm, name="verify_monitor"),
+            _start_thread(module.record_data, name="verify_record"),
+            _start_thread(trigger_disarm, name="verify_disarm_trigger"),
+        ]
+        try:
+            stopped, exit_elapsed = wait_for(
+                lambda: (not module.running) or None,
+                timeout=DISARM_EXIT_TIMEOUT_S, poll=0.05,
+            )
+            exit_elapsed_s = exit_elapsed if stopped else None
+        finally:
+            alive = _stop_threads(module, threads)
+            # AR-hook1.main() の finally と同じ順序で保存する
+            module.save_csv()
+
+        produced = sorted(
+            (
+                path for path in csv_dir.glob("*.csv")
+                if path.stat().st_mtime >= started_at - 1.0
+            ),
+            key=lambda path: path.stat().st_mtime,
+        )
+        csv_path = produced[-1] if produced else None
+        summary = summarize_csv(csv_path) if csv_path is not None else None
+        if csv_path is not None:
+            copy_dir = out_dir / "csv"
+            copy_dir.mkdir(parents=True, exist_ok=True)
+            (copy_dir / csv_path.name).write_text(
+                csv_path.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+
+        summary = summary or {}
+        missing = summary.get("missing_columns", ["?"])
+        checks = {
+            "disarm_command_sent": disarm_sent["value"],
+            "program_stopped_on_disarm": bool(stopped),
+            "csv_saved": bool(summary.get("rows", 0) > 0),
+            "csv_column_count_is_170": (
+                summary.get("columns") == CSV_EXPECTED_COLUMNS
+            ),
+            "csv_has_enough_rows": summary.get("rows", 0) >= CSV_MIN_ROWS,
+            "attitude_columns_present": not any(
+                name in missing for name in ("Attitude_Age_ms", "Attitude_Stale")
+            ),
+            "attitude_age_is_numeric": (
+                summary.get("attitude_age_ms_numeric") is not None
+            ),
+            "attitude_stale_flag_is_0_or_1": (
+                summary.get("attitude_stale_first_row") in ("0", "1")
+            ),
+            "clamp_columns_present": not any(
+                name in missing for name in LIMIT_COLUMNS
+            ),
+            "threads_stopped": not alive,
+        }
+        measurements = {
+            "disarm_delay_s": float(args.disarm_delay),
+            "disarm_force": bool(args.disarm_force),
+            "exit_elapsed_s": (
+                None if exit_elapsed_s is None else round(exit_elapsed_s, 3)
+            ),
+            "csv_dir": str(csv_dir),
+            "csv_path": None if csv_path is None else str(csv_path),
+            "csv_columns": summary.get("columns"),
+            "csv_rows": summary.get("rows"),
+            "csv_missing_columns": summary.get("missing_columns"),
+            "attitude_age_ms_first_row": summary.get(
+                "attitude_age_ms_first_row"
+            ),
+            "attitude_stale_first_row": summary.get(
+                "attitude_stale_first_row"
+            ),
+            "target_update_source_first_row": summary.get(
+                "target_update_source_first_row"
+            ),
+            "clamp_active_rows": summary.get("clamp_active_rows"),
+        }
+        write_observations(out_dir / "observations.csv", [
+            ("disarm", "measurement", key, value, "")
+            for key, value in measurements.items()
+        ])
+
+    return {
+        "id": "disarm",
+        "name": "ディスアーム終了（停止・CSV 保存・列の充足）",
+        "conditions": {
+            "csv_dir": str(csv_dir),
+            "disarm_delay_s": float(args.disarm_delay),
+            "expected_columns": CSV_EXPECTED_COLUMNS,
+        },
+        "measurements": measurements,
+        "checks": checks,
+        "pass": all(checks.values()),
+    }
+
+
 SCENARIOS = [
     ("f6152", scenario_f6152),
     ("7f03b", scenario_7f03b),
     ("9c2a5", scenario_9c2a5),
     ("12794", scenario_12794),
+    ("takeoff", scenario_takeoff),
+    ("disarm", scenario_disarm),
 ]
 
 
 def build_arg_parser():
     parser = argparse.ArgumentParser(
         description=(
-            "AR-hook の原点・高度基準 / クランプ / yaw / ATTITUDE 周期を "
-            "ハードウェア無しで検証する"
+            "AR-hook の原点・高度基準 / クランプ / yaw / ATTITUDE 周期 / "
+            "自動離陸 / disarm 終了をハードウェア無しで検証する"
+            "（--external-connection で実 ArduPilot SITL にも接続できる）"
         )
     )
     parser.add_argument(
@@ -802,6 +1325,26 @@ def build_arg_parser():
             "ArduPilot SITL など外部機体への pymavlink 接続文字列。"
             "指定時は同梱スタブを起動しない"
             "（例: udpin:0.0.0.0:14550）"
+        ),
+    )
+    parser.add_argument(
+        "--disarm-delay", type=float, default=DISARM_TRIGGER_DELAY_S,
+        help=(
+            "disarm シナリオで disarm を送るまでの秒数"
+            f"（既定: {DISARM_TRIGGER_DELAY_S:g}）"
+        ),
+    )
+    parser.add_argument(
+        "--disarm-force", action="store_true",
+        help=(
+            "disarm を強制（param2=21196）。実 SITL で飛行中に disarm する場合に使う"
+        ),
+    )
+    parser.add_argument(
+        "--csv-dir", default=None,
+        help=(
+            "disarm シナリオが CSV を保存するディレクトリ"
+            "（既定: ~/LOGS_Pixhawk6c = 本番と同じ）"
         ),
     )
     return parser
