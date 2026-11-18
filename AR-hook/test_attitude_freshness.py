@@ -233,14 +233,22 @@ def test_csv_appends_only_freshness_columns():
     header_names = [
         element.value for element in header if isinstance(element, ast.Constant)
     ]
-    assert header_names[-2:] == ["Attitude_Age_ms", "Attitude_Stale"], header_names[-4:]
+    # 3aaa930（クランプ・レート制限）が末尾に 12 列追加するため、Attitude の 2 列は
+    # その直前に連続して並ぶ（既存列の削除・改名はせず、追加順に並べている）。
+    target_head = header_names.index("Target_Desired_X_m")
+    assert header_names[target_head - 2:target_head] == [
+        "Attitude_Age_ms",
+        "Attitude_Stale",
+    ], header_names[target_head - 4:target_head + 2]
 
     row = _last_list_elements(tree, "append")
     assert row is not None, "data_records.append([...]) が見つからない"
-    row_tail = [
-        element.id for element in row[-2:] if isinstance(element, ast.Name)
-    ]
-    assert row_tail == ["attitude_age_ms", "attitude_stale"], row_tail
+    row_names = [element.id for element in row if isinstance(element, ast.Name)]
+    target_row_head = row_names.index("tgt_des_x")
+    assert row_names[target_row_head - 2:target_row_head] == [
+        "attitude_age_ms",
+        "attitude_stale",
+    ], row_names[target_row_head - 4:target_row_head + 2]
 
 
 def test_freshness_wiring_in_source():

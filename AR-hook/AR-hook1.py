@@ -41,6 +41,11 @@ from mavlink_comm import (
     MavlinkConnectionError,
     MavlinkTimeoutError,
 )
+from target_limiter import (
+    frame_step_limit,
+    limit_target,
+    lost_target_desired,
+)
 import pytz
 # Raspberry Pi 5 カメラサポート
 try:
@@ -56,8 +61,27 @@ SEND_HZ = 10  # 従来の状態監視周期（10Hz）。現在は MAVLINK_POLL_I
 AR_MEASUREMENT_FPS = 40
 AR_LOG_HZ = 40
 AR_FRAME_DURATION_US = round(1_000_000 / AR_MEASUREMENT_FPS)
-# SET_POSITION_TARGET_GLOBAL_INT の type_mask（デフォルト 0x09F8 は yaw 有効）
+# ───── 目標更新のクランプ・レート制限設定 ─────
+# カメラ追従は毎フレーム「現在位置 + 相対ベクトル」で目標を上書きするため、
+# カメラのオフセット誤差や計測遅れがあると誤差が毎フレーム再注入され、
+# 指令がじわじわ流れる（積分ドリフト）方向に働きます。
+# ここでは 1 フレームあたりの移動量と、現在位置から目標までの偏差を制限します。
+TARGET_MAX_SPEED_MPS = 0.50  # 目標指令の最大移動速度 [m/s]（LOIT_SPEED_MS 相当）
+TARGET_MAX_STEP_M = frame_step_limit(
+    TARGET_MAX_SPEED_MPS, AR_MEASUREMENT_FPS
+)  # 1 フレームあたりの最大移動量 [m]
+TARGET_MAX_OFFSET_M = 1.20  # 水平方向の最大偏差（現在位置からの半径）[m]
+TARGET_MAX_ALT_UP_M = 0.30  # 上昇方向（NED Down の負側）の最大偏差 [m]
+TARGET_MAX_ALT_DOWN_M = 0.20  # 下降方向（NED Down の正側）の最大偏差 [m]
+# 検出ロスト時: 最大 TARGET_LOST_HOLD_S 秒は目標を保持し、その後は
+# TARGET_LOST_DECAY_MPS で現在位置（水平）へ戻して自動復帰します。
+TARGET_LOST_HOLD_S = 1.00  # 目標を保持する最大時間 [s]
+TARGET_LOST_DECAY_MPS = 0.15  # 保持時間超過後に現在位置へ戻る速度 [m/s]
+# 座標系の前提: クランプは target / gps_now と同じ「REF原点基準のローカル NED（Down）」で
+# 評価します。home 相対高度への変換は送信時（send_local_target）だけなので、
+# ここの上限値は f6152 の原点・高度基準と矛盾しません。
 MASK = 0x09F8
+# SET_POSITION_TARGET_GLOBAL_INT の type_mask（デフォルト 0x09F8 は yaw 有効）
 # 固定ヨー角 [deg]（MAVLink NED yaw: 0=北, 90=東, 180=南）
 # デフォルト 0.0 は従来通り北向き。EKF/circle_params.json の fixed_yaw_deg と
 # 同じ扱いで、環境変数 AR_HOOK_TARGET_YAW_DEG により起動時に上書きできる。
@@ -286,6 +310,25 @@ dist_id1_to_cargo_y = float('nan')
 dist_id1_to_cargo_z = float('nan')
 cargo_center_cam_x = float('nan')
 cargo_center_cam_y = float('nan')
+
+# ✅ 目標のクランプ・レート制限の作動状況（CSV記録用）
+# commit_target_command() が唯一の書き換え元で、record_data() が io_lock 内で読む
+target_limit_log = {
+    'desired': (0.0, 0.0, 0.0),   # 制限前の計測目標 [m]（NED）
+    'limited': (0.0, 0.0, 0.0),   # 制限後の目標 [m]（NED）
+    'rate_active': False,         # レートリミッタが作動した
+    'xy_clamp_active': False,     # 水平偏差クランプが作動した
+    'z_clamp_up_active': False,   # 上昇側（NED Down の負側）の上限に達した
+    'z_clamp_down_active': False, # 下降側（NED Down の正側）の上限に達した
+    'invalid': False,             # 計測値が NaN/inf で前回目標を維持した
+    'hold_active': False,         # 検出ロストで目標を保持中
+    'hold_elapsed_s': 0.0,        # 検出ロストからの経過時間 [s]
+    'decay_active': False,        # 保持時間超過後に現在位置へ減衰復帰中
+    'source': "none",             # 更新元: camera / keyboard / lost_hold / lost_decay
+}
+_target_lost_started_s = None  # 検出ロスト開始時刻（time.monotonic）
+# 一度でもカメラ追従で目標を更新したか（未追従時のロスト処理を無効にする）
+_target_tracked_once = False
 
 # カメラ座標系での位置情報（CSV記録用、オフセット適用前の生値）
 cargo_cam_raw = [float('nan'), float('nan'), float('nan')]
@@ -1382,6 +1425,8 @@ def monitor_vehicle(comm):
                     if takeoff_sent and not takeoff_reached and alt_rel >= TAKEOFF_ALT * 0.9:
                         takeoff_reached = True
                         # ✅ TAKEOFF_ALT は「離陸地点からの高さ」なので Down へ変換して設定
+                        #    離陸直後の初期高度は追従開始前の基準値なので、
+                        #    クランプ・レート制限の対象外（追従は commit_target_command 経由）
                         target['z'] = alt_above_home_to_local_down(
                             TAKEOFF_ALT, gps_origin['z']
                         )
@@ -1454,6 +1499,139 @@ def start_camera_stream_server(port=CAMERA_STREAM_PORT):
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
+
+
+# ───── 目標更新のクランプ・レート制限（唯一の更新入口） ─────
+def commit_target_command(
+    desired_x,
+    desired_y,
+    desired_z,
+    source="camera",
+    apply_rate_limit=True,
+    hold_active=False,
+    hold_elapsed_s=0.0,
+    decay_active=False,
+):
+    """target を書き換える唯一の入口。
+
+    ここにクランプとレート制限を集約する。呼び出し側は io_lock を取らずに
+    呼び出し、戻り値の (x, y, z) を送信に使う。
+
+    クランプの適用範囲:
+        カメラ追従（source="camera"）とキーボード操作（source="keyboard"）の
+        両方に偏差クランプを適用する。キーボードの STEP 操作（0.10 m/回）は
+        偏差クランプの上限（TARGET_MAX_OFFSET_M など）に達するまでそのまま
+        反映されるため、STEP の意図は阻害されない。オペレータが上限を超えて
+        動かそうとした場合だけ、安全側で頭打ちになる。
+        一方、レートリミッタはカメラ追従のみに適用する（apply_rate_limit）。
+        キーボードの 1 回の STEP を 1 フレーム分の移動量（例: 0.0125 m）に
+        分割すると「押した分だけ動かす」という操作意図を壊すため、
+        キーボード経路ではレート制限を掛けない。
+
+    Args:
+        desired_x, desired_y, desired_z: 制限前の目標 [m]（NED）
+        source: 更新元（CSVの Target_Update_Source に記録）
+        apply_rate_limit: レートリミッタを適用するか
+        hold_active: 検出ロストで目標を保持中か
+        hold_elapsed_s: 検出ロストからの経過時間 [s]
+        decay_active: 保持時間超過後の減衰復帰中か
+
+    Returns:
+        (x, y, z): 制限後の目標 [m]（NED）
+    """
+    global target, target_limit_log
+    global _target_lost_started_s, _target_tracked_once
+    with io_lock:
+        previous_target = (target['x'], target['y'], target['z'])
+        current_position = (gps_now['x'], gps_now['y'], gps_now['z'])
+
+    limited, info = limit_target(
+        previous_target,
+        (desired_x, desired_y, desired_z),
+        current_position,
+        TARGET_MAX_STEP_M,
+        TARGET_MAX_OFFSET_M,
+        TARGET_MAX_ALT_UP_M,
+        TARGET_MAX_ALT_DOWN_M,
+        apply_rate_limit=apply_rate_limit,
+    )
+
+    with io_lock:
+        target['x'], target['y'], target['z'] = limited
+        target_limit_log.update({
+            'desired': (float(desired_x), float(desired_y), float(desired_z)),
+            'limited': limited,
+            'rate_active': info['rate_active'],
+            'xy_clamp_active': info['xy_clamp_active'],
+            'z_clamp_up_active': info['z_clamp_up_active'],
+            'z_clamp_down_active': info['z_clamp_down_active'],
+            'invalid': info['invalid'],
+            'hold_active': hold_active,
+            'hold_elapsed_s': hold_elapsed_s,
+            'decay_active': decay_active,
+            'source': source,
+        })
+        if source == "camera":
+            # 正常に追従できたので、検出ロストの経過時間をリセットする
+            _target_lost_started_s = None
+            _target_tracked_once = True
+
+    return limited
+
+
+def update_target_on_detection_lost(comm):
+    """検出ロスト時（cargo_detected が False）の目標更新。
+
+    挙動は「保持 → 減衰復帰」の 2 段階とする。
+    - ロストから TARGET_LOST_HOLD_S 秒までは直前の目標を保持する。
+      短時間のマーカー欠落で指令を動かさないための猶予。
+    - 保持時間を超えたら TARGET_LOST_DECAY_MPS で現在位置（水平）へ戻す。
+      高度指令は保持する。検出が戻れば通常追従へ自動復帰する。
+
+    保持・減衰中も、通常追従と同じ条件（Guided中かつ離陸後）で
+    同じフレーム周期で setpoint を送る（送信周期・モード遷移は変えない）。
+
+    一度もカメラ追従で目標を更新していない場合（離陸直後など）は、
+    従来どおり target を変更しない（離陸後の目標を勝手に動かさない）。
+    """
+    global _target_lost_started_s
+    if not _target_tracked_once:
+        return
+    now_s = time.monotonic()
+    with io_lock:
+        previous_target = (target['x'], target['y'], target['z'])
+        current_position = (gps_now['x'], gps_now['y'], gps_now['z'])
+        if _target_lost_started_s is None:
+            _target_lost_started_s = now_s
+        lost_elapsed_s = now_s - _target_lost_started_s
+
+    decay_step_m = frame_step_limit(TARGET_LOST_DECAY_MPS, AR_MEASUREMENT_FPS)
+    desired, hold_active, decay_active = lost_target_desired(
+        previous_target,
+        current_position,
+        lost_elapsed_s,
+        TARGET_LOST_HOLD_S,
+        decay_step_m,
+    )
+    target_cmd = commit_target_command(
+        desired[0],
+        desired[1],
+        desired[2],
+        source="lost_hold" if hold_active else "lost_decay",
+        apply_rate_limit=True,
+        hold_active=hold_active,
+        hold_elapsed_s=lost_elapsed_s,
+        decay_active=decay_active,
+    )
+
+    if guided_mode_active and initial_target_set:
+        # ✅ クランプ後の目標（REF基準のNED Down）を、水平=REF基準 / 高度=home相対 に
+        #    変換して送る（変換は send_local_target に集約。f6152 の高度基準を維持）。
+        with io_lock:
+            home_down_m = gps_origin['z']
+        if math.isfinite(home_down_m):
+            send_local_target(
+                comm, target_cmd[0], target_cmd[1], target_cmd[2], home_down_m)
 
 
 def camera_tracker_loop(comm, show_window=False, stream_enabled=False):
@@ -2059,16 +2237,23 @@ def camera_tracker_loop(comm, show_window=False, stream_enabled=False):
                         if _attitude_freshness.warning_due():
                             _print_stale_attitude_warning(attitude_age_s)
                     else:
+                        # ✅ target の書き換えは commit_target_command() に集約する
+                        #    （水平偏差クランプ → レートリミッタの順で制限。
+                        #      計測値 target_x/y/z での直接上書きは廃止）
+                        target_cmd = commit_target_command(
+                            target_x,
+                            target_y,
+                            # NEDのDown(Z)方向もマーカー位置に追随
+                            target_z,
+                            source="camera",
+                            apply_rate_limit=True,
+                        )
                         # ✅ target は REF原点基準のローカルNED（Down）で保持し、
                         #    送信時に home 相対高度へ変換します（高度基準の統一）。
                         with io_lock:
                             _coord_source_log = coord_source  # ✅ 座標変換ソースをCSV記録用に保存
-                            target['x'] = target_x
-                            target['y'] = target_y
-                            # NEDのDown(Z)方向もマーカー位置に追随
-                            target['z'] = target_z
-                            # ✅ 送信値はロック内で確定させる（キー操作スレッドとの競合防止）
-                            send_x, send_y, send_z = target_x, target_y, target_z
+                            # ✅ 送信値と原点はロック内で確定させる（キー操作スレッドとの競合防止）
+                            send_x, send_y, send_z = target_cmd
                             home_down_m = gps_origin['z']
                             target_ready = initial_target_set
 
@@ -2099,11 +2284,11 @@ def camera_tracker_loop(comm, show_window=False, stream_enabled=False):
                         # ここは io_lock を保持していない区間なので、取得順序（io_lock → 通信部の _send_lock）に反しない。
                         # 自動で誘導目標コマンドを送信
                         if guided_mode_active and target_ready and math.isfinite(home_down_m):
-                            # ✅ 高度設定に一定値ではなく追跡値 target['z'] を利用。
+                            # ✅ クランプ・レート制限を適用した目標（target_cmd）を送る。
                             #    ローカル Down → 送信 alt の変換は send_local_target() に集約し、
                             #    MAV_FRAME_GLOBAL_RELATIVE_ALT_INT が要求する home 相対高度で送ります
                             #    （旧実装は REF_ALT 基準の高度をそのまま送っていた）。
-                            # ヨーはユーザー設定（TARGET_YAW_DEG、既定 0.0=北向き）に従う
+                            # ヨーはユーザー設定（TARGET_YAW_DEG / AR_HOOK_TARGET_YAW_DEG）に従う
                             # （send_local_target() が TARGET_YAW_SEND_DEG を渡す）。
                             send_local_target(comm, send_x, send_y, send_z, home_down_m)
 
@@ -2121,6 +2306,8 @@ def camera_tracker_loop(comm, show_window=False, stream_enabled=False):
                         hand_cam_raw = [float('nan'), float('nan'), float('nan')]
                         motive_cargo_cam = [float('nan'), float('nan'), float('nan')]
                         motive_hand_cam = [float('nan'), float('nan'), float('nan')]
+                    # ✅ 検出ロスト時は「保持 → 保持時間超過後に減衰復帰」で目標を更新する
+                    update_target_on_detection_lost(comm)
             else:
                 # ids is None
                 with io_lock:
@@ -2135,6 +2322,8 @@ def camera_tracker_loop(comm, show_window=False, stream_enabled=False):
                     hand_cam_raw = [float('nan'), float('nan'), float('nan')]
                     motive_cargo_cam = [float('nan'), float('nan'), float('nan')]
                     motive_hand_cam = [float('nan'), float('nan'), float('nan')]
+                # ✅ 検出ロスト時は「保持 → 保持時間超過後に減衰復帰」で目標を更新する
+                update_target_on_detection_lost(comm)
 
             now = time.monotonic()
             if now - last_print_time >= 1.0:
@@ -2360,39 +2549,55 @@ def control_loop(comm):
             key, moved, echo = get_key(), False, None
             if key == 'q': running = False; break
             elif key in 'umhlwzt':
-                if key == 'u': target['x'] -= STEP; echo = "u South"
-                elif key == 'm': target['x'] += STEP; echo = "m North"
-                elif key == 'h': target['y'] += STEP; echo = "h East"
-                elif key == 'l': target['y'] -= STEP; echo = "l West"
-                elif key == 'w' and initial_target_set: target['z'] -= STEP; echo = "w Up"
+                # キーボード操作も commit_target_command() を通して偏差クランプを適用する。
+                # ただしレートリミッタは掛けない（apply_rate_limit=False）。
+                # 1 回の STEP=0.10 m を 1 フレーム分（例: 0.0125 m）に分割すると
+                # 「押した分だけ動かす」という操作意図を壊すため。
+                # t（基準点復帰）も同じクランプを通るため、現在位置から上限を超える
+                # 場合は安全側で頭打ちになり、再度押すと残りへ段階的に近づく。
+                desired = dict(target)
+                if key == 'u': desired['x'] -= STEP; echo = "u South"
+                elif key == 'm': desired['x'] += STEP; echo = "m North"
+                elif key == 'h': desired['y'] += STEP; echo = "h East"
+                elif key == 'l': desired['y'] -= STEP; echo = "l West"
+                elif key == 'w' and initial_target_set: desired['z'] -= STEP; echo = "w Up"
                 elif key == 'z' and initial_target_set:
-                    # ✅ 降下の下限は「離陸地点からの高さ 0.05 m」で判定します。
+                    # ✅ 降下の下限は「離陸地点からの高さ 0.05 m」で判定します（f6152 の高度基準統一）。
                     #    旧実装は REF基準の Down を直接比較していたため、離陸地点と
-                    #    REF の高度差しだいで下限の意味が変わっていました（高度基準の統一）。
+                    #    REF の高度差しだいで下限の意味が変わっていました。
                     with io_lock:
                         home_down_m = gps_origin['z']
-                    next_down = target['z'] + STEP
+                    next_down = desired['z'] + STEP
                     if local_down_to_home_relative_alt(next_down, home_down_m) >= 0.05:
-                        target['z'] = next_down
+                        desired['z'] = next_down
                         echo = "z Down"
                 elif key == 't' and initial_target_set:
                     # ✅ N/E は REF フレーム、高さは「離陸地点からの高さ」
                     #    TARGET_HEIGHT_ABOVE_TAKEOFF を Down へ変換して設定します。
                     with io_lock:
                         home_down_m = gps_origin['z']
-                    target['x'], target['y'], _ = gps_to_local_xyz(
+                    desired['x'], desired['y'], _ = gps_to_local_xyz(
                         36.0757693, 136.2132945, REF_ALT)
-                    target['z'] = alt_above_home_to_local_down(
+                    desired['z'] = alt_above_home_to_local_down(
                         TARGET_HEIGHT_ABOVE_TAKEOFF, home_down_m)
-                    echo = f"t → N={target['x']:.2f} E={target['y']:.2f} D={target['z']:.2f}"
-                if echo: moved = True; print(f"KEY: {echo}")
-                # カメラスレッドと同じ接続へ送信するため、send_setpoint() → 通信部の _send_lock で直列化される。
+                    echo = "t"
+                if echo:
+                    moved = True
+                    target_cmd = commit_target_command(
+                        desired['x'], desired['y'], desired['z'],
+                        source="keyboard",
+                        apply_rate_limit=False,
+                    )
+                    print(
+                        f"KEY: {echo} → N={target_cmd[0]:.2f} "
+                        f"E={target_cmd[1]:.2f} D={target_cmd[2]:.2f}"
+                    )
+                # カメラスレッドと同じ接続へ送信するため、send_local_target() → 通信部の _send_lock で直列化される。
                 # ここは io_lock を保持していない区間なので、取得順序（io_lock → 通信部の _send_lock）に反しない。
                 if moved:
                     # ✅ 目標と原点はロック内で確定させてから送信します
                     with io_lock:
-                        key_target_x, key_target_y, key_target_z = (
-                            target['x'], target['y'], target['z'])
+                        key_target_x, key_target_y, key_target_z = target_cmd
                         home_down_m = gps_origin['z']
                     if math.isfinite(home_down_m):
                         # 自動追従と同じ固定ヨー設定（TARGET_YAW_DEG, 既定 0.0=北向き）
@@ -2510,7 +2715,20 @@ def record_data():
                     *ar_marker_pose_log[name]["pre_offset_quaternion_ned"],
                 )
             ]
-            
+
+            # ✅ 目標のクランプ・レート制限の作動状況
+            tgt_lim = target_limit_log
+            tgt_des_x, tgt_des_y, tgt_des_z = tgt_lim['desired']
+            tgt_rate = 1 if tgt_lim['rate_active'] else 0
+            tgt_xy_clamp = 1 if tgt_lim['xy_clamp_active'] else 0
+            tgt_z_up = 1 if tgt_lim['z_clamp_up_active'] else 0
+            tgt_z_down = 1 if tgt_lim['z_clamp_down_active'] else 0
+            tgt_invalid = 1 if tgt_lim['invalid'] else 0
+            tgt_hold = 1 if tgt_lim['hold_active'] else 0
+            tgt_hold_t = tgt_lim['hold_elapsed_s']
+            tgt_decay = 1 if tgt_lim['decay_active'] else 0
+            tgt_src = tgt_lim['source']
+
         data_records.append([
             time.time(), 
             gps['x'], gps['y'], gps['z'], 
@@ -2549,9 +2767,13 @@ def record_data():
             *motive_pose_calibration_log,
             *ar_pose_log_values,
             *ar_pose_pre_offset_log_values,
-            # ✅ 新規追加：MAVLink ATTITUDE の鮮度（末尾に追加。既存列は変更しない）
+            # ✅ 新規追加：MAVLink ATTITUDE の鮮度（既存列は変更しない）
             attitude_age_ms,
             attitude_stale,
+            # ✅ 新規追加：目標のクランプ・レート制限の作動状況（末尾に追加）
+            tgt_des_x, tgt_des_y, tgt_des_z,
+            tgt_rate, tgt_xy_clamp, tgt_z_up, tgt_z_down,
+            tgt_invalid, tgt_hold, tgt_hold_t, tgt_decay, tgt_src,
         ])
         time.sleep(1 / AR_LOG_HZ)
 def save_csv():
@@ -2654,11 +2876,20 @@ def save_csv():
                     f'AR_{name}_PreOffset_QW_NED',
                 )
             ],
-            # ✅ 新規追加：MAVLink ATTITUDE の鮮度（末尾に追加。既存列は変更しない）
+            # ✅ 新規追加：MAVLink ATTITUDE の鮮度（既存列は変更しない）
             # Attitude_Age_ms は未受信時 nan、Attitude_Stale は古い/未受信なら 1。
             # motive モードで Motive 姿勢を受信できている場合は参考情報。
             'Attitude_Age_ms',
             'Attitude_Stale',
+            # ✅ 新規追加：目標のクランプ・レート制限の作動状況（末尾に追加）
+            'Target_Desired_X_m', 'Target_Desired_Y_m', 'Target_Desired_Z_m',
+            'Target_Limit_Rate_Active',
+            'Target_Limit_XY_Clamp_Active',
+            'Target_Limit_Z_Clamp_Up', 'Target_Limit_Z_Clamp_Down',
+            'Target_Limit_Invalid',
+            'Target_Hold_Active', 'Target_Hold_Elapsed_s',
+            'Target_Lost_Decay_Active',
+            'Target_Update_Source',
         ])
         writer.writerows(data_records)
     print(f"\n✓ CSV保存完了: {path} ({len(data_records)} 行)")
