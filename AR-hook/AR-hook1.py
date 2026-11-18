@@ -15,6 +15,19 @@ from marker_pose_calibration import (
     quaternion_to_rotation_matrix_xyzw,
     rotation_matrix_to_quaternion_xyzw,
 )
+# ✅ ローカルNED原点と高度変換は local_frame.py の 1 箇所に集約しています。
+#    原点は固定の REF_LAT/REF_LON/REF_ALT で、起動時原点による正規化は行いません
+#    （理由は local_frame.py の docstring を参照）。
+from local_frame import (
+    REF_ALT,
+    REF_LAT,
+    REF_LON,
+    alt_above_home_to_local_down,
+    gps_to_local_xyz,
+    home_down_from_position,
+    local_down_to_home_relative_alt,
+    local_xyz_to_gps,
+)
 # pyrefly: ignore [missing-import]
 from pymavlink import mavutil
 import pytz
@@ -121,8 +134,12 @@ else:
     print(f"ℹ 固定姿勢オフセットなし（未校正）: {MARKER_POSE_OFFSET_FILE.name}")
 
 # ───── 基準点設定 ─────
-# Motive SDKの固定GPS基準点と一致させ、異なるCSV間でNED原点を共有します。
-REF_LAT, REF_LON, REF_ALT = 36.0757800, 136.2132900, 0.0
+# ✅ ローカル NED 原点（REF_LAT/REF_LON/REF_ALT）の定義は local_frame.py の
+#    1 箇所だけです。Motive SDKの固定GPS基準点と一致させ、異なるCSV間で
+#    NED原点を共有するため、ここでは再定義しません（同名で import 済み）。
+# ✅ TARGET_HEIGHT_ABOVE_TAKEOFF は「離陸地点（EKF home）からの高さ」[m] です。
+#    target['z']（REF基準のDown）へ設定するときは
+#    alt_above_home_to_local_down() で変換します。
 TARGET_HEIGHT_ABOVE_TAKEOFF = 1.10
 CSV_DIR = Path.home() / "LOGS_Pixhawk6c"
 CSV_DIR.mkdir(exist_ok=True)
@@ -136,8 +153,13 @@ _camera_stream_jpeg = None
 running = True
 recording = True  # ← 常に記録
 target = {'x':0.0, 'y':0.0, 'z':0.0}
-gps_now = {'x':0.0, 'y':0.0, 'z':0.0}
-gps_origin = {'x':0.0, 'y':0.0, 'z':0.0}  # ✅ GPS原点（ローカル座標系の原点）
+gps_now = {'x':0.0, 'y':0.0, 'z':0.0}  # ✅ REF原点基準のローカルNED（起動時正規化なし）
+# ✅ gps_origin は「離陸地点（EKF home）を REF フレームで表した参照点」です。
+#    原点そのものは local_frame.REF_LAT/REF_LON/REF_ALT の 1 箇所だけで、
+#    ここには同じ原点で表した座標を保持します（位置の減算・正規化には使いません）。
+#    z は REF基準の Down [m] で、target/送信高度の変換に使います。
+#    未確定を表すため初期値は nan（NaN の間は高度変換・送信を行いません）。
+gps_origin = {'x':0.0, 'y':0.0, 'z':float('nan')}
 current_roll_rad = 0.0   # MAVLinkから取得する実時間ロール角（ラジアン）
 current_pitch_rad = 0.0  # MAVLinkから取得する実時間ピッチ角（ラジアン）
 current_yaw_rad = 0.0    # MAVLinkから取得する実時間ヨー角（ラジアン）
@@ -561,6 +583,8 @@ def motive_udp_listener():
                 rigid_body_id = unpacked[0]
                 
                 # GPSからローカルNED座標に変換
+                # ✅ Motive が送る alt は REF_ALT と同じスケール（Motive固定基準点）なので、
+                #    そのまま gps_to_local_xyz() に渡せます（原点は REF で共通）。
                 lat = unpacked[1] / 1e7
                 lon = unpacked[2] / 1e7
                 alt = unpacked[3] / 1000.0
@@ -810,16 +834,29 @@ def send_setpoint(m, lat_i, lon_i, alt):
         lat_i, lon_i, alt, 0,0,0,0,0,0,
         math.radians(TARGET_YAW_DEG), 0)
 # ───── 座標変換 ─────
-def gps_to_local_xyz(lat, lon, alt):
-    north = (lat - REF_LAT) * 111319.5
-    east = (lon - REF_LON) * 111319.5 * math.cos(math.radians(REF_LAT))
-    down = REF_ALT - alt
-    return north, east, down
-def local_xyz_to_gps(x, y, z):
-    lat = REF_LAT + x / 111319.5
-    lon = REF_LON + y / (111319.5 * math.cos(math.radians(REF_LAT)))
-    alt = REF_ALT - z
-    return lat, lon, alt
+# ✅ gps_to_local_xyz() / local_xyz_to_gps() の実体は local_frame.py に移しました。
+#    ローカル NED 原点は REF_LAT/REF_LON/REF_ALT の 1 箇所だけで、
+#    gps_now も gps_origin も同じ原点を参照します（起動時原点の正規化は廃止）。
+def send_local_target(m, x, y, z, home_down_m):
+    """REF原点基準のローカル目標を、home相対高度のGLOBAL_INT指令として送信します。
+
+    MAV_FRAME_GLOBAL_RELATIVE_ALT_INT は EKF home（離陸地点）からの高度を要求する
+    ため、水平は REF 基準の緯度経度へ、高度は local_down_to_home_relative_alt()
+    で home 相対高度へ変換してから送ります（変換はこの 1 関数経由に統一）。
+
+    Args:
+        m: MAVLink 接続
+        x, y: REF原点基準の北・東 [m]
+        z: REF原点基準の Down [m]
+        home_down_m: 離陸地点の Down 座標 [m]（gps_origin['z']）
+
+    Returns:
+        送信した home 相対高度 [m]。
+    """
+    lat, lon, _alt_ref = local_xyz_to_gps(x, y, z)
+    alt_above_home = local_down_to_home_relative_alt(z, home_down_m)
+    send_setpoint(m, int(lat * 1e7), int(lon * 1e7), alt_above_home)
+    return alt_above_home
 
 
 def rotation_matrix_to_euler_rpy(rotation):
@@ -1098,35 +1135,52 @@ def monitor_vehicle(m):
                 current_yaw_deg = (math.degrees(att.yaw) + 360) % 360
         pos = m.recv_match(type='GLOBAL_POSITION_INT', blocking=False)
         if pos:
-            lat, lon, alt = pos.lat / 1e7, pos.lon / 1e7, pos.relative_alt / 1000
+            lat, lon = pos.lat / 1e7, pos.lon / 1e7
+            # ✅ 高度は REF_ALT と同じスケール（AMSL）で扱います。
+            #    relative_alt（EKF home 相対）をそのまま Down にすると、起動が
+            #    離陸後だと z 基準がずれるため、REF基準の Down は alt(AMSL) から求めます。
+            alt_amsl = pos.alt / 1000
+            alt_rel = pos.relative_alt / 1000
             if origin is None:
+                # ✅ origin は起動時の GPS メッセージを残すだけのログ用変数です。
+                #    ローカル座標の原点は local_frame.REF_* 固定（ここでは作りません）。
                 origin = pos
-                print(f"✓ GPS原点設定 lat={lat}, lon={lon}")
-            
-            # ✅ GPS原点の設定（初回のみ）
-            if not gps_origin_set:
-                x, y, z = gps_to_local_xyz(lat, lon, alt)
-                with io_lock:
-                    gps_origin['x'] = x
-                    gps_origin['y'] = y
-                    gps_origin['z'] = z
-                print(f"✓ GPS原点（ローカル座標系）: X={x:.3f}, Y={y:.3f}, Z={z:.3f}")
-                gps_origin_set = True
-            
-            x, y, z = gps_to_local_xyz(lat, lon, alt)
-            # ✅ GPS原点からの相対座標に正規化
-            x -= gps_origin['x']
-            y -= gps_origin['y']
-            z -= gps_origin['z']
-            
+                print(f"✓ 起動時のGPS位置（ログ用）: lat={lat:.7f}, lon={lon:.7f}")
+            # ✅ 起動時原点による正規化は廃止しました（原点は local_frame.REF_* 固定）。
+            #    旧実装は初回位置を gps_origin として減算していたため、離陸地点と REF の
+            #    差が追従目標に一定バイアスとして乗っていました。
+            north, east, down = gps_to_local_xyz(lat, lon, alt_amsl)
+            origin_log = None
+            takeoff_log = None
             with io_lock:
-                gps_now.update({'x': x, 'y': y, 'z': z})
-            if takeoff_sent and not takeoff_reached and z <= -TAKEOFF_ALT * 0.9:
-                takeoff_reached = True
-                with io_lock:
-                    target['z'] = -TAKEOFF_ALT
+                # ✅ 原点関連（gps_origin / gps_now / target）の読み書きは必ずこのロック内
+                if not gps_origin_set:
+                    gps_origin['x'] = north
+                    gps_origin['y'] = east
+                    # 離陸地点（EKF home）の Down。起動が離陸後でも home 基準で求まります。
+                    gps_origin['z'] = home_down_from_position(alt_amsl, alt_rel)
+                    gps_origin_set = True
+                    origin_log = (north, east, gps_origin['z'])
+                gps_now.update({'x': north, 'y': east, 'z': down})
+                # ✅ 離陸判定は home 相対高度（上正）で行います（高度基準の統一）
+                if takeoff_sent and not takeoff_reached and alt_rel >= TAKEOFF_ALT * 0.9:
+                    takeoff_reached = True
+                    # ✅ TAKEOFF_ALT は「離陸地点からの高さ」なので Down へ変換して設定
+                    target['z'] = alt_above_home_to_local_down(
+                        TAKEOFF_ALT, gps_origin['z']
+                    )
                     initial_target_set = True
-                print(f"✓ 離陸高度到達: {target['z']:.2f}m")
+                    takeoff_log = target['z']
+            if origin_log is not None:
+                print(
+                    f"✓ 離陸地点のREF座標: X={origin_log[0]:.3f}, Y={origin_log[1]:.3f}, "
+                    f"Down={origin_log[2]:.3f}"
+                )
+            if takeoff_log is not None:
+                print(
+                    f"✓ 離陸高度到達: home相対 {TAKEOFF_ALT:.2f}m "
+                    f"(target Down={takeoff_log:.2f}m)"
+                )
         time.sleep(1 / SEND_HZ)
 # ───── バックグラウンド・カメラ追跡スレッド ─────
 def start_camera_stream_server(port=CAMERA_STREAM_PORT):
@@ -1760,12 +1814,18 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                             tvec_error, ap_roll, ap_pitch, ap_yaw, drone_gps)
 
                     # グローバル目標値等の更新
+                    # ✅ target は REF原点基準のローカルNED（Down）で保持し、
+                    #    送信時に home 相対高度へ変換します（高度基準の統一）。
                     with io_lock:
                         _coord_source_log = coord_source  # ✅ 座標変換ソースをCSV記録用に保存
                         target['x'] = target_x
                         target['y'] = target_y
                         # NEDのDown(Z)方向もマーカー位置に追随
                         target['z'] = target_z
+                        # ✅ 送信値はロック内で確定させる（キー操作スレッドとの競合防止）
+                        send_x, send_y, send_z = target_x, target_y, target_z
+                        home_down_m = gps_origin['z']
+                        target_ready = initial_target_set
                         
                         cargo_center_world['x'] = cargo_x
                         cargo_center_world['y'] = cargo_y
@@ -1791,10 +1851,12 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                         cargo_center_cam_y = v - H / 2.0
 
                     # 自動で誘導目標コマンドを送信
-                    if guided_mode_active and initial_target_set:
-                        # 高度設定に一定値ではなく追跡値 target['z'] を利用
-                        lat, lon, alt = local_xyz_to_gps(target_x, target_y, target['z'])
-                        send_setpoint(m, int(lat*1e7), int(lon*1e7), alt)
+                    if guided_mode_active and target_ready and math.isfinite(home_down_m):
+                        # ✅ 高度設定に一定値ではなく追跡値 target['z'] を利用。
+                        #    ローカル Down → 送信 alt の変換は send_local_target() に集約し、
+                        #    MAV_FRAME_GLOBAL_RELATIVE_ALT_INT が要求する home 相対高度で送ります
+                        #    （旧実装は REF_ALT 基準の高度をそのまま送っていた）。
+                        send_local_target(m, send_x, send_y, send_z, home_down_m)
 
                 else:
                     # 荷物が検出されていない場合
@@ -2054,15 +2116,38 @@ def control_loop(m):
                 elif key == 'h': target['y'] += STEP; echo = "h East"
                 elif key == 'l': target['y'] -= STEP; echo = "l West"
                 elif key == 'w' and initial_target_set: target['z'] -= STEP; echo = "w Up"
-                elif key == 'z' and initial_target_set and target['z'] + STEP <= -0.05: target['z'] += STEP; echo = "z Down"
+                elif key == 'z' and initial_target_set:
+                    # ✅ 降下の下限は「離陸地点からの高さ 0.05 m」で判定します。
+                    #    旧実装は REF基準の Down を直接比較していたため、離陸地点と
+                    #    REF の高度差しだいで下限の意味が変わっていました（高度基準の統一）。
+                    with io_lock:
+                        home_down_m = gps_origin['z']
+                    next_down = target['z'] + STEP
+                    if local_down_to_home_relative_alt(next_down, home_down_m) >= 0.05:
+                        target['z'] = next_down
+                        echo = "z Down"
                 elif key == 't' and initial_target_set:
-                    target['x'], target['y'], target['z'] = gps_to_local_xyz(36.0757693, 136.2132945, REF_ALT)
-                    target['z'] = -TARGET_HEIGHT_ABOVE_TAKEOFF
+                    # ✅ N/E は REF フレーム、高さは「離陸地点からの高さ」
+                    #    TARGET_HEIGHT_ABOVE_TAKEOFF を Down へ変換して設定します。
+                    with io_lock:
+                        home_down_m = gps_origin['z']
+                    target['x'], target['y'], _ = gps_to_local_xyz(
+                        36.0757693, 136.2132945, REF_ALT)
+                    target['z'] = alt_above_home_to_local_down(
+                        TARGET_HEIGHT_ABOVE_TAKEOFF, home_down_m)
                     echo = f"t → N={target['x']:.2f} E={target['y']:.2f} D={target['z']:.2f}"
                 if echo: moved = True; print(f"KEY: {echo}")
                 if moved:
-                    lat, lon, alt = local_xyz_to_gps(target['x'], target['y'], target['z'])
-                    send_setpoint(m, int(lat*1e7), int(lon*1e7), alt)
+                    # ✅ 目標と原点はロック内で確定させてから送信します
+                    with io_lock:
+                        key_target_x, key_target_y, key_target_z = (
+                            target['x'], target['y'], target['z'])
+                        home_down_m = gps_origin['z']
+                    if math.isfinite(home_down_m):
+                        send_local_target(
+                            m, key_target_x, key_target_y, key_target_z, home_down_m)
+                    else:
+                        print("⚠ 離陸地点の高度が未確定のため目標を送信しません")
             time.sleep(0.05)  # 100% CPU使用率を防ぐためにスリープを追加
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
