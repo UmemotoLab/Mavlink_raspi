@@ -229,8 +229,8 @@ params_to_set = {
     # === AP_Observer コア制御パラメータ ===
     'OBS_CORR_GAIN':    (0.3, 'AP_Float', '外力推定に基づく姿勢補正ゲイン（現ファーム値; Observer4の0.3は別途フライト調整で判断）'),
     'OBS_MAX_CORR_ANG': (0.5, 'AP_Float', 'ロールおよびピッチの最大姿勢補正角 [rad]'),
-    'OBS_PHASE_RLL':    (75.0, 'AP_Float', 'ロール軸高調波力推定の位相進み [deg]（direct-phase用初期値）'),
-    'OBS_PHASE_PIT':    (75.0, 'AP_Float', 'ピッチ軸高調波力推定の位相進み [deg]（direct-phase用初期値）'),
+    'OBS_PHASE_RLL':    (90.0, 'AP_Float', 'ロール軸高調波力推定の位相進み [deg]（direct-phase用初期値）'),
+    'OBS_PHASE_PIT':    (90.0, 'AP_Float', 'ピッチ軸高調波力推定の位相進み [deg]（direct-phase用初期値）'),
 
     # === EKF プロセス/観測ノイズ ===
     'OBS_EKF_Q_D':      (9.5367432e-12, 'AP_Float', '外乱状態 d のプロセスノイズ分散（現ファームスケール; live値）'),
