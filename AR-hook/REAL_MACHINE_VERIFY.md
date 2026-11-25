@@ -1,0 +1,498 @@
+# AR-hook 実機確認手順（REAL_MACHINE_VERIFY）
+
+- 対象: `AR-hook/bench_check.py`（計測ツール）と `AR-hook/bench_log_check.py`（判定ツール）
+- 対象ブランチ: `feature/arhook-fixes`（`main` は `1c6aca1` 固定。本手順は `main` を変更しません）
+- 実施状態: **NOT RUN（未実施）**
+  この手順書を作成した作業環境には Raspberry Pi / Pixhawk / カメラ / Motive が無いため、
+  実機への接続・計測・判定は行っていません。**実機の実行と記入は人間が行います。**
+  本文・記入欄（§8・付録1.4）の実測値はすべて `NOT RUN` のままで、推測値は入れていません。
+- 関連文書:
+  [BENCH_RESULT.md](./BENCH_RESULT.md)（§7 実機観測の記録 / §7.6 実機再計測の記録欄）、
+  [FAILSAFE_CHECKLIST.md](./FAILSAFE_CHECKLIST.md)（偽 armed 対策の根拠）、
+  [実験手順書.md](./実験手順書.md)（本番運用手順）、
+  [統合メモ.md](./統合メモ.md)（起動時ログの確認項目）
+
+## 0. この文書の位置づけ
+
+### 0.1 確認すること
+
+地上ベンチで、Raspberry Pi ↔ Pixhawk の MAVLink リンクが「実機で」健全かどうかを確認します。
+
+1. 受信レート（HEARTBEAT / GLOBAL_POSITION_INT / ATTITUDE）
+2. 受信フレームの健全性（BAD_DATA 件数、受信例外、受信タイムアウト、フレーム競合）
+3. 偽 armed（`armed_raw=True` かつ確定 armed に至らない事象）の有無
+4. 多重起動（ポートを掴むプロセスの二重起動）が無いこと
+
+### 0.2 確認しないこと（本手順の対象外）
+
+- 飛行・離陸・GUIDED へのモード変更・アーム（**本手順では一切行いません**）
+- カメラ・ArUco 検出精度・Motive 座標精度
+- 長時間（30 分以上）の連続計測、EMI・ケーブル揺動の評価
+- 付録2 の GUIDED 自動移動（`AR_HOOK_AUTO_START`）は **未実装のため NOT RUN**
+
+### 0.3 ツールの役割
+
+| ツール | 役割 | 実機接続 |
+|---|---|---|
+| `bench_check.py` | シリアルを開いて受信レート・異常件数を実測し、`[判定]` と終了コードを出す | する（本手順で唯一シリアルを開く） |
+| `bench_log_check.py` | `bench_check.py` の出力ログ（テキスト / CSV）だけを読み、合否を 1 行で判定する | **しない**（標準ライブラリのみ） |
+
+**合否の正は `bench_log_check.py` の判定**です（§5.3）。`bench_check.py` の `[判定]` 表示は
+参考情報として併記し、両者が食い違ったときは `bench_log_check.py` を正とします。
+
+## 1. 安全条件（厳守）
+
+| # | 条件 | 理由 |
+|---|---|---|
+| 1 | **プロペラを外す** | 誤送信・誤操作があっても機体が飛ばない状態にする |
+| 2 | **アームしない**（送信機・GCS から手を離す） | アームされると自動離陸の条件に近づく。実行中に誰かがアームしないようにする |
+| 3 | **GUIDED へ変更しない** | GUIDED は setpoint が機体に効くモード。本手順ではモード変更を一切行わない |
+| 4 | **機体を固定する** | 送信や機体の自己テストで動いても危険が無いようにする |
+| 5 | **`bench_check.py` は既定（setpoint 送信なし）で使う** | `--send-setpoints` を付けない。既定で送るのは `MAV_CMD_SET_MESSAGE_INTERVAL`（受信周期の要求）のみ |
+| 6 | **`AR-hook1.py` を同時に起動しない** | `AR-hook1.py` は `/dev/ttyAMA0` を占有し、GUIDED + armed を検出すると 3 秒後に `MAV_CMD_NAV_TAKEOFF` を送る |
+| 7 | 実行中に armed を検出したら中止 | `bench_check.py` は確定 armed を検出すると自動で中止する（終了コード 2）。人間も直ちにアームを解除する |
+| 8 | プロセスは常に 1 つ。終了は Ctrl+C（SIGINT） | `kill -9`（SIGKILL）で殺した直後に BAD_DATA と偽 armed が観測されている（[BENCH_RESULT.md](./BENCH_RESULT.md) §7.2 / §7.3） |
+| 9 | 異音・発熱・焦げ臭・配線外れがあれば即中止 | ベンチでも配線異常は危険 |
+
+補足:
+
+- 条件 5 のとおり、本手順では setpoint を送りません。`--send-setpoints` は使いません
+  （仮に付けても、armed / GUIDED を検出すると `bench_check.py` 側が送信を拒否しますが、
+  本手順の前提は「送らない」です）。
+- 条件 6 は付録1 にも関わります。付録1 で `AR-hook1.py` を起動するときは、
+  §3 の計測とは**別の時間帯**に行い、同時に走らせません。
+
+## 2. 準備と前提
+
+### 2.1 機体・配線
+
+| 項目 | 前提 | 確認方法 |
+|---|---|---|
+| 接続 | Pixhawk TELEM1 ↔ Raspberry Pi `/dev/ttyAMA0`、1,000,000 bps、RTS/CTS 有効 | 本書 §3 の手順で接続ログを確認 |
+| Pixhawk 設定 | `SERIALx_BAUD` = 1000（1,000,000）、`SERIALx_PROTOCOL` = 2（MAVLink2）、`BRD_SERx_RTSCTS` を配線に合わせる | GCS のパラメータ画面 |
+| ストリーム | `SRx_EXTRA1`（ATTITUDE）、`SRx_POSITION`（GLOBAL_POSITION_INT） | GCS のパラメータ画面（未確認項目は [BENCH_RESULT.md](./BENCH_RESULT.md) §4） |
+| 機体状態 | disarmed、非 GUIDED | GCS の表示で確認（人間の目視） |
+| UART | Bluetooth に取られていない / シリアルコンソール・getty が無効 | [BENCH_RESULT.md](./BENCH_RESULT.md) §3.2 の事前確認コマンド |
+
+### 2.2 Raspberry Pi 側の事前確認（`AR-hook/` で実行）
+
+```bash
+cd /path/to/Mavlink_raspi/AR-hook     # 実際の配置に読み替える
+
+python3 bench_log_check.py --version  # bench_log_check.py 1.0
+python3 -c 'import pymavlink; print(pymavlink.__version__)'   # 依存の確認
+
+stty -F /dev/ttyAMA0 1000000 cs8 -cstopb -parenb crtscts raw -echo
+ls -l /dev/serial0 /dev/ttyAMA0
+cat /proc/cmdline                     # console=serial0,... が残っていないこと
+dmesg | grep -i tty                   # overrun / frame error が無いこと
+```
+
+`bench_check.py` は `--version` を持ちません（`--help` で既定値を確認できます）。
+既定値は `--device /dev/ttyAMA0` / `--baud 1000000` / RTS-CTS 有効 / `--duration 30` /
+`--warmup 3` / `--mode locked` / setpoint 送信なし です。**既定値を変更しません。**
+
+### 2.3 ログの保存先
+
+```bash
+mkdir -p "$HOME/arhook_verify_logs"
+ls -ld "$HOME/arhook_verify_logs"
+```
+
+実測ログ（`run*.txt` / `exit_codes.txt`）はリポジトリにコミットしません。
+本書 §8 と [BENCH_RESULT.md](./BENCH_RESULT.md) §7.6 には要約だけを記入します。
+
+## 3. 手順
+
+全体の流れ: **電源投入 → 多重起動の確認 → 計測 3 回以上（起動直後 1 回 + 落ち着いた状態 2 回以上）
+→ 任意で `--no-rtscts` 1 回 → 判定 → 記入**。
+
+| # | 手順 | 確認・記録 |
+|---|---|---|
+| 1 | 機体を固定し、プロペラが無いことを確認する。GCS で disarmed / 非 GUIDED を確認する | 目視。§8.2 に記録 |
+| 2 | **電源投入**（Pixhawk → Raspberry Pi の順。Pixhawk の起動完了と HEARTBEAT 開始を待つ） | GCS に HEARTBEAT が表示されること。`bench_check.py` は接続時に HEARTBEAT を既定 10 秒待つ（`--heartbeat-timeout`）ので、待たずに実行すると接続エラー（終了コード 2）になる |
+| 3 | **多重起動の確認**（下記 3.1） | 0 件であること |
+| 4 | **計測 1 回目（起動直後）**。コマンドは §4 の `run1_boot` | §8.1 に記録 |
+| 5 | **1 回目の終了から 60 秒以上あける**（可能なら 5 分以上） | — |
+| 6 | **計測 2 回目（落ち着いた状態）** `run2_settled` | §8.1 に記録 |
+| 7 | **計測 3 回目（落ち着いた状態）** `run3_settled`。2 回目と 3 回目の間も 60 秒以上あける | §8.1 に記録 |
+| 8 | （任意）**`--no-rtscts` で 1 回** `run4_no_rtscts` | §8.1 に記録（合否は §5.3 のとおり RTS-CTS 有効の 3 回で判定） |
+| 9 | **判定**（§4.2）。`bench_log_check.py` で `run*.txt` をまとめて判定する | §8.3 に 1 行サマリを貼る |
+| 10 | **記入**。本書 §8 と [BENCH_RESULT.md](./BENCH_RESULT.md) §7.6 に要約を記入する | NOT RUN は消さない |
+
+### 3.1 多重起動の確認（`pgrep -af`）
+
+```bash
+pgrep -af 'bench_check\.py'
+pgrep -af 'AR-hook1\.py'
+pgrep -af 'mavlink'
+```
+
+- 期待: **すべて出力 0 行**（`pgrep` の終了コード 1 は「該当なし」で正常）。
+- 1 行でも出た場合は、その PID を確認し、**Ctrl+C（SIGINT）で正常終了**させてから計測を始めます。
+  `kill -9` は使わないでください（[BENCH_RESULT.md](./BENCH_RESULT.md) §7.2 / §7.3 の
+  BAD_DATA 7 件・偽 armed は SIGKILL された多重起動の直後に観測されています）。
+- シリアルポートを掴んでいるプロセスの確認（要 root。`mavlink-bridge.service` 等）:
+
+```bash
+sudo fuser -v /dev/ttyAMA0
+sudo lsof /dev/ttyAMA0
+```
+
+`/dev/ttyAMA0` を他プロセスが開いていると `bench_check.py` は接続できません
+（[実験手順書.md](./実験手順書.md) の「多重起動・ポート占有」も参照）。
+
+## 4. 実行コマンド例（`tee` で保存し `PIPESTATUS` で終了コードを記録）
+
+### 4.1 計測（3 回以上 + 任意で `--no-rtscts` 1 回）
+
+```bash
+cd /path/to/Mavlink_raspi/AR-hook        # 実際の配置に読み替える
+mkdir -p "$HOME/arhook_verify_logs"
+LOG_DIR="$HOME/arhook_verify_logs"
+
+# --- 1 回目: 電源投入直後 ------------------------------------------------
+python3 bench_check.py --device /dev/ttyAMA0 --duration 30 --warmup 3 2>&1 \
+  | tee "$LOG_DIR/run1_boot.txt"
+RC1=${PIPESTATUS[0]}
+echo "# PIPESTATUS=${RC1}" >> "$LOG_DIR/run1_boot.txt"
+printf 'run1_boot %s\n' "$RC1" >> "$LOG_DIR/exit_codes.txt"
+
+# --- 60 秒以上あける -----------------------------------------------------
+sleep 60
+
+# --- 2 回目: 落ち着いた状態 ---------------------------------------------
+python3 bench_check.py --device /dev/ttyAMA0 --duration 30 --warmup 3 2>&1 \
+  | tee "$LOG_DIR/run2_settled.txt"
+RC2=${PIPESTATUS[0]}
+echo "# PIPESTATUS=${RC2}" >> "$LOG_DIR/run2_settled.txt"
+printf 'run2_settled %s\n' "$RC2" >> "$LOG_DIR/exit_codes.txt"
+
+# --- 60 秒以上あける -----------------------------------------------------
+sleep 60
+
+# --- 3 回目: 落ち着いた状態 ---------------------------------------------
+python3 bench_check.py --device /dev/ttyAMA0 --duration 30 --warmup 3 2>&1 \
+  | tee "$LOG_DIR/run3_settled.txt"
+RC3=${PIPESTATUS[0]}
+echo "# PIPESTATUS=${RC3}" >> "$LOG_DIR/run3_settled.txt"
+printf 'run3_settled %s\n' "$RC3" >> "$LOG_DIR/exit_codes.txt"
+
+# --- 60 秒以上あける -----------------------------------------------------
+sleep 60
+
+# --- 任意: RTS/CTS 無効で 1 回（切り分け用） ----------------------------
+python3 bench_check.py --device /dev/ttyAMA0 --duration 30 --warmup 3 --no-rtscts 2>&1 \
+  | tee "$LOG_DIR/run4_no_rtscts.txt"
+RC4=${PIPESTATUS[0]}
+echo "# PIPESTATUS=${RC4}" >> "$LOG_DIR/run4_no_rtscts.txt"
+printf 'run4_no_rtscts %s\n' "$RC4" >> "$LOG_DIR/exit_codes.txt"
+```
+
+注意:
+
+- `PIPESTATUS[0]` が **`bench_check.py` の終了コード**です（`tee` の終了コードではありません）。
+  パイプの直後に変数へ退避してから `echo` など別コマンドを実行してください。
+- `2>&1` は stderr も同じログに残すためです（接続エラーなどの原因を後から確認できます）。
+- 既定運用（setpoint 送信なし）では、`bench_check.py` の終了コードは通常 **3**
+  （`setpoint 送信レート` が SKIP）になります。扱いは §5.2 を参照してください。
+- `bench_check.py` 自身もログ末尾に `終了コード N: ...` の 1 行を出します。
+  `PIPESTATUS` の記録（`# PIPESTATUS=N`）と一致することを確認してください。食い違った場合は
+  ログを保存して §8.1 の備考に記録します（判定は `bench_log_check.py` が行います）。
+- 任意で `--csv "$LOG_DIR/run1_boot.csv"` を足すとサマリ CSV も保存できます（必須ではありません）。
+  CSV を単独で判定する場合は、CSV に終了コードが含まれないため
+  `python3 bench_log_check.py --exit-code 3 "$LOG_DIR/run1_boot.csv"` のように指定します。
+
+### 4.2 判定（合否の正）
+
+```bash
+cd /path/to/Mavlink_raspi/AR-hook
+python3 bench_log_check.py --verbose "$LOG_DIR"/run*.txt
+echo "bench_log_check.py の終了コード: $?"
+```
+
+- 期待する出力（例）:
+
+```text
+[PASS] /home/.../run1_boot.txt: exit=3 bad_data=0/10(30s) att=39.95Hz gpi=5.00Hz hb=1.00Hz errors=0/0/0/0 hb_lines=1/0 armed_true=0 fake_armed=0/1
+...
+SUMMARY: PASS 4 / FAIL 0 / ERROR 0
+結果: 合格（4 ログ）
+```
+
+- `bench_log_check.py` の終了コード: **0 = 合格 / 1 = 不合格 / 2 = 入力不備**。
+- `bad_data` の `(30s)` は実測ウィンドウです。30 秒でない場合は許容件数が比例配分されます。
+  `errors=` は「受信例外 / 送信失敗 / 受信タイムアウト / フレーム競合」の順です。
+- `--verbose` を付けると判定項目の内訳と、偽 armed 候補・確定 armed 遷移の行が出ます
+  （偽 armed の疑いを切り分けるときに使います）。
+- 判定に使うのは**テキストログ**です（CSV には HB遷移 / HB生値のログが含まれません）。
+
+## 5. 合格基準（判定は `bench_log_check.py` の結果を正とする）
+
+### 5.1 基準値
+
+| # | 項目 | 合格基準 | 判定の出どころ |
+|---|---|---|---|
+| 1 | BAD_DATA | **10 件 / 30 秒以下**（実測ウィンドウが 30 秒でない場合は比例配分し、端数は切り捨て） | `[異常]` 行の `フレーム競合 N (BAD_DATA X + 書き込み重なり Y)` の `X` |
+| 2 | ATTITUDE 受信 | **30 Hz 以上**（要求 40 Hz。30 Hz 以上 40 Hz 未満は PASS だが理由を記録） | `[受信]` 行の実測 Hz |
+| 3 | GLOBAL_POSITION_INT 受信 | **4〜6 Hz** | 同上 |
+| 4 | HEARTBEAT 受信 | **1 Hz 以上** | 同上 |
+| 5 | 受信例外 / 送信失敗 / 受信タイムアウト / フレーム競合 | **すべて 0 件** | `[異常]` 行 |
+| 6 | 終了コード | **0**（§5.2 の読み替えを含む） | ログ末尾の `終了コード N: ...`、または `--exit-code` 指定値 |
+| 7 | HB遷移（確定 armed） | `armed False->True` / `True->True` に至った行が **0 件** | `HB遷移:` 行 |
+| 8 | 偽 armed 候補 | `armed_raw=True` かつ確定 armed に至らない行が **1 件以下**（2 件以上で不合格 = 繰り返し） | `HB遷移:` / `HB生値:` 行 |
+
+- 計測分解能の許容は `bench_check.py` と同じです
+  （HEARTBEAT ±0.1 Hz、ATTITUDE / GPI ±0.05 Hz）。`bench_log_check.py` がこの許容を含めて判定します。
+- 3 回以上の計測すべてが合格であること（`SUMMARY: PASS N / FAIL 0 / ERROR 0`）。
+
+### 5.2 終了コードの読み替え（重要）
+
+既定運用（`--send-setpoints` を付けない = 本手順）では、`bench_check.py` は
+`setpoint 送信レート` が SKIP になるため **終了コード 3** を返します（0 ではありません）。
+
+- `bench_log_check.py` は「終了コード 3 で、SKIP が `setpoint 送信レート` だけ」の場合を
+  **合格**として扱います（`exit=3` と表示されます）。§5.1 の「終了コード 0」は
+  **「`bench_log_check.py` の終了コード判定が PASS であること」**と読み替えてください。
+- 終了コード 0 だけを合格にしたい場合は `bench_log_check.py --strict-exit` を使い、
+  その場合は `bench_check.py` に `--send-setpoints` を付けた実行（armed / GUIDED でないときだけ
+  送信される経路）を併用します。**本手順の既定は `--strict-exit` なし**です。
+- 終了コード **2（安全停止・接続エラー）は無条件で不合格**です。1 回でも出たら §6 の切り分けへ進みます。
+- 参考: `--simulate`（ハードウェア不要の自己テスト）では setpoint 送信が既定で有効になるため、
+  同じ引数でも終了コード 0 になります。実機（`--simulate` なし）とは既定が異なる点に注意してください。
+
+### 5.3 判定の手順
+
+1. `bench_log_check.py` の 1 行サマリで `[PASS]` / `[FAIL]` を確認する（§4.2）。
+2. `bench_log_check.py` の終了コードが 0 なら合格（複数ログなら `SUMMARY: PASS N / FAIL 0 / ERROR 0`。
+   1 ログのときは `SUMMARY` 行は出ません）。
+3. `bench_check.py` の `[判定]` 表示と食い違った場合は、**`bench_log_check.py` を正**とし、
+   食い違いの内容を §8.1 の備考に記録する（例: 終了コード 3 の SKIP 解釈）。
+4. `--no-rtscts` の 1 回は**合否に含めない**（切り分け用の参考記録）。合否は RTS-CTS 有効の
+   3 回以上で判定します。参考値も §8.1 に記録します。
+
+## 6. 不合格条件と切り分け
+
+| 事象 | 判定 | 対応 |
+|---|---|---|
+| **BAD_DATA が連続して発生する**（毎回出る / 時間とともに増える） | 不合格 | 配線（GND 共通・終端・ケーブル長）・EMI・多重起動の有無を確認（[BENCH_RESULT.md](./BENCH_RESULT.md) §7.2 / §7.4） |
+| 起動直後の 1 回目だけ BAD_DATA が出た | 5.1 の件数以内なら合格（記録する） | 2 回目以降で 0 件に落ち着くかを確認。連続するなら上と同じ切り分け |
+| **`HB遷移:` で `armed False->True`** | **不合格。直ちに中止** | 実際にアームされた可能性がある。GCS でアーム状態を確認し、アームを解除する。ログを保存して報告（偽 armed か実 armed かを切り分ける） |
+| **`HB生値:` で `armed_raw=True` が繰り返し（2 件以上）** | **不合格（偽 armed の疑い）** | `sys` / `comp` / `base_mode(hex)` / 同時刻の BAD_DATA を確認（[FAILSAFE_CHECKLIST.md](./FAILSAFE_CHECKLIST.md) §1.3.1） |
+| `armed_raw=True` が 1 件だけ | 合格（許容） | §8.1 の備考に記録し、再現するか 3 回目まで確認する |
+| `bench_check.py` の終了コード 2（`⚠ 安全停止`） | 不合格 | 中止理由の行（`⚠ 安全停止: ...`）と、その直前の `HB遷移:` / `HB生値:` 行を保存する |
+| ATTITUDE / GPI / HEARTBEAT のレート不足 | 不合格 | [BENCH_RESULT.md](./BENCH_RESULT.md) §5.1〜§5.3 の切り分け（SRx_ 設定、帯域、RTS/CTS、SET_MESSAGE_INTERVAL の可否） |
+| 受信例外・送信失敗・受信タイムアウトが 0 でない | 不合格 | [BENCH_RESULT.md](./BENCH_RESULT.md) §5.5 |
+
+**この手順で「合格」と書けるのは、§5 を満たし §8 を人間が記入したときだけ**です。
+実測していない項目は `NOT RUN` のまま残してください。
+
+## 7. 結果の記入先
+
+1. **本書 §8**（詳細。1 実行 1 行）
+   - §8.1 実行結果、§8.2 環境、§8.3 `bench_log_check.py` の出力、§8.4 付録1 の記入欄
+2. **[BENCH_RESULT.md](./BENCH_RESULT.md) §7.6「実機再計測の記録欄」**（要約。1 実行 1 行）
+3. ログ実体は `~/arhook_verify_logs/`（`run*.txt` / `exit_codes.txt`）。**リポジトリにはコミットしない**
+
+記入ルール:
+
+- 実測していない欄は `NOT RUN` のまま残す（空欄にしない・推測で埋めない）。
+- 数値は `bench_log_check.py` の 1 行サマリの値を転記する（手計算の値は使わない）。
+- 日時は JST、実行環境（Pi の機種・OS・Python・pymavlink・Pixhawk FW）を §8.2 に記録する。
+- 不合格だった場合は、原因候補と次の処置を §8.1 の備考に残す。
+
+## 8. 結果記入欄（人間が記入 / 初期値 NOT RUN）
+
+### 8.1 実行結果
+
+`NOT RUN` = 未実施。実測したら数値に置き換えてください。
+
+| # | 実行 | 日時 (JST) | bench_check exit | BAD_DATA | ATTITUDE Hz | GPI Hz | HEARTBEAT Hz | 例外/送信失敗/タイムアウト/競合 | 確定 armed 遷移 | 偽 armed 候補 | bench_log_check 判定 | 備考 |
+|---|---|---|---:|---:|---:|---:|---:|---|---:|---:|---|---|
+| 1 | `run1_boot`（起動直後） | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | |
+| 2 | `run2_settled` | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | |
+| 3 | `run3_settled` | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | |
+| 4 | `run4_no_rtscts`（任意・参考） | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | 合否には含めない |
+
+- 追加で計測した場合は行を足してください（3 回以上あれば合格判定できます）。
+- 「例外/送信失敗/タイムアウト/競合」は `bench_log_check.py` の `errors=a/b/c/d` をそのまま転記します。
+
+### 8.2 環境
+
+| 項目 | 記入 |
+|---|---|
+| 実施日 / 実施者 | NOT RUN |
+| Raspberry Pi の機種 | NOT RUN |
+| OS / カーネル | NOT RUN |
+| Python / pymavlink | NOT RUN |
+| Pixhawk のファームウェア | NOT RUN |
+| `SERIALx_BAUD` / `SERIALx_PROTOCOL` | NOT RUN |
+| `BRD_SERx_RTSCTS` | NOT RUN |
+| `SRx_EXTRA1` / `SRx_POSITION` | NOT RUN |
+| 配線（ケーブル長・GND・終端） | NOT RUN |
+| 多重起動の確認結果（§3.1） | NOT RUN |
+| その他（気象・電源・特記事項） | NOT RUN |
+
+### 8.3 `bench_log_check.py` の出力（1 行サマリを貼る）
+
+```text
+NOT RUN
+```
+
+### 8.4 付録1（座標系・高度・yaw）の記入欄
+
+| 確認項目 | 結果 |
+|---|---|
+| `✓ 起動時のGPS位置（ログ用）` の lat / lon | NOT RUN |
+| `✓ 離陸地点のREF座標: X=/Y=/Down=` | NOT RUN |
+| `REF_ALT` と `Down` の整合（`home_down = REF_ALT - (alt - relative_alt)`） | NOT RUN |
+| `ℹ 目標ヨー: ...deg（設定ソース: ...）`（既定 0.0） | NOT RUN |
+| `AR_HOOK_TARGET_YAW_DEG=180.0` で起動したときの表示 | NOT RUN |
+| 範囲外の値を指定したときの起動停止 | NOT RUN |
+| `TAKEOFF 高度 0.50 m（home 相対）` の確認 | NOT RUN（アームが必要。付録1.2 参照） |
+
+## 9. 未実施（NOT RUN）の一覧
+
+以下はこの作業環境（実機なし）では実施できていません。**実機で確認するまで「合格」と
+書かないでください。**
+
+- 実機での計測 3 回以上（`run1_boot` / `run2_settled` / `run3_settled`）
+- 実機での `--no-rtscts` 1 回（`run4_no_rtscts`）
+- 実機ログに対する `bench_log_check.py` の判定
+- 付録1 の実機確認（離陸地点 REF 座標ログ、REF_ALT との整合、yaw 表示）
+- 付録1.2 の TAKEOFF 高度（home 相対）の**送信値**の実機確認（アーム + GUIDED が必要）
+- 付録2 の GUIDED 自動移動（`AR_HOOK_AUTO_START` は**未実装**）
+- 長時間（30 分以上）の連続計測・EMI 評価
+
+## 付録1. アームせずに確認できる座標系・高度・yaw
+
+**この付録はアームも GUIDED への変更も行いません。** `AR-hook1.py` を起動しますが、
+GUIDED でないため setpoint は送信されません（`⚠ Guidedモードではないため目標を送信しません`）。
+`AR-hook1.py` は `/dev/ttyAMA0` を占有するので、**§3 の計測とは別の時間帯**に実施します。
+
+### 付録1.1 起動時の離陸地点 REF 座標ログ
+
+目的: 離陸地点（EKF home）を REF フレームで表した点（`gps_origin`）が確定し、
+`local_frame.REF_LAT/REF_LON/REF_ALT` を原点とする座標系と矛盾しないことを確認します。
+
+```bash
+cd /path/to/Mavlink_raspi/AR-hook
+python3 AR-hook1.py --device /dev/ttyAMA0     # 引数なしなら対話プロンプト（既定 1=Serial）
+```
+
+起動後にコンソールへ出る行（実装の出力そのまま）:
+
+| ログ行 | 出るタイミング | 確認すること |
+|---|---|---|
+| `ℹ 目標ヨー: X.Xdeg (設定ソース: ... / 取付ヨーオフセット: X.Xdeg) \| MASK: 0x.... (設定ソース: ...)` | 起動直後 1 行 | 既定は `0.0deg` / 設定ソース `デフォルト` / MASK `0x09F8` |
+| `✓ 起動時のGPS位置（ログ用）: lat=..., lon=...` | 最初の `GLOBAL_POSITION_INT` | 緯度経度が妥当（REF 付近） |
+| `✓ 離陸地点のREF座標: X=..., Y=..., Down=...` | 同じタイミングで 1 回だけ | X/Y が REF 基準の北・東 [m]、Down が REF 基準の Down [m] |
+
+確認の考え方:
+
+- `X` / `Y` は REF 原点からの北・東 [m]、`Down` は REF 原点からの Down [m] です
+  （`local_frame.gps_to_local_xyz()` と同じ定義）。
+- `Down` は `home_down = REF_ALT - (alt_amsl - relative_alt)` で求まります
+  （`local_frame.home_down_from_position()`）。GCS に出ている `GLOBAL_POSITION_INT.alt`（AMSL）と
+  `relative_alt` を使って手計算と照合できます。REF と離陸地点が同じ高さなら `Down ≈ 0` です。
+- この行は 1 回だけ出ます（毎フレームは出ません）。出ない場合は `GLOBAL_POSITION_INT` が
+  届いていないので、まず §3 の計測に戻って GPI のレートを確認してください。
+
+注意:
+
+- カメラ・Motive・映像出力の対話が入ります（[実験手順書.md](./実験手順書.md) §3.2）。
+  ヘッドレスなら映像出力は `3` を選びます。**GUIDED にしない・アームしない**を守ってください。
+- 終了は `q` キーまたは Ctrl+C です（終了してもアーム解除・着陸は送られません）。
+
+### 付録1.2 TAKEOFF 高度が home 相対であること
+
+`TAKEOFF_ALT = 0.50 m` は「離陸地点（EKF home）からの高さ」で、
+`MAV_CMD_NAV_TAKEOFF` / `SET_POSITION_TARGET_GLOBAL_INT` には
+`local_down_to_home_relative_alt()` で変換した **home 相対高度**を送ります。
+
+アームしないため、**実機で `MAV_CMD_NAV_TAKEOFF` の送信値を観測することは本手順ではできません**
+（= NOT RUN。アーム + GUIDED が必要で、§1 の安全条件の対象外です）。アームせずに確認できるのは
+次の 3 点です。
+
+| # | アームせずに確認できること | 方法 | 結果 |
+|---|---|---|---|
+| 1 | 離陸地点の `Down` が確定している | 付録1.1 の `✓ 離陸地点のREF座標` 行 | 未記入（§8.4） |
+| 2 | `Down` と `REF_ALT` / GPI の整合 | `home_down = REF_ALT - (alt_amsl - relative_alt)` を手計算で照合 | 未記入（§8.4） |
+| 3 | 変換が home 相対に戻ること（オフライン） | `cd AR-hook && python3 -m pytest -q test_local_frame.py` | 未記入（§8.4） |
+
+期待値の計算例（SITL と同じ条件の考え方）:
+
+- `REF_ALT = 0`、離陸地点が REF より 3.0 m 上（`Down = -3.0 m`）のとき
+- `alt_above_home_to_local_down(0.50, -3.0) = -3.5 m` → 送信 alt は `0.50 m`
+- 到達判定は `relative_alt >= TAKEOFF_ALT * 0.9 = 0.45 m`（home 相対）
+- `✓ 離陸高度到達: home相対 0.50m (target Down=-3.50m)` は**離陸後にしか出ません**
+
+参考: SITL（実 ArduPilot Copter）では同じ変換で 6/6 PASS、送信 alt 1.100000 m /
+到達 1.051 m を確認済みです（[SITL_RESULT.md](./SITL_RESULT.md)）。**実機の送信値は NOT RUN**。
+
+### 付録1.3 `AR_HOOK_TARGET_YAW_DEG` 変更時の目標方位
+
+```bash
+# 既定（北向き 0.0）
+python3 AR-hook1.py --device /dev/ttyAMA0
+
+# 南向き 180°（環境変数で上書き）
+AR_HOOK_TARGET_YAW_DEG=180.0 python3 AR-hook1.py --device /dev/ttyAMA0
+```
+
+起動ログ 1 行目の例:
+
+```text
+ℹ 目標ヨー: 180.0deg (設定ソース: 環境変数 AR_HOOK_TARGET_YAW_DEG / 取付ヨーオフセット: 0.0deg) | MASK: 0x09F8 (設定ソース: デフォルト)
+```
+
+確認すること:
+
+- 角度は MAVLink NED（`0`=北、`90`=東、`180`=南、`270`=西）で解釈されます。
+- 指定範囲は `0.0`〜`360.0` [deg]。範囲外・数値でない値は**起動時に停止**します
+  （`❌ 環境変数 AR_HOOK_TARGET_YAW_DEG の値が範囲外です: ...` /
+  `❌ 環境変数 AR_HOOK_TARGET_YAW_DEG の値が数値ではありません: '...'`）。
+- 表示されるのは**実送信値** `TARGET_YAW_SEND_DEG = 設定値 + CAMERA_MOUNT_YAW_OFFSET_DEG`
+  （取付ヨーオフセットの既定は `0.0`）です。
+- yaw を指令に載せるかは MASK の yaw ビットで決まります（既定 `0x09F8` = yaw 有効）。
+  無効化する場合は `AR_HOOK_MASK=0x0DF8`。
+- GUIDED でないため setpoint は送信されず、機体は回りません。したがって
+  **「実際にその方位を向くか」は本手順では確認できません（NOT RUN）**。
+  ログで確認できるのは「送る予定の値」までです。
+
+### 付録1.4 付録1 の記入欄
+
+§8.4 の表に記入してください（初期値は `NOT RUN`）。
+
+## 付録2. GUIDED 自動移動（`AR_HOOK_AUTO_START`）— NOT RUN（未実装）
+
+### 付録2.1 状態
+
+- **NOT RUN（未実装）**。`AR_HOOK_AUTO_START` は後続タスク **3bb4b** で実装予定です。
+- 現時点のリポジトリには `AR_HOOK_AUTO_START` の実装も、それを読むコードもありません
+  （`grep -rn AR_HOOK_AUTO_START` で 0 件）。
+- したがって本節は**手順の下書き**です。実装が入るまで実行せず、**本書の合格判定にも含めません**。
+- 実装後は、実装された引数名・既定値・安全条件に合わせて本節を更新し、
+  `NOT RUN` を実測結果で置き換えてください。
+
+### 付録2.2 実装後の確認項目（案）
+
+| # | 確認項目 | 状態 |
+|---|---|---|
+| 1 | `AR_HOOK_AUTO_START` の既定値（未設定時に自動移動しないこと） | NOT RUN（未実装） |
+| 2 | 自動移動の前提条件（armed / GUIDED / 離陸高度到達 / 目標確定） | NOT RUN（未実装） |
+| 3 | 目標方位（`AR_HOOK_TARGET_YAW_DEG`）と移動方向が一致する | NOT RUN（未実装） |
+| 4 | 目標高度が home 相対（`TARGET_HEIGHT_ABOVE_TAKEOFF`）で送られる | NOT RUN（未実装） |
+| 5 | 目標座標（REF 基準 N/E）へ移動し、クランプ・レート制限が効く | NOT RUN（未実装） |
+| 6 | 中止手段（キー操作 / モード変更 / 送信機）で即座に停止できる | NOT RUN（未実装） |
+| 7 | 異常時（ATTITUDE 鮮度切れ・マーカーロスト・通信断）の挙動 | NOT RUN（未実装） |
+
+### 付録2.3 実装後の実施前提（案）
+
+- §1 の安全条件を**緩めない**こと。最初はプロペラ無し・機体固定のまま、GUIDED 遷移と
+  コマンド列（`MAV_CMD_NAV_TAKEOFF` → `SET_POSITION_TARGET_GLOBAL_INT`）の確認だけを行う。
+- 実際に動かす段階では、テザー・退避距離・緊急停止（送信機のモード切替）を
+  [実験手順書.md](./実験手順書.md) §2 のチェックリストに従って準備する。
+- アームは人間が行い、プログラムにはアームさせない（現行実装もアームは送りません）。
+
+**本節の内容は実機で確認していません（NOT RUN）。**

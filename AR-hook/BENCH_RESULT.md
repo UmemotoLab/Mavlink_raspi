@@ -360,7 +360,41 @@ HEARTBEAT は **61 件すべて `sys=1` / `comp=1` / `base_mode=0x51` / `custom_
 - 「comp 0」報告の再確認（60 秒以上の直接計測）
 - 長時間（30 分以上）の EMI・ケーブル揺動を含む連続計測
 
-### 7.6 自己テスト（ハードウェア不要 / 実行済み）
+再計測の記録欄は §7.6 です（**未記入 / NOT RUN**）。手順は
+[REAL_MACHINE_VERIFY.md](./REAL_MACHINE_VERIFY.md) を参照してください。
+
+### 7.6 実機再計測の記録欄（NOT RUN / 人間が記入）
+
+**この欄は未記入（NOT RUN）です。** 本作業環境には実機（Raspberry Pi / Pixhawk）が無いため、
+7.5 の再計測は行っていません。実機での実施と記入は人間が行います。
+
+- 手順・安全条件・コマンド例: [REAL_MACHINE_VERIFY.md](./REAL_MACHINE_VERIFY.md)
+  （§1 安全条件 / §3 手順 / §4 `tee` + `PIPESTATUS` の実行例 / §5 合格基準）
+- 合否の正: `bench_log_check.py` の 1 行サマリ（`[PASS]` / `[FAIL]` と `SUMMARY`）。
+  `bench_check.py` の `[判定]` 表示と食い違った場合は `bench_log_check.py` を正とします。
+- 実測ログは `~/arhook_verify_logs/run*.txt` に置き、**リポジトリにはコミットしません**。
+  この表には要約だけを記入します。
+
+| # | 実行 | 日時 (JST) | BAD_DATA | ATTITUDE Hz | GPI Hz | HB Hz | 例外/失敗/TO/競合 | 確定 armed | 偽 armed | exit | 判定 |
+|---|---|---|---:|---:|---:|---:|---|---:|---:|---:|---|
+| 1 | `run1_boot`（電源投入直後） | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN |
+| 2 | `run2_settled`（落ち着いた状態 1） | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN |
+| 3 | `run3_settled`（落ち着いた状態 2） | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN |
+| 4 | `run4_no_rtscts`（任意・参考） | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN |
+
+記入ルール:
+
+- 実測していない欄は `NOT RUN` のまま残す（空欄にしない・推測で埋めない）。
+- 「例外/失敗/TO/競合」は `bench_log_check.py` の `errors=受信例外/送信失敗/受信タイムアウト/フレーム競合`
+  をそのまま転記する。`確定 armed` は `armed_true=`、`偽 armed` は `fake_armed=N/1` を転記する。
+- 既定運用（setpoint 送信なし）では `bench_check.py` は終了コード 3 を返す。SKIP が
+  `setpoint 送信レート` だけなら `bench_log_check.py` は合格と判定する（REAL_MACHINE_VERIFY.md §5.2）。
+- `--no-rtscts` は切り分け用の参考で、合否は RTS-CTS 有効の 3 回以上で判定する。
+- 合格は 7.4 の基準（BAD_DATA ≤ 10 件 / 30 秒、ATTITUDE ≥ 30 Hz、GPI 4〜6 Hz、HB ≥ 1 Hz、
+  例外・競合 0、確定 armed 遷移 0、偽 armed 候補 1 件以下）を **3 回以上すべて**満たしたときだけ。
+  7.5 の項目は、この欄が埋まるまで **NOT RUN のまま**とする。
+
+### 7.7 自己テスト（ハードウェア不要 / 実行済み）
 
 - `python3 AR-hook/bench_check.py --simulate --duration 2` → **PASS 5 / FAIL 0**（exit 0）
 - `python3 AR-hook/bench_check.py --simulate --sim-armed-spike --duration 3 --warmup 0`
@@ -377,3 +411,7 @@ HEARTBEAT は **61 件すべて `sys=1` / `comp=1` / `base_mode=0x51` / `custom_
   （takeoff / f6152 / 7f03b / 9c2a5 / 12794 / disarm）。armed / guided の確定を 2 連続に
   しても、自動離陸は GUIDED+armed 検出から **3.002 秒後に 1 回だけ**（NAV_TAKEOFF 0.5 m）。
   ログ: `~/arhook_sitl_logs/run_sitl_verify_20261125_094844/`。**実機での確認は NOT RUN**。
+- `test_bench_log_check.py`（`bench_log_check.py` の自己テスト）→ **28/28 PASS**。
+  `cd AR-hook && python3 -m pytest -q -p no:cacheprovider --ignore=archive` → **156 passed**
+  （既存 128 + 新規 28）。シリアル・ネットワーク・pymavlink を使わない文字列判定のみ。
+  実機ログに対する判定結果は §7.6（NOT RUN）。
