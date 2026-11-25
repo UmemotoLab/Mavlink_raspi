@@ -153,10 +153,26 @@ def control_loop(comm: MavlinkComm) -> None      # キーボード操作スレ�
 def camera_tracker_loop(comm: MavlinkComm, show_window=False, stream_enabled=False) -> None
 def record_data() -> None                        # CSV 記録（40Hz）
 def save_csv() -> None                           # 終了時の保存
+def auto_start_log_snapshot() -> tuple           # (phase, elapsed_s, dist_m) を io_lock 内でコピー
+def auto_start_on_guided_armed(now_s=None) -> None      # IDLE/ABORTED/TRACK → TAKEOFF_WAIT
+def auto_start_on_takeoff_reached(now_s=None) -> None   # TAKEOFF_WAIT → AUTO_TO_START
+def auto_start_on_guided_lost(reason="GUIDED 解除") -> bool  # 移動中なら ABORTED
+def auto_start_abort(reason: str) -> bool                # 中断（現在目標を保持、警告 1 回）
+def auto_start_update(comm: MavlinkComm, now_s=None) -> bool
+                                                 # 1 フレーム分の自動移動。
+                                                 # True=カメラ更新を抑止 / False=TRACK か無効
 ```
 
 `send_setpoint` は `TARGET_YAW_DEG` と `MASK` を通信部へ渡すだけのラッパーです
 （設定値は統合プログラム側に残す）。
+
+`auto_start_*` は離陸後の自動移動（`AR_HOOK_AUTO_START=1`）の状態機械です。
+実験開始位置は `EXPERIMENT_START_LAT/LON/HEIGHT_ABOVE_TAKEOFF` の 1 箇所で定義し、
+キーボード `t` も同じ値を使います。移動は `auto_start_update()` が毎フレーム
+`commit_target_command(source="auto_start")` を呼び、`send_local_target()` で送ります
+（独自の送信経路は作りません）。`TRACK` に入るまで `camera_tracker_loop()` は
+`target` を書き換えません。無効時は `DISABLED` のままで `auto_start_update()` が
+常に `False` を返すため、従来の経路は変わりません。
 
 ### 2.2 MAVLink 通信部（`mavlink_comm.py`・実装済み）
 

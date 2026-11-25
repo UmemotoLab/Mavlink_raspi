@@ -9,9 +9,9 @@
     python3 -m pytest -q test_verify_sitl_extra.py
 
 確認内容:
-1. CSV の列数（170）と注目列（Attitude_* / Target_Limit_*）の充足判定
+1. CSV の列数（173）と注目列（Attitude_* / Target_Limit_* / Auto_Start_*）の充足判定
 2. takeoff シナリオ: GUIDED+ARM 検出 → NAV_TAKEOFF(0.5m) → 0.5m 到達
-3. disarm シナリオ: disarm 検出 → 停止 → CSV 保存（列数 170）
+3. disarm シナリオ: disarm 検出 → 停止 → CSV 保存（列数 173）
 
 実 ArduPilot SITL での値は run_sitl_verify.sh で取得します（このテストは
 スタブ相手なので、機体の空力・EKF は対象外です）。
@@ -49,9 +49,9 @@ def _write_csv(path, header, rows):
     return path
 
 
-def test_expected_csv_columns_is_170():
-    """save_csv() のヘッダ列数（170）を契約として固定する。"""
-    assert CSV_EXPECTED_COLUMNS == 170
+def test_expected_csv_columns_is_173():
+    """save_csv() のヘッダ列数（173）を契約として固定する。"""
+    assert CSV_EXPECTED_COLUMNS == 173
 
 
 def test_summarize_csv_counts_rows_and_clamp_flags(tmp_path):
@@ -148,7 +148,7 @@ def test_takeoff_scenario_sends_nav_takeoff_and_climbs(tmp_path):
 
 
 def test_disarm_scenario_stops_and_saves_csv(tmp_path):
-    """スタブ相手に disarm 検出 → 停止 → 170 列の CSV 保存を確認。"""
+    """スタブ相手に disarm 検出 → 停止 → 173 列の CSV 保存を確認。"""
     csv_dir = tmp_path / "csv_out"
     csv_dir.mkdir()
     result = _run_verify(
@@ -162,7 +162,7 @@ def test_disarm_scenario_stops_and_saves_csv(tmp_path):
     assert scenario["pass"] is True
     checks = scenario["checks"]
     assert checks["program_stopped_on_disarm"] is True
-    assert checks["csv_column_count_is_170"] is True
+    assert checks["csv_column_count_matches_schema"] is True
     assert checks["attitude_age_is_numeric"] is True
     assert checks["clamp_columns_present"] is True
 

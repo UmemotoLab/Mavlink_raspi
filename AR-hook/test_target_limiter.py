@@ -350,6 +350,10 @@ def test_csv_header_and_row_lengths_match():
         "motive_pose_calibration_log": [0] * 27,
         "ar_pose_log_values": [0] * 20,
         "ar_pose_pre_offset_log_values": [0] * 14,
+        # 離陸後の自動移動（末尾 3 列）
+        "auto_phase": "DISABLED",
+        "auto_elapsed": 0.0,
+        "auto_dist": float("nan"),
     })
     row = eval("[" + row_source + "]", {"__builtins__": {}}, row_locals)
 
@@ -357,23 +361,17 @@ def test_csv_header_and_row_lengths_match():
         f"CSVヘッダー {len(header)} 列 / データ行 {len(row)} 列で不一致"
     )
     # 追加した列がヘッダーの末尾に並んでいること
-    assert header[-len(
-        (
-            "Target_Desired_X_m", "Target_Desired_Y_m", "Target_Desired_Z_m",
-            "Target_Limit_Rate_Active", "Target_Limit_XY_Clamp_Active",
-            "Target_Limit_Z_Clamp_Up", "Target_Limit_Z_Clamp_Down",
-            "Target_Limit_Invalid", "Target_Hold_Active",
-            "Target_Hold_Elapsed_s", "Target_Lost_Decay_Active",
-            "Target_Update_Source",
-        )
-    ):] == list((
+    tail_columns = (
         "Target_Desired_X_m", "Target_Desired_Y_m", "Target_Desired_Z_m",
         "Target_Limit_Rate_Active", "Target_Limit_XY_Clamp_Active",
         "Target_Limit_Z_Clamp_Up", "Target_Limit_Z_Clamp_Down",
         "Target_Limit_Invalid", "Target_Hold_Active",
         "Target_Hold_Elapsed_s", "Target_Lost_Decay_Active",
         "Target_Update_Source",
-    ))
+        # 離陸後の自動移動（さらに末尾）
+        "Auto_Start_Phase", "Auto_Start_Elapsed_s", "Auto_Start_Dist_m",
+    )
+    assert header[-len(tail_columns):] == list(tail_columns)
 
 
 def test_simulation_bounds_without_hardware():

@@ -3,7 +3,7 @@
 """CSV 後方互換の検証（ハードウェア不要）。
 
 目的:
-  * 統合後の CSV スキーマ（170 列）が、AR-hook1.py・CSV_SCHEMA.md・
+  * 統合後の CSV スキーマ（173 列）が、AR-hook1.py・CSV_SCHEMA.md・
     make_dummy_csv.py の 3 者で一致していることを検証する。
   * ダミー CSV に対して既存の解析・校正スクリプトを実行し、
     例外なく完走することを確認する。
@@ -62,12 +62,16 @@ ADDED_COLUMNS = (
     "Target_Hold_Elapsed_s",
     "Target_Lost_Decay_Active",
     "Target_Update_Source",
+    "Auto_Start_Phase",
+    "Auto_Start_Elapsed_s",
+    "Auto_Start_Dist_m",
 )
 # 数値ではなく列挙文字列が入る列（欠損は nan ではなく列挙値で表す）
 TEXT_COLUMNS = frozenset({
     "Coord_Source",
     "Camera_Orientation_Source",
     "Target_Update_Source",
+    "Auto_Start_Phase",
 })
 # 0/1 フラグとして検証する列
 FLAG_COLUMNS = tuple(
@@ -75,6 +79,7 @@ FLAG_COLUMNS = tuple(
     if column not in (
         "Attitude_Age_ms", "Target_Desired_X_m", "Target_Desired_Y_m",
         "Target_Desired_Z_m", "Target_Hold_Elapsed_s", "Target_Update_Source",
+        "Auto_Start_Phase", "Auto_Start_Elapsed_s", "Auto_Start_Dist_m",
     )
 )
 
@@ -245,7 +250,7 @@ def test_header_matches_ar_hook1():
         "make_dummy_csv.CSV_HEADER が AR-hook1.py と一致しません。"
         " 列を追加したら build_header() も更新してください。"
     )
-    assert len(expected) == 170, f"列数が 170 ではありません: {len(expected)}"
+    assert len(expected) == 173, f"列数が 173 ではありません: {len(expected)}"
 
 
 def test_column_names_follow_compatibility_rules():

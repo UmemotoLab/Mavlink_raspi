@@ -170,6 +170,13 @@ cmd --timeout 40 land >/dev/null || log "⚠ 着陸できませんでした"
 arm_guided
 run_scenario "disarm（終了・CSV 保存）" 5_disarm --only disarm
 
+# ── 6) 離陸後の自動移動（AR_HOOK_AUTO_START=1）──
+# disarm シナリオでディスアーム済みなので、着陸を確認してから再度 GUIDED+ARM する。
+cmd --timeout 40 land >/dev/null || log "⚠ 着陸できませんでした"
+sleep 3
+arm_guided
+run_scenario "auto_start（離陸→開始位置→TRACK）" 6_auto_start --only auto_start
+
 log ""
 log "================================================================"
 log "結果一覧"

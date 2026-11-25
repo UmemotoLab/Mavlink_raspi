@@ -165,6 +165,42 @@ def _env_mask_param(env_name, default):
     return value, f"環境変数 {env_name}"
 
 
+def _env_flag_param(env_name, default):
+    """0/1 のスイッチを環境変数から読む（true/false・on/off も可）。"""
+    raw = os.environ.get(env_name)
+    if raw is None or not raw.strip():
+        return bool(default), "デフォルト"
+    value = raw.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True, f"環境変数 {env_name}"
+    if value in ("0", "false", "no", "off"):
+        return False, f"環境変数 {env_name}"
+    sys.exit(
+        f"❌ 環境変数 {env_name} の値が 0/1 ではありません: '{raw}'"
+        "（0 または 1 で指定してください）"
+    )
+
+
+def _env_int_param(env_name, default, label, minimum, maximum):
+    """環境変数の整数値を読み、範囲を検証する（未設定ならデフォルト）。"""
+    raw = os.environ.get(env_name)
+    if raw is None or not raw.strip():
+        return int(default), "デフォルト"
+    try:
+        value = int(raw.strip(), 10)
+    except ValueError:
+        sys.exit(
+            f"❌ 環境変数 {env_name} の値が整数ではありません: '{raw}'"
+            f"（{label}は {minimum} 〜 {maximum} で指定してください）"
+        )
+    if not (minimum <= value <= maximum):
+        sys.exit(
+            f"❌ 環境変数 {env_name} の値が範囲外です: {raw}"
+            f"（{label}は {minimum} 〜 {maximum} で指定してください）"
+        )
+    return value, f"環境変数 {env_name}"
+
+
 TARGET_YAW_DEG, TARGET_YAW_SOURCE = _env_float_param(
     TARGET_YAW_ENV_VAR, TARGET_YAW_DEG, "目標ヨー角 [deg]", 0.0, 360.0
 )
@@ -280,6 +316,84 @@ else:
 #    target['z']（REF基準のDown）へ設定するときは
 #    alt_above_home_to_local_down() で変換します。
 TARGET_HEIGHT_ABOVE_TAKEOFF = 1.10
+# ───── 実験開始位置（単一定義） ─────
+# 離陸後に自動で移動する開始位置、およびキーボード t（基準点復帰）が使う座標です。
+# 既定値は従来の t キーと同じ座標・同じ高さ（離陸地点から TARGET_HEIGHT_ABOVE_TAKEOFF）
+# なので、環境変数を設定しない限り既定挙動は変わりません。
+#   AR_HOOK_START_LAT / AR_HOOK_START_LON   : 緯度・経度 [deg]
+#   AR_HOOK_START_HEIGHT_M                  : 離陸地点からの高さ [m]
+EXPERIMENT_START_LAT = 36.0757693
+EXPERIMENT_START_LON = 136.2132945
+EXPERIMENT_START_HEIGHT_ABOVE_TAKEOFF = TARGET_HEIGHT_ABOVE_TAKEOFF
+EXPERIMENT_START_LAT_ENV_VAR = "AR_HOOK_START_LAT"
+EXPERIMENT_START_LON_ENV_VAR = "AR_HOOK_START_LON"
+EXPERIMENT_START_HEIGHT_ENV_VAR = "AR_HOOK_START_HEIGHT_M"
+EXPERIMENT_START_LAT, EXPERIMENT_START_LAT_SOURCE = _env_float_param(
+    EXPERIMENT_START_LAT_ENV_VAR,
+    EXPERIMENT_START_LAT,
+    "実験開始位置の緯度 [deg]",
+    -90.0,
+    90.0,
+)
+EXPERIMENT_START_LON, EXPERIMENT_START_LON_SOURCE = _env_float_param(
+    EXPERIMENT_START_LON_ENV_VAR,
+    EXPERIMENT_START_LON,
+    "実験開始位置の経度 [deg]",
+    -180.0,
+    180.0,
+)
+EXPERIMENT_START_HEIGHT_ABOVE_TAKEOFF, EXPERIMENT_START_HEIGHT_SOURCE = (
+    _env_float_param(
+        EXPERIMENT_START_HEIGHT_ENV_VAR,
+        EXPERIMENT_START_HEIGHT_ABOVE_TAKEOFF,
+        "実験開始位置の高さ（離陸地点から）[m]",
+        0.05,
+        10.0,
+    )
+)
+# REF フレームでの開始位置（自動移動の目標）。gps_to_local_xyz() は純関数なので
+# 起動時に 1 回だけ求めれば十分です。
+EXPERIMENT_START_X_M, EXPERIMENT_START_Y_M, _ = gps_to_local_xyz(
+    EXPERIMENT_START_LAT, EXPERIMENT_START_LON, REF_ALT
+)
+# ───── 離陸後の自動移動（開始位置へ整列） ─────
+# 既定は無効（従来どおり離陸後すぐカメラ追従）。AR_HOOK_AUTO_START=1 で有効化します。
+# 有効時は IDLE → TAKEOFF_WAIT → AUTO_TO_START → ARRIVED → TRACK の順に遷移し、
+# TRACK に入るまでカメラ追従による target の書き換えを抑止します。
+AUTO_START_ENV_VAR = "AR_HOOK_AUTO_START"
+AUTO_START_ENABLED, AUTO_START_SOURCE = _env_flag_param(AUTO_START_ENV_VAR, 0)
+AUTO_START_ARRIVE_XY_ENV_VAR = "AR_HOOK_AUTO_START_ARRIVE_XY_M"
+AUTO_START_ARRIVE_Z_ENV_VAR = "AR_HOOK_AUTO_START_ARRIVE_Z_M"
+AUTO_START_ARRIVE_FRAMES_ENV_VAR = "AR_HOOK_AUTO_START_ARRIVE_FRAMES"
+AUTO_START_TIMEOUT_ENV_VAR = "AR_HOOK_AUTO_START_TIMEOUT_S"
+AUTO_START_ARRIVE_XY_M, AUTO_START_ARRIVE_XY_SOURCE = _env_float_param(
+    AUTO_START_ARRIVE_XY_ENV_VAR,
+    0.15,
+    "自動移動の到着判定（水平距離）[m]",
+    0.01,
+    5.0,
+)
+AUTO_START_ARRIVE_Z_M, AUTO_START_ARRIVE_Z_SOURCE = _env_float_param(
+    AUTO_START_ARRIVE_Z_ENV_VAR,
+    0.10,
+    "自動移動の到着判定（高さ差）[m]",
+    0.01,
+    5.0,
+)
+AUTO_START_ARRIVE_FRAMES, AUTO_START_ARRIVE_FRAMES_SOURCE = _env_int_param(
+    AUTO_START_ARRIVE_FRAMES_ENV_VAR,
+    2,
+    "自動移動の到着判定（連続フレーム数）",
+    1,
+    1000,
+)
+AUTO_START_TIMEOUT_S, AUTO_START_TIMEOUT_SOURCE = _env_float_param(
+    AUTO_START_TIMEOUT_ENV_VAR,
+    30.0,
+    "自動移動のタイムアウト [s]",
+    0.1,
+    600.0,
+)
 CSV_DIR = Path.home() / "LOGS_Pixhawk6c"
 CSV_DIR.mkdir(exist_ok=True)
 # ───── カメラ向きソース設定 ─────
@@ -358,6 +472,32 @@ target_limit_log = {
 _target_lost_started_s = None  # 検出ロスト開始時刻（time.monotonic）
 # 一度でもカメラ追従で目標を更新したか（未追従時のロスト処理を無効にする）
 _target_tracked_once = False
+
+# ───── 離陸後の自動移動（開始位置へ整列）の状態機械 ─────
+# 無効時は "DISABLED" のまま何も変更しません（従来挙動を維持）。
+AUTO_START_PHASE_DISABLED = "DISABLED"
+AUTO_START_PHASE_IDLE = "IDLE"
+AUTO_START_PHASE_TAKEOFF_WAIT = "TAKEOFF_WAIT"
+AUTO_START_PHASE_AUTO_TO_START = "AUTO_TO_START"
+AUTO_START_PHASE_ARRIVED = "ARRIVED"
+AUTO_START_PHASE_TRACK = "TRACK"
+AUTO_START_PHASE_TIMEOUT = "TIMEOUT"
+AUTO_START_PHASE_ABORTED = "ABORTED"
+AUTO_START_ACTIVE_PHASES = (
+    AUTO_START_PHASE_TAKEOFF_WAIT,
+    AUTO_START_PHASE_AUTO_TO_START,
+    AUTO_START_PHASE_ARRIVED,
+)
+auto_start_phase = (
+    AUTO_START_PHASE_IDLE if AUTO_START_ENABLED else AUTO_START_PHASE_DISABLED
+)
+auto_start_started_s = None      # AUTO_TO_START 開始時刻（time.monotonic）
+auto_start_elapsed_s = 0.0       # AUTO_TO_START 開始からの経過 [s]（CSV）
+auto_start_dist_m = float('nan') # 開始位置までの水平距離 [m]（CSV）
+auto_start_arrival_count = 0     # 到着条件を連続で満たしたフレーム数
+auto_start_arrived_logged = False
+auto_start_timeout_warned = False
+auto_start_abort_logged = False
 
 # カメラ座標系での位置情報（CSV記録用、オフセット適用前の生値）
 cargo_cam_raw = [float('nan'), float('nan'), float('nan')]
@@ -1615,6 +1755,7 @@ def monitor_vehicle(comm):
         state = comm.snapshot()
         if state.link_lost:
             print("❌ MAVLinkリンク切断を検出 → プログラムを終了します")
+            auto_start_abort("リンク切断")
             running = False
             break
         if state.heartbeat_seq != last_heartbeat_seq:
@@ -1635,14 +1776,19 @@ def monitor_vehicle(comm):
                         f"✓ 目標Yawを {TARGET_YAW_SEND_DEG:.1f}° に固定"
                         f"（設定ソース: {TARGET_YAW_SOURCE}）"
                     )
+                    # 自動移動が有効なときだけ IDLE/ABORTED/TRACK → TAKEOFF_WAIT。
+                    auto_start_on_guided_armed()
                 if guided and not takeoff_sent and time.time() - start_time > 3:
                     send_takeoff_command(comm, TAKEOFF_ALT)
                     print(f"✓ 離陸指令（{TAKEOFF_ALT:.1f}m）")
                     takeoff_sent = True
                 if not is_guided:
+                    # 移動中なら即中断（現在の目標を保持）。安全動作を優先する。
+                    auto_start_on_guided_lost()
                     guided, takeoff_sent, takeoff_reached, initial_target_set = False, False, False, False
                 if armed and not new_armed:  # アームされていた状態からディスアームされた場合のみ終了
                     print("\n✓ ディスアーム検出")
+                    auto_start_abort("disarm")
                     running = False  # プログラム停止（記録は最後に保存）
                 armed = new_armed  # アーム状態を更新
         # 実時間の機体姿勢(ロール、ピッチ、ヨー角)情報の取得
@@ -1711,6 +1857,8 @@ def monitor_vehicle(comm):
                         f"✓ 離陸高度到達: home相対 {TAKEOFF_ALT:.2f}m "
                         f"(target Down={takeoff_log:.2f}m)"
                     )
+                    # 自動移動が有効なときだけ TAKEOFF_WAIT → AUTO_TO_START。
+                    auto_start_on_takeoff_reached()
         # 従来は 1/SEND_HZ = 100ms 周期だったが、ATTITUDE 40Hz 要求に合わせて
         # 5ms 周期に短縮する。GLOBAL_POSITION_INT は 5Hz のままなので、位置更新の
         # 実効レートは従来と同じ（受信したときだけ更新）である。
@@ -1903,6 +2051,259 @@ def update_target_on_detection_lost(comm):
             comm, target_cmd[0], target_cmd[1], target_cmd[2], home_down_m)
 
 
+# ───── 離陸後の自動移動（開始位置へ整列） ─────
+# 状態機械:
+#   IDLE --GUIDED+armed--> TAKEOFF_WAIT --離陸高度到達--> AUTO_TO_START
+#   AUTO_TO_START --到着条件を N フレーム連続--> ARRIVED --次フレーム--> TRACK
+#   AUTO_TO_START --タイムアウト--> TIMEOUT（現在目標を保持）
+#   TAKEOFF_WAIT / AUTO_TO_START --GUIDED解除・disarm・リンク切断・終了--> ABORTED
+# 無効時（AUTO_START_ENABLED=False）は "DISABLED" のままで target も送信も変更しません。
+def auto_start_log_snapshot():
+    """CSV 記録用に (phase, elapsed_s, dist_m) を io_lock 内でコピーする。"""
+    with io_lock:
+        return auto_start_phase, auto_start_elapsed_s, auto_start_dist_m
+
+
+def auto_start_abort(reason):
+    """自動移動を中断し、現在の目標を保持する（1 回だけ警告）。"""
+    global auto_start_phase, auto_start_abort_logged
+    if not AUTO_START_ENABLED:
+        return False
+    with io_lock:
+        aborted = auto_start_phase in AUTO_START_ACTIVE_PHASES
+        if aborted:
+            auto_start_phase = AUTO_START_PHASE_ABORTED
+        should_log = aborted and not auto_start_abort_logged
+        if should_log:
+            auto_start_abort_logged = True
+    if not aborted:
+        return False
+    if should_log:
+        print(
+            f"⚠ 自動移動を中断しました（理由: {reason}）。"
+            "現在の目標を保持し、既存の安全動作（送信停止／終了処理）を優先します"
+        )
+    return True
+
+
+def auto_start_on_guided_armed(now_s=None):
+    """GUIDED+armed を検出したとき（離陸準備のタイマー開始時）に呼ぶ。"""
+    global auto_start_phase, auto_start_arrival_count
+    global auto_start_arrived_logged, auto_start_timeout_warned
+    global auto_start_abort_logged, auto_start_started_s, auto_start_elapsed_s
+    global auto_start_dist_m
+    if not AUTO_START_ENABLED:
+        return
+    with io_lock:
+        if auto_start_phase == AUTO_START_PHASE_TAKEOFF_WAIT:
+            return
+        auto_start_phase = AUTO_START_PHASE_TAKEOFF_WAIT
+        auto_start_started_s = None
+        auto_start_elapsed_s = 0.0
+        auto_start_dist_m = float('nan')
+        auto_start_arrival_count = 0
+        auto_start_arrived_logged = False
+        auto_start_timeout_warned = False
+        auto_start_abort_logged = False
+    print("ℹ 自動移動フェーズ: TAKEOFF_WAIT（離陸高度到達を待ちます）")
+
+
+def auto_start_on_takeoff_reached(now_s=None):
+    """離陸高度到達（initial_target_set=True にした直後）に呼ぶ。"""
+    global auto_start_phase, auto_start_started_s, auto_start_elapsed_s
+    global auto_start_dist_m, auto_start_arrival_count
+    if not AUTO_START_ENABLED:
+        return
+    now = time.monotonic() if now_s is None else float(now_s)
+    with io_lock:
+        if auto_start_phase != AUTO_START_PHASE_TAKEOFF_WAIT:
+            return
+        auto_start_phase = AUTO_START_PHASE_AUTO_TO_START
+        auto_start_started_s = now
+        auto_start_elapsed_s = 0.0
+        auto_start_dist_m = math.hypot(
+            gps_now['x'] - EXPERIMENT_START_X_M,
+            gps_now['y'] - EXPERIMENT_START_Y_M,
+        )
+        auto_start_arrival_count = 0
+        current_dist = auto_start_dist_m
+        current_x, current_y = gps_now['x'], gps_now['y']
+        base_z = target['z']
+    # ✅ 移動の基準を「離陸高度到達時点の現在位置」へ置き直す。
+    #    離陸直後の target の水平成分は初期値 (0, 0) のままなので、そのまま
+    #    開始位置を指令すると、クランプ前の古い target との差で機体が想定より
+    #    速く飛ぶ可能性があります。ここでは移動ではなく基準の初期化として、
+    #    commit_target_command() に現在位置を渡す（偏差 0・レート制限なし）ことで
+    #    target の書き換え入口を 1 箇所に保ちます。次のフレームから 0.5 m/s で接近。
+    commit_target_command(
+        current_x, current_y, base_z,
+        source="auto_start",
+        apply_rate_limit=False,
+    )
+    print(
+        "✓ 自動移動を開始します: "
+        f"開始位置 N={EXPERIMENT_START_X_M:.2f} E={EXPERIMENT_START_Y_M:.2f} "
+        f"高さ={EXPERIMENT_START_HEIGHT_ABOVE_TAKEOFF:.2f}m"
+        f"（現在の水平距離 {current_dist:.2f}m、"
+        f"移動上限 {TARGET_MAX_SPEED_MPS:.2f}m/s で接近）"
+    )
+
+
+def auto_start_on_guided_lost(reason="GUIDED 解除"):
+    """GUIDED から外れたときに、移動中なら中断する。"""
+    return auto_start_abort(reason)
+
+
+def auto_start_update(comm, now_s=None):
+    """自動移動の 1 フレーム分を進める。
+
+    Returns:
+        True: このフレームはカメラ追従による target の書き換えを抑止する。
+        False: カメラ追従を通常どおり実行してよい（無効時・TRACK 時）。
+    """
+    global auto_start_phase, auto_start_elapsed_s, auto_start_dist_m
+    global auto_start_arrival_count, auto_start_arrived_logged
+    global auto_start_timeout_warned
+    if not AUTO_START_ENABLED:
+        return False
+    now = time.monotonic() if now_s is None else float(now_s)
+    with io_lock:
+        phase = auto_start_phase
+        home_down_m = gps_origin['z']
+        pos_x, pos_y, pos_z = gps_now['x'], gps_now['y'], gps_now['z']
+        current_target = (target['x'], target['y'], target['z'])
+        started_s = auto_start_started_s
+    if phase in (AUTO_START_PHASE_DISABLED, AUTO_START_PHASE_TRACK):
+        return False
+    if phase == AUTO_START_PHASE_IDLE:
+        return True
+    if phase == AUTO_START_PHASE_ARRIVED:
+        with io_lock:
+            auto_start_phase = AUTO_START_PHASE_TRACK
+        print("✓ 自動移動フェーズ: TRACK（カメラ追従を再開します）")
+        return False
+    if phase == AUTO_START_PHASE_TAKEOFF_WAIT:
+        if not running:
+            auto_start_abort("終了要求 (running=False)")
+        elif not guided_mode_active:
+            auto_start_abort("GUIDED 解除")
+        return True
+    if phase == AUTO_START_PHASE_ABORTED:
+        return True
+    if phase == AUTO_START_PHASE_TIMEOUT:
+        # 移動は中止済み。現在の目標をそのまま再送して保持する
+        # （GUIDED の目標タイムアウトで機体が別の動きをしないようにする）。
+        if can_send_guided_setpoint(
+            guided_mode_active, initial_target_set, home_down_m
+        ):
+            send_local_target(
+                comm,
+                current_target[0], current_target[1], current_target[2],
+                home_down_m,
+            )
+        return True
+
+    # ───── AUTO_TO_START ─────
+    if not running:
+        auto_start_abort("終了要求 (running=False)")
+        return True
+    if not guided_mode_active:
+        auto_start_abort("GUIDED 解除")
+        return True
+    if not (home_down_m is not None and math.isfinite(home_down_m)):
+        # 離陸地点の Down が未確定。送信できないので待つ（移動もしない）。
+        return True
+
+    desired_z = alt_above_home_to_local_down(
+        EXPERIMENT_START_HEIGHT_ABOVE_TAKEOFF, home_down_m
+    )
+    elapsed = max(0.0, now - started_s) if started_s is not None else 0.0
+    dx = pos_x - EXPERIMENT_START_X_M
+    dy = pos_y - EXPERIMENT_START_Y_M
+    horizontal_ok = math.isfinite(dx) and math.isfinite(dy)
+    dist_m = math.hypot(dx, dy) if horizontal_ok else float('nan')
+    z_ok = math.isfinite(pos_z) and math.isfinite(desired_z)
+    dz_m = abs(pos_z - desired_z) if z_ok else float('nan')
+    condition_met = bool(
+        horizontal_ok
+        and z_ok
+        and dist_m <= AUTO_START_ARRIVE_XY_M
+        and dz_m <= AUTO_START_ARRIVE_Z_M
+    )
+    with io_lock:
+        if condition_met:
+            auto_start_arrival_count += 1
+        else:
+            auto_start_arrival_count = 0
+        arrival_count = auto_start_arrival_count
+        auto_start_elapsed_s = elapsed
+        auto_start_dist_m = dist_m
+    arrived = arrival_count >= AUTO_START_ARRIVE_FRAMES
+
+    if arrived:
+        # 最終目標も commit_target_command() 経由で確定させる（クランプ・レート制限）。
+        target_cmd = commit_target_command(
+            EXPERIMENT_START_X_M,
+            EXPERIMENT_START_Y_M,
+            desired_z,
+            source="auto_start",
+            apply_rate_limit=True,
+        )
+        with io_lock:
+            auto_start_phase = AUTO_START_PHASE_ARRIVED
+        if not auto_start_arrived_logged:
+            print(
+                "✓ 自動移動 到着: "
+                f"水平距離 {dist_m:.3f}m（しきい値 {AUTO_START_ARRIVE_XY_M:.2f}m）、"
+                f"高さ差 {dz_m:.3f}m（しきい値 {AUTO_START_ARRIVE_Z_M:.2f}m）、"
+                f"経過 {elapsed:.2f}s（{arrival_count} フレーム連続）"
+                " → カメラ追従を開始します"
+            )
+            auto_start_arrived_logged = True
+        if can_send_guided_setpoint(
+            guided_mode_active, initial_target_set, home_down_m
+        ):
+            send_local_target(
+                comm, target_cmd[0], target_cmd[1], target_cmd[2], home_down_m)
+        return True
+
+    if elapsed >= AUTO_START_TIMEOUT_S:
+        with io_lock:
+            auto_start_phase = AUTO_START_PHASE_TIMEOUT
+        if not auto_start_timeout_warned:
+            print(
+                f"⚠ 自動移動がタイムアウト（{AUTO_START_TIMEOUT_S:.1f}秒）しました。"
+                "移動を中止し、現在の目標を保持します"
+                f"（残り水平距離 {dist_m:.2f}m / 高さ差 {dz_m:.2f}m）。"
+                "降下・着陸は行いません"
+            )
+            auto_start_timeout_warned = True
+        if can_send_guided_setpoint(
+            guided_mode_active, initial_target_set, home_down_m
+        ):
+            send_local_target(
+                comm,
+                current_target[0], current_target[1], current_target[2],
+                home_down_m,
+            )
+        return True
+
+    # 通常の移動フレーム: クランプ・レート制限を必ず通してから送る。
+    target_cmd = commit_target_command(
+        EXPERIMENT_START_X_M,
+        EXPERIMENT_START_Y_M,
+        desired_z,
+        source="auto_start",
+        apply_rate_limit=True,
+    )
+    if can_send_guided_setpoint(
+        guided_mode_active, initial_target_set, home_down_m
+    ):
+        send_local_target(
+            comm, target_cmd[0], target_cmd[1], target_cmd[2], home_down_m)
+    return True
+
+
 def camera_tracker_loop(comm, show_window=False, stream_enabled=False):
     global running, target, gps_now, current_yaw_deg, initial_target_set, guided_mode_active
     global last_center_cam, last_rvec_cargo
@@ -2033,6 +2434,11 @@ def camera_tracker_loop(comm, show_window=False, stream_enabled=False):
     last_stream_frame_time = 0.0
     try:
         while running:
+            # ✅ 自動移動（AR_HOOK_AUTO_START=1）の 1 フレーム分を進める。
+            #    True の間は TRACK に入るまでカメラ追従による target の書き換えを
+            #    抑止する（理由は CSV の Auto_Start_Phase で分かる）。
+            #    無効時は常に False を返すだけで、従来の経路は 1 ビットも変わらない。
+            auto_start_suppress = auto_start_update(comm)
             ar_cargo_ned = None
             ar_target_ned = None
             ar_hand_camera = None
@@ -2528,7 +2934,13 @@ def camera_tracker_loop(comm, show_window=False, stream_enabled=False):
                             tvec_error, ap_roll, ap_pitch, ap_yaw, drone_gps)
 
                     # グローバル目標値等の更新
-                    if stale_fallback_blocks_target:
+                    if auto_start_suppress:
+                        # 自動移動（AUTO_TO_START など）の間は、カメラ追従による
+                        # target の書き換えと setpoint 送信を行わない。移動は
+                        # auto_start_update() が commit_target_command() 経由で行う。
+                        # 抑止理由は CSV の Auto_Start_Phase で確認できる。
+                        pass
+                    elif stale_fallback_blocks_target:
                         # ATTITUDE がしきい値より古いため、フォールバック姿勢による
                         # 自動誘導目標の更新を停止する。target は前回値を保持し、
                         # setpoint も送らない（ArduPilot は最後の目標を保持する）。
@@ -2610,7 +3022,9 @@ def camera_tracker_loop(comm, show_window=False, stream_enabled=False):
                         motive_cargo_cam = [float('nan'), float('nan'), float('nan')]
                         motive_hand_cam = [float('nan'), float('nan'), float('nan')]
                     # ✅ 検出ロスト時は「保持 → 保持時間超過後に減衰復帰」で目標を更新する
-                    update_target_on_detection_lost(comm)
+                    #    自動移動中はカメラ経路の target 更新を抑止する。
+                    if not auto_start_suppress:
+                        update_target_on_detection_lost(comm)
             else:
                 # ids is None
                 with io_lock:
@@ -2626,7 +3040,9 @@ def camera_tracker_loop(comm, show_window=False, stream_enabled=False):
                     motive_cargo_cam = [float('nan'), float('nan'), float('nan')]
                     motive_hand_cam = [float('nan'), float('nan'), float('nan')]
                 # ✅ 検出ロスト時は「保持 → 保持時間超過後に減衰復帰」で目標を更新する
-                update_target_on_detection_lost(comm)
+                #    自動移動中はカメラ経路の target 更新を抑止する。
+                if not auto_start_suppress:
+                    update_target_on_detection_lost(comm)
 
             now = time.monotonic()
             if now - last_print_time >= 1.0:
@@ -2892,14 +3308,15 @@ def control_loop(comm):
                         desired['z'] = next_down
                         echo = "z Down"
                 elif key == 't' and initial_target_set:
-                    # ✅ N/E は REF フレーム、高さは「離陸地点からの高さ」
-                    #    TARGET_HEIGHT_ABOVE_TAKEOFF を Down へ変換して設定します。
+                    # ✅ 実験開始位置は EXPERIMENT_START_* の 1 箇所だけで定義します
+                    #    （自動移動と同じ定義。N/E は REF フレーム、高さは「離陸地点からの
+                    #    高さ」を Down へ変換）。環境変数で上書き可能です。
                     with io_lock:
                         home_down_m = gps_origin['z']
-                    desired['x'], desired['y'], _ = gps_to_local_xyz(
-                        36.0757693, 136.2132945, REF_ALT)
+                    desired['x'] = EXPERIMENT_START_X_M
+                    desired['y'] = EXPERIMENT_START_Y_M
                     desired['z'] = alt_above_home_to_local_down(
-                        TARGET_HEIGHT_ABOVE_TAKEOFF, home_down_m)
+                        EXPERIMENT_START_HEIGHT_ABOVE_TAKEOFF, home_down_m)
                     echo = "t"
                 if echo:
                     moved = True
@@ -3063,6 +3480,12 @@ def record_data():
             tgt_decay = 1 if tgt_lim['decay_active'] else 0
             tgt_src = tgt_lim['source']
 
+            # ✅ 新規追加：離陸後の自動移動（末尾 3 列）
+            # 無効時は Auto_Start_Phase=DISABLED、elapsed=0、dist=nan。
+            auto_phase = auto_start_phase
+            auto_elapsed = auto_start_elapsed_s
+            auto_dist = auto_start_dist_m
+
         data_records.append([
             time.time(), 
             gps['x'], gps['y'], gps['z'], 
@@ -3108,6 +3531,8 @@ def record_data():
             tgt_des_x, tgt_des_y, tgt_des_z,
             tgt_rate, tgt_xy_clamp, tgt_z_up, tgt_z_down,
             tgt_invalid, tgt_hold, tgt_hold_t, tgt_decay, tgt_src,
+            # ✅ 新規追加：離陸後の自動移動（末尾に追加。既存列は変更しない）
+            auto_phase, auto_elapsed, auto_dist,
         ])
         time.sleep(1 / AR_LOG_HZ)
 def save_csv():
@@ -3224,6 +3649,10 @@ def save_csv():
             'Target_Hold_Active', 'Target_Hold_Elapsed_s',
             'Target_Lost_Decay_Active',
             'Target_Update_Source',
+            # ✅ 新規追加：離陸後の自動移動（末尾に追加。既存列は変更しない）
+            'Auto_Start_Phase',
+            'Auto_Start_Elapsed_s',
+            'Auto_Start_Dist_m',
         ])
         writer.writerows(data_records)
     print(f"\n✓ CSV保存完了: {path} ({len(data_records)} 行)")
@@ -3300,6 +3729,20 @@ def main(argv=None):
         f" (設定ソース: {TARGET_YAW_SOURCE}"
         f" / 取付ヨーオフセット: {CAMERA_MOUNT_YAW_OFFSET_DEG:.1f}deg)"
         f" | MASK: 0x{MASK:04X} (設定ソース: {MASK_SOURCE})"
+    )
+    print(
+        "ℹ 離陸後の自動移動: "
+        + (
+            "有効"
+            f"（{AUTO_START_ENV_VAR}={AUTO_START_SOURCE}、"
+            f"開始位置 lat={EXPERIMENT_START_LAT:.7f} lon={EXPERIMENT_START_LON:.7f} "
+            f"高さ={EXPERIMENT_START_HEIGHT_ABOVE_TAKEOFF:.2f}m、"
+            f"到着 {AUTO_START_ARRIVE_XY_M:.2f}m/{AUTO_START_ARRIVE_Z_M:.2f}m を"
+            f" {AUTO_START_ARRIVE_FRAMES} フレーム連続、"
+            f"タイムアウト {AUTO_START_TIMEOUT_S:.1f}s）"
+            if AUTO_START_ENABLED
+            else f"無効（{AUTO_START_ENV_VAR}=0、既定どおり離陸後すぐカメラ追従）"
+        )
     )
     
     try:

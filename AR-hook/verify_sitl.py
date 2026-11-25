@@ -79,8 +79,13 @@ TAKEOFF_REACH_RATIO = 0.9         # AR-hook1.py の離陸到達判定と同じ 9
 # ── disarm（終了と CSV 保存）──
 DISARM_TRIGGER_DELAY_S = 4.0      # 記録を数秒取ってから disarm する
 DISARM_EXIT_TIMEOUT_S = 20.0
-CSV_EXPECTED_COLUMNS = 170        # save_csv() のヘッダ列数
+CSV_EXPECTED_COLUMNS = 173        # save_csv() のヘッダ列数（Auto_Start_* の 3 列を含む）
 CSV_MIN_ROWS = 5
+
+# ── auto_start（離陸後に開始位置へ自動移動 → TRACK）──
+AUTO_START_PHASE_TIMEOUT_S = 90.0  # 離陸待ち＋移動＋到着の上限（移動自体は 30 秒で TIMEOUT）
+AUTO_START_TRACK_SETPOINT_TOL_M = 0.50  # TRACK 後の setpoint が開始位置から外れてよい距離
+AUTO_START_POST_TRACK_FRAMES = 5   # TRACK 後に疑似カメラ更新を送る回数
 
 # ── external（実 SITL）でのみ使う値 ──
 # 実 SITL は地上では yaw 指令に追従しないため、ホバリング高度まで上げてから測る。
@@ -114,21 +119,37 @@ def _install_optional_mocks():
         sys.modules["pytz"] = pytz_mock
 
 
-def load_ar_hook1_module():
-    """AR-hook1.py をモジュールとして読み込む（main() は実行しない）。"""
+def load_ar_hook1_module(env=None):
+    """AR-hook1.py をモジュールとして読み込む（main() は実行しない）。
+
+    Args:
+        env: 読み込み時だけ設定する環境変数（例: {"AR_HOOK_AUTO_START": "1"}）。
+             指定しない場合は現在の環境変数をそのまま使います。
+    """
     _install_optional_mocks()
     original_home = Path.__dict__["home"]
-    with tempfile.TemporaryDirectory(prefix="arhook_verify_") as tmp_home:
-        try:
-            Path.home = classmethod(lambda cls: Path(tmp_home))
-            spec = importlib.util.spec_from_file_location(
-                "ar_hook1_sitl_verify", AR_HOOK
-            )
-            module = importlib.util.module_from_spec(spec)
-            with contextlib.redirect_stdout(io.StringIO()):
-                spec.loader.exec_module(module)
-        finally:
-            Path.home = original_home
+    saved_env = {}
+    for key, value in (env or {}).items():
+        saved_env[key] = os.environ.get(key)
+        os.environ[key] = str(value)
+    try:
+        with tempfile.TemporaryDirectory(prefix="arhook_verify_") as tmp_home:
+            try:
+                Path.home = classmethod(lambda cls: Path(tmp_home))
+                spec = importlib.util.spec_from_file_location(
+                    "ar_hook1_sitl_verify", AR_HOOK
+                )
+                module = importlib.util.module_from_spec(spec)
+                with contextlib.redirect_stdout(io.StringIO()):
+                    spec.loader.exec_module(module)
+            finally:
+                Path.home = original_home
+    finally:
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
     return module
 
 
@@ -1230,7 +1251,7 @@ def scenario_disarm(module, args):
             "disarm_command_sent": disarm_sent["value"],
             "program_stopped_on_disarm": bool(stopped),
             "csv_saved": bool(summary.get("rows", 0) > 0),
-            "csv_column_count_is_170": (
+            "csv_column_count_matches_schema": (
                 summary.get("columns") == CSV_EXPECTED_COLUMNS
             ),
             "csv_has_enough_rows": summary.get("rows", 0) >= CSV_MIN_ROWS,
@@ -1289,6 +1310,236 @@ def scenario_disarm(module, args):
     }
 
 
+# ──────────────────────────────────────────────
+#  auto_start: 離陸後に開始位置へ自動移動 → 到着 → TRACK
+# ──────────────────────────────────────────────
+def _setpoint_local(module, record, home_down_m):
+    """送信 setpoint（GLOBAL_INT）を REF ローカル NED へ戻す。"""
+    north, east, _ = module.gps_to_local_xyz(
+        record["lat_e7"] / 1e7, record["lon_e7"] / 1e7, module.REF_ALT
+    )
+    down = module.alt_above_home_to_local_down(record["alt_m"], home_down_m)
+    return north, east, down
+
+
+def scenario_auto_start(module, args):
+    """AR_HOOK_AUTO_START=1 で、離陸 → 開始位置へ移動 → TRACK を検証する。
+
+    monitor_vehicle() に離陸を任せ、その後のカメラフレーム周期を
+    auto_start_update() の呼び出しで模擬する（実カメラは使わない）。
+    TRACK 後に疑似カメラ更新を送り、setpoint が開始位置近傍かを測る。
+    """
+    auto_module = load_ar_hook1_module(env={"AR_HOOK_AUTO_START": "1"})
+    timeline = []
+    with vehicle_session(
+        auto_module, args, "auto_start", port_offset=5
+    ) as (comm, records, _port, out_dir):
+        wait_position(comm, timeout=10.0)
+        started = time.monotonic()
+
+        def mark(event, detail=""):
+            timeline.append([
+                len(timeline) + 1, round(time.monotonic() - started, 6),
+                event, detail,
+            ])
+
+        takeoff_calls = []
+        original_takeoff = comm.takeoff
+
+        def takeoff(alt_m):
+            takeoff_calls.append(float(alt_m))
+            mark("nav_takeoff_sent", f"alt={float(alt_m):.3f} m")
+            return original_takeoff(alt_m)
+
+        comm.takeoff = takeoff
+        auto_module.running = True
+        mark("monitor_start", "mode=AR-hook1.monitor_vehicle")
+        threads = [
+            _start_thread(
+                auto_module.monitor_vehicle, comm, name="verify_monitor_auto_start"
+            )
+        ]
+        track_seen = False
+        move_frames = 0
+        phase_reached = None
+        try:
+            phase_reached, wait_s = wait_for(
+                lambda: (
+                    auto_module.auto_start_phase == "AUTO_TO_START" or None
+                ),
+                timeout=AUTO_START_PHASE_TIMEOUT_S,
+            )
+            mark(
+                "auto_to_start" if phase_reached else "auto_to_start_timeout",
+                f"phase={auto_module.auto_start_phase} after {wait_s:.2f} s",
+            )
+            deadline = time.monotonic() + AUTO_START_PHASE_TIMEOUT_S
+            while time.monotonic() < deadline:
+                auto_module.auto_start_update(comm)
+                move_frames += 1
+                if auto_module.auto_start_phase in ("TRACK", "TIMEOUT", "ABORTED"):
+                    track_seen = auto_module.auto_start_phase == "TRACK"
+                    break
+                time.sleep(1.0 / auto_module.AR_MEASUREMENT_FPS)
+            mark(
+                "phase_" + str(auto_module.auto_start_phase),
+                f"frames={move_frames}",
+            )
+
+            # 到着時点の実測（TRACK に遷移した直後）
+            home_down_m = auto_module.gps_origin['z']
+            position = comm.snapshot().position
+            if position is None:
+                start_dist_m = start_dz_m = float("nan")
+            else:
+                pos_x, pos_y, pos_z = auto_module.gps_to_local_xyz(
+                    position.lat / 1e7, position.lon / 1e7, position.alt / 1000
+                )
+                start_dist_m = math.hypot(
+                    pos_x - auto_module.EXPERIMENT_START_X_M,
+                    pos_y - auto_module.EXPERIMENT_START_Y_M,
+                )
+                start_down = auto_module.alt_above_home_to_local_down(
+                    auto_module.EXPERIMENT_START_HEIGHT_ABOVE_TAKEOFF,
+                    home_down_m,
+                )
+                start_dz_m = abs(pos_z - start_down)
+
+            # TRACK 後の擬似カメラ更新（開始位置 + 5cm 程度）。
+            after_index = len(records["setpoints"])
+            for _ in range(AUTO_START_POST_TRACK_FRAMES):
+                camera_target = (
+                    auto_module.EXPERIMENT_START_X_M + 0.05,
+                    auto_module.EXPERIMENT_START_Y_M - 0.05,
+                    auto_module.alt_above_home_to_local_down(
+                        auto_module.EXPERIMENT_START_HEIGHT_ABOVE_TAKEOFF,
+                        home_down_m,
+                    ),
+                )
+                cmd = auto_module.commit_target_command(
+                    camera_target[0], camera_target[1], camera_target[2],
+                    source="camera", apply_rate_limit=True,
+                )
+                if auto_module.can_send_guided_setpoint(
+                    auto_module.guided_mode_active,
+                    auto_module.initial_target_set,
+                    home_down_m,
+                ):
+                    auto_module.send_local_target(
+                        comm, cmd[0], cmd[1], cmd[2], home_down_m
+                    )
+                time.sleep(1.0 / auto_module.AR_MEASUREMENT_FPS)
+            post_setpoints = list(records["setpoints"][after_index:])
+            mark("post_track_setpoints", f"count={len(post_setpoints)}")
+            post_distances = []
+            for record in post_setpoints:
+                north, east, _ = _setpoint_local(auto_module, record, home_down_m)
+                post_distances.append(math.hypot(
+                    north - auto_module.EXPERIMENT_START_X_M,
+                    east - auto_module.EXPERIMENT_START_Y_M,
+                ))
+            max_post_dist = max(post_distances) if post_distances else None
+        finally:
+            comm.takeoff = original_takeoff
+            alive = _stop_threads(auto_module, threads)
+
+        _write_timeline(out_dir / "timeline.csv", timeline)
+        elapsed_s = auto_module.auto_start_elapsed_s
+        arrival_dist_m = float(auto_module.auto_start_dist_m)
+        checks = {
+            "auto_start_enabled": bool(auto_module.AUTO_START_ENABLED),
+            "takeoff_command_sent": len(takeoff_calls) == 1,
+            "reached_auto_to_start": phase_reached is not None,
+            "phase_reached_track": bool(track_seen),
+            "arrival_logged_once": bool(auto_module.auto_start_arrived_logged),
+            "arrival_within_timeout": (
+                elapsed_s is not None
+                and 0.0 <= float(elapsed_s)
+                <= float(auto_module.AUTO_START_TIMEOUT_S) + 1e-6
+            ),
+            "arrival_distance_within_threshold": (
+                math.isfinite(arrival_dist_m)
+                and arrival_dist_m
+                <= float(auto_module.AUTO_START_ARRIVE_XY_M) + 1e-6
+            ),
+            "vehicle_near_start_at_track": (
+                math.isfinite(start_dist_m)
+                and start_dist_m
+                <= float(auto_module.AUTO_START_ARRIVE_XY_M) + 0.10
+                and math.isfinite(start_dz_m)
+                and start_dz_m
+                <= float(auto_module.AUTO_START_ARRIVE_Z_M) + 0.10
+            ),
+            "track_setpoints_sent": len(post_setpoints) > 0,
+            "track_setpoints_near_start": (
+                max_post_dist is not None
+                and max_post_dist <= AUTO_START_TRACK_SETPOINT_TOL_M
+            ),
+            "threads_stopped": not alive,
+        }
+        measurements = {
+            "auto_start_phase": auto_module.auto_start_phase,
+            "auto_start_elapsed_s": (
+                None if elapsed_s is None else round(float(elapsed_s), 3)
+            ),
+            "auto_start_dist_m": (
+                None if not math.isfinite(arrival_dist_m)
+                else round(arrival_dist_m, 3)
+            ),
+            "vehicle_horizontal_distance_to_start_m": (
+                None if not math.isfinite(start_dist_m)
+                else round(start_dist_m, 3)
+            ),
+            "vehicle_height_difference_m": (
+                None if not math.isfinite(start_dz_m) else round(start_dz_m, 3)
+            ),
+            "move_frames": move_frames,
+            "post_track_setpoint_count": len(post_setpoints),
+            "post_track_max_horizontal_distance_m": (
+                None if max_post_dist is None else round(max_post_dist, 3)
+            ),
+            "track_setpoint_tolerance_m": AUTO_START_TRACK_SETPOINT_TOL_M,
+            "timeline": timeline,
+        }
+        write_observations(out_dir / "observations.csv", [
+            ("auto_start", "measurement", "auto_start_elapsed_s",
+             measurements["auto_start_elapsed_s"], "s"),
+            ("auto_start", "measurement", "auto_start_dist_m",
+             measurements["auto_start_dist_m"], "m"),
+            ("auto_start", "measurement",
+             "vehicle_horizontal_distance_to_start_m",
+             measurements["vehicle_horizontal_distance_to_start_m"], "m"),
+            ("auto_start", "measurement", "vehicle_height_difference_m",
+             measurements["vehicle_height_difference_m"], "m"),
+            ("auto_start", "measurement",
+             "post_track_max_horizontal_distance_m",
+             measurements["post_track_max_horizontal_distance_m"], "m"),
+        ])
+    return {
+        "id": "auto_start",
+        "name": "自動移動（GUIDED+ARM → 離陸 → 開始位置へ移動 → TRACK）",
+        "conditions": {
+            "enabled_by": "AR_HOOK_AUTO_START=1",
+            "arrive_xy_m": float(auto_module.AUTO_START_ARRIVE_XY_M),
+            "arrive_z_m": float(auto_module.AUTO_START_ARRIVE_Z_M),
+            "arrive_frames": int(auto_module.AUTO_START_ARRIVE_FRAMES),
+            "timeout_s": float(auto_module.AUTO_START_TIMEOUT_S),
+            "start_lat": float(auto_module.EXPERIMENT_START_LAT),
+            "start_lon": float(auto_module.EXPERIMENT_START_LON),
+            "start_height_above_takeoff_m": float(
+                auto_module.EXPERIMENT_START_HEIGHT_ABOVE_TAKEOFF
+            ),
+            "command_path": (
+                "auto_start_update() -> commit_target_command() -> "
+                "send_local_target()"
+            ),
+        },
+        "measurements": measurements,
+        "checks": checks,
+        "pass": all(checks.values()),
+    }
+
+
 SCENARIOS = [
     ("f6152", scenario_f6152),
     ("7f03b", scenario_7f03b),
@@ -1296,6 +1547,7 @@ SCENARIOS = [
     ("12794", scenario_12794),
     ("takeoff", scenario_takeoff),
     ("disarm", scenario_disarm),
+    ("auto_start", scenario_auto_start),
 ]
 
 

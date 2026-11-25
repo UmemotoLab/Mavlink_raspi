@@ -3,8 +3,9 @@
 """AR-hook が出力する CSV と同じ列構成のダミーログを生成する（ハードウェア不要）。
 
 目的:
-  * AR-hook1.py の save_csv() が書く 170 列を、追加列（Attitude_Age_ms /
-    Attitude_Stale / Target_* クランプ作動フラグ）も含めてそのまま再現する。
+  * AR-hook1.py の save_csv() が書く 173 列を、追加列（Attitude_Age_ms /
+    Attitude_Stale / Target_* クランプ作動フラグ / Auto_Start_*）も含めて
+    そのまま再現する。
   * 既存の解析・校正スクリプト（calibrate_camera_optical_offset.py /
     plot_hand_cargo_relative.py / plot_pose_offset_comparison.py）が、
     実機・Motive・Pixhawk 無しで動作確認できる入力を用意する。
@@ -312,6 +313,12 @@ def build_header():
         'Target_Hold_Active', 'Target_Hold_Elapsed_s',
         'Target_Lost_Decay_Active',
         'Target_Update_Source',
+    ])
+    # 追加タスク auto-start: 離陸後の自動移動（末尾追加）
+    header.extend([
+        'Auto_Start_Phase',
+        'Auto_Start_Elapsed_s',
+        'Auto_Start_Dist_m',
     ])
     return header
 
@@ -796,6 +803,10 @@ def build_row(index, start_epoch, hz, orientation_source, simulator, rng):
     row['Target_Hold_Elapsed_s'] = target_state["hold_elapsed"]
     row['Target_Lost_Decay_Active'] = 1 if target_state["decay"] else 0
     row['Target_Update_Source'] = target_state["source"]
+    # 離陸後の自動移動（ダミーは機能無効の想定）
+    row['Auto_Start_Phase'] = 'DISABLED'
+    row['Auto_Start_Elapsed_s'] = 0.0
+    row['Auto_Start_Dist_m'] = nan
     return row
 
 

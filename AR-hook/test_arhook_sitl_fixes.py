@@ -39,7 +39,7 @@ from test_failsafe_injection import (  # noqa: E402
     _new_module,
 )
 
-CSV_EXPECTED_COLUMNS = 170
+CSV_EXPECTED_COLUMNS = 173
 
 
 def _load_detected_rows(module):

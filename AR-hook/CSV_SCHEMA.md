@@ -2,7 +2,7 @@
 
 対象: `AR-hook/AR-hook1.py` の `save_csv()` が出力する `~/LOGS_Pixhawk6c/<日時>_1.csv`。
 各タスクが追加した列（MAVLink ATTITUDE の鮮度、目標のクランプ・レート制限）を含めた
-**統合後の 170 列**を、既存の解析・校正スクリプトがそのまま読める形で文書化したものです。
+**統合後の 173 列**を、既存の解析・校正スクリプトがそのまま読める形で文書化したものです。
 
 - 本書は「列名・単位・生成元・追加タスク・追加位置」の一覧と、**後方互換ルール**、
   **検証手順**、**実ログでの欠損確認観点**をまとめています。
@@ -17,7 +17,7 @@
 | ファイル名 | `YYYYmmdd_HHMMSS_1.csv`（Asia/Tokyo、終了時に `save_csv()` で 1 回だけ書き出し） |
 | 形式 | CSV（カンマ区切り、`csv.writer` の既定＝CRLF）。1 行目ヘッダー、2 行目以降データ |
 | 文字コード | UTF-8（スクリプト側は `encoding="utf-8-sig"` で読むので BOM の有無どちらも可） |
-| 列数 | **170 列固定**（`MOTIVE_RIGID_BODY_IDS = (1, 2, 3)` のとき） |
+| 列数 | **173 列固定**（`MOTIVE_RIGID_BODY_IDS = (1, 2, 3)` のとき） |
 | 記録レート | `AR_LOG_HZ = 40`（行数 = 記録スレッドの実行回数） |
 | 欠損値 | 空文字ではなく `nan`（Python の `float("nan")` を `csv.writer` が書いた文字列） |
 | フラグ列 | `0` / `1`（**`1.0` ではなく `1`**）。解析側は `row["..._Received"] == "1"` で判定する |
@@ -41,7 +41,7 @@
 | Motive 時刻 | `Motive_*_Pose_Time_s`、`AR_*_Camera_Pose_Time_s` は Motive 側の時計。オフセットは受信時刻から推定されるため、**ホスト時刻と直接比較してはいけない** |
 | 目標 | `Target_Drone_*` は `commit_target_command()` の制限後、`Target_Desired_*` は制限前（生の計測目標） |
 
-## 3. 列一覧（170 列・この順序が固定）
+## 3. 列一覧（173 列・この順序が固定）
 
 `追加位置` は「そのタスクが列を追加したときの位置」です。初期スキーマは変更しておらず、
 追加はすべて末尾です（`Attitude_*` の 2 列も、追加当時は末尾でした）。
@@ -218,6 +218,10 @@
 | 168 | `Target_Hold_Elapsed_s` | s | `target_limit_log["hold_elapsed_s"]` | a986990 | 末尾（最終 12 列） |
 | 169 | `Target_Lost_Decay_Active` | 0/1 | `target_limit_log["decay_active"]`（`decay_target_toward_current()`） | a986990 | 末尾（最終 12 列） |
 | 170 | `Target_Update_Source` | 文字列（camera / keyboard / lost_hold / lost_decay / none） | `target_limit_log["source"]` | a986990 | 末尾（最終 12 列） |
+| 171 | `Auto_Start_Phase` | 文字列（DISABLED / IDLE / TAKEOFF_WAIT / AUTO_TO_START / ARRIVED / TRACK / TIMEOUT / ABORTED） | `auto_start_phase`（`auto_start_log_snapshot()`） | auto-start | 末尾（最終 3 列） |
+| 172 | `Auto_Start_Elapsed_s` | s（AUTO_TO_START 開始からの経過。未開始は 0） | `auto_start_elapsed_s`（`auto_start_log_snapshot()`） | auto-start | 末尾（最終 3 列） |
+| 173 | `Auto_Start_Dist_m` | m（開始位置までの水平距離。未計算は nan） | `auto_start_dist_m`（`auto_start_log_snapshot()`） | auto-start | 末尾（最終 3 列） |
+
 
 ## 4. 追加した列とタスク ID
 
@@ -226,6 +230,7 @@
 | 初期スキーマ | 計測・目標・Motive 真値・AR 姿勢 | 1〜156 列目 | 156 |
 | `b720b2e` | MAVLink ATTITUDE の鮮度（40Hz 受信＋古い姿勢の抑止） | `Attitude_Age_ms`, `Attitude_Stale` | 2 |
 | `a986990`（旧 `3aaa930`） | 目標更新のクランプ・レート制限（積分ドリフト抑制） | `Target_Desired_X_m`, `Target_Desired_Y_m`, `Target_Desired_Z_m`, `Target_Limit_Rate_Active`, `Target_Limit_XY_Clamp_Active`, `Target_Limit_Z_Clamp_Up`, `Target_Limit_Z_Clamp_Down`, `Target_Limit_Invalid`, `Target_Hold_Active`, `Target_Hold_Elapsed_s`, `Target_Lost_Decay_Active`, `Target_Update_Source` | 12 |
+| auto-start | 離陸後の自動移動（開始位置へ整列、TRACK までカメラ更新を抑止） | `Auto_Start_Phase`, `Auto_Start_Elapsed_s`, `Auto_Start_Dist_m` | 3 |
 
 > 統合（rebase）前のコミット ID は `ファイル概要.md` に `19d3881` / `3aaa930` として
 > 記載されています。現在の履歴ではそれぞれ `ca40f48` / `a986990` に対応します。
@@ -245,7 +250,22 @@
 | `Target_Lost_Decay_Active` | 減衰復帰していない | 保持時間を超え、`TARGET_LOST_DECAY_MPS`（0.15 m/s）で現在位置へ復帰中 |
 
 `Target_Update_Source` は `camera`（通常追従）/ `keyboard`（キー操作）/ `lost_hold` /
-`lost_decay` / `none`（まだ一度も追従していない）のいずれかです。
+`lost_decay` / `auto_start`（離陸後の自動移動）/ `none`（まだ一度も追従していない）の
+いずれかです。
+
+`Auto_Start_Phase` は離陸後の自動移動の状態です（`AR_HOOK_AUTO_START=1` のときだけ
+`DISABLED` 以外になります）。
+
+| 値 | 意味 |
+|---|---|
+| `DISABLED` | 機能無効（既定）。従来どおり離陸後すぐカメラ追従 |
+| `IDLE` | 有効だが GUIDED+armed をまだ検出していない |
+| `TAKEOFF_WAIT` | GUIDED+armed を検出し、離陸高度到達を待っている（カメラ更新は抑止） |
+| `AUTO_TO_START` | 開始位置へ移動中。`commit_target_command(source="auto_start")` で更新 |
+| `ARRIVED` | 到着判定を満たしたフレーム（1 フレームだけ） |
+| `TRACK` | カメラ追従を再開した状態 |
+| `TIMEOUT` | 移動を中止し、現在の目標を保持中（警告は 1 回） |
+| `ABORTED` | GUIDED 解除・disarm・リンク切断・終了要求で中断 |
 
 ## 5. 後方互換ルール（必須）
 
@@ -279,7 +299,7 @@
 | `plot_pose_offset_comparison.py` | `Time_s`, `AR_{Hand,Cargo}_Pose_Received`, `AR_*_{X,Y,Z}_NED_m`, `AR_*_QX`〜`QW_NED`, `AR_*_PreOffset_{X,Y,Z}_NED_m`, `AR_*_PreOffset_QX`〜`QW_NED`, `AR_Hand→RB1` / `AR_Cargo→RB2` の `Motive_RB*_Pose_{Time_s,Received}`, `Motive_RB*_{X,Y,Z}_NED_m`, `Motive_RB*_Pose_QX`〜`QW`（`AR_*_Pose_Time_s`, `AR_*_Camera_Pose_Time_s` は任意＝無ければ `Time_s` で代替） |
 | `marker_pose_calibration.py` | CSV を読まない（姿勢・座標変換の共通ライブラリ） |
 
-追加列（`Attitude_Age_ms` 以降の 14 列）を参照する既存スクリプトはありません。
+追加列（`Attitude_Age_ms` 以降の 17 列）を参照する既存スクリプトはありません。
 そのため追加によって壊れる経路はありませんが、**ダミー CSV での実行確認**を行います。
 
 ## 7. ダミー CSV と検証手順（ハードウェア不要）
@@ -299,7 +319,7 @@ python3 make_dummy_csv.py --orientation-source ardupilot \
 
 生成内容（実ログに近づけた点）:
 
-- 170 列すべて（追加列 14 列を含む）。フラグは `0`/`1`、欠損は `nan`。
+- 173 列すべて（追加列 17 列を含む）。フラグは `0`/`1`、欠損は `nan`。
 - Motive RB1（手先）/RB2（荷物）/RB3（カメラ）の位置・姿勢を**別々の周期**で動かし、
   光学中心オフセットの誤差（OpenCV 座標で約 2.6 cm）を注入。
   → `calibrate_camera_optical_offset.py` が `[0.012, -0.009, 0.021]` を復元します。
@@ -321,7 +341,7 @@ python3 -m pytest test_csv_compat.py -q
 
 1. `AR-hook1.py` の CSV ヘッダー = 本ファイルの列一覧 = `make_dummy_csv.CSV_HEADER`（順序込み）
 2. 列名が `^[A-Za-z0-9_]+$` を満たし、重複が無い
-3. 生成したダミー CSV が 170 列で全行同じ要素数、全フィールドが `float()` で読める
+3. 生成したダミー CSV が 173 列で全行同じ要素数、全フィールドが `float()` で読める
 4. 追加列（`Attitude_*` / `Target_*`）が存在し、`0/1`・`nan` の両方の値を含む
 5. `calibrate_camera_optical_offset.py`（motive / ardupilot）が例外なく完走し、
    注入した光学中心オフセットを復元する
@@ -362,12 +382,12 @@ cd AR-hook
 python3 test_csv_compat.py --csv ~/LOGS_Pixhawk6c/20261118_120000_1.csv
 ```
 
-現在のスキーマ（170 列）と一致しないログは FAIL します。これは
+現在のスキーマ（173 列）と一致しないログは FAIL します。これは
 「列の削除・改名・順序変更が起きた」ことを検知するための仕様です。
 
 ## 8. 追加列が実飛行ログで値が入るかの確認観点
 
-追加 14 列が「実ログで欠損しないか」「意味どおりの値か」を確認する観点です。
+追加 17 列が「実ログで欠損しないか」「意味どおりの値か」を確認する観点です。
 現時点で実飛行ログが無いため、**7.2 のダミー検証まで実施済み**、以下はベンチ／実機で
 確認する項目として列挙します。
 
@@ -420,9 +440,9 @@ python3 test_csv_compat.py --csv ~/LOGS_Pixhawk6c/20261118_120000_1.csv
    （＝レート制限が効いている）。
 2. `Target_Drone_*` のフレーム間差分が 0.0125 m 以下であること
    （`simulate_target_limits.py` と同じ上限）。
-3. 追加 14 列の `nan` 率が 1% 未満であること（`Target_Limit_Invalid` の行を除く）。
-4. CSV の列数が 170、行数が「記録時間 × 40 Hz」にほぼ一致すること
-   （追加列の書き忘れがあると列数が 170 にならない）。
+3. 追加 17 列の `nan` 率が 1% 未満であること（`Target_Limit_Invalid` の行と、未計算の `Auto_Start_Dist_m` を除く）。
+4. CSV の列数が 173、行数が「記録時間 × 40 Hz」にほぼ一致すること
+   （追加列の書き忘れがあると列数が 173 にならない）。
 5. `Target_Update_Source` が `camera` 以外になる時間帯が、操作・ロストの時間と一致すること。
 
 ### 8.4 判定の目安
@@ -437,6 +457,7 @@ python3 test_csv_compat.py --csv ~/LOGS_Pixhawk6c/20261118_120000_1.csv
 | 日付 | 内容 |
 |---|---|
 | 2026-11-18 | 初版。統合後 170 列のスキーマ文書化、`make_dummy_csv.py` と `test_csv_compat.py` の追加、後方互換ルールと実ログ確認観点を記載 |
+| 2026-11-25 | 離陸後の自動移動（`AR_HOOK_AUTO_START`）の 3 列を末尾に追加（173 列）。`Auto_Start_Phase` / `Auto_Start_Elapsed_s` / `Auto_Start_Dist_m` |
 
 ### 検証結果（2026-11-18 時点）
 

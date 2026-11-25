@@ -285,6 +285,30 @@ NaN などの異常計測では前回目標を維持する。
 
 ---
 
+### 1.10 離陸後の自動移動（`AR_HOOK_AUTO_START`）
+
+**既定は無効**（`AR_HOOK_AUTO_START=0`）。無効時は `auto_start_update()` が常に
+`False` を返し、`target` も setpoint も変更しません（従来どおり離陸後すぐカメラ追従）。
+
+有効時（`AR_HOOK_AUTO_START=1`）の条件・中断条件・タイムアウト:
+
+| 項目 | 内容 |
+|---|---|
+| 開始条件 | GUIDED + 確定 armed を検出（`TAKEOFF_WAIT`）、離陸高度到達（`AUTO_TO_START`） |
+| 目標 | `EXPERIMENT_START_LAT/LON`（既定 `36.0757693, 136.2132945`）と、離陸地点から `EXPERIMENT_START_HEIGHT_ABOVE_TAKEOFF`（既定 1.10 m） |
+| 更新経路 | `auto_start_update()` → `commit_target_command(source="auto_start")` → `send_local_target()`。クランプ（水平 1.20 m / 上 0.30 m / 下 0.20 m）とレート制限（0.50 m/s）を必ず通す |
+| カメラ抑止 | `TAKEOFF_WAIT` 〜 `ARRIVED` はカメラ経路の `target` 更新と setpoint 送信を抑止（理由は CSV の `Auto_Start_Phase`） |
+| 到着判定 | 水平距離 ≤ `AR_HOOK_AUTO_START_ARRIVE_XY_M`（0.15 m）**かつ** 高さ差 ≤ `AR_HOOK_AUTO_START_ARRIVE_Z_M`（0.10 m）を `AR_HOOK_AUTO_START_ARRIVE_FRAMES`（2）フレーム連続。到着ログは 1 回だけ |
+| タイムアウト | `AR_HOOK_AUTO_START_TIMEOUT_S`（30 秒）。超過時は `TIMEOUT` へ移り、移動を中止して現在の目標を保持（警告 1 回）。**降下・着陸・モード変更は送らない** |
+| 中断条件 | GUIDED 解除 / disarm / リンク切断 / `running=False`。検出した時点で `ABORTED` へ移り、以後は移動しない。既存の送信停止・終了処理（CSV 保存）を優先する |
+| 再進入 | GUIDED を外して再び GUIDED+armed になると `TAKEOFF_WAIT` からやり直す（既存の再離陸と同じ） |
+
+- 実装は `AR-hook1.py` の `auto_start_on_guided_armed()` /
+  `auto_start_on_takeoff_reached()` / `auto_start_update()` / `auto_start_abort()` に集約。
+- モード遷移要求（GUIDED への変更要求）・arm/disarm・着陸指令は一切送りません。
+- 机上検証は `test_auto_start.py`（ハードウェア不要）と
+  `verify_sitl.py --only auto_start`（ArduPilot SITL）で行います。
+
 ## 2. 注入試験（ハード無しで自動化）
 
 **実行**:
