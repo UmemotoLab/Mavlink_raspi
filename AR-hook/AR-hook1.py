@@ -1483,6 +1483,108 @@ def aruco_ids_to_list(ids):
             continue
     return result
 
+# ───── ArUco 検出 API の互換層（OpenCV 4.6 / 4.7+ / 5.x 共通） ─────
+# 理由: 実機 Raspberry Pi 5 / Debian 12 の `sudo apt install python3-opencv` は
+#   OpenCV 4.6 系で、4.7 で追加された `cv2.aruco.ArucoDetector` と
+#   `cv2.aruco.DetectorParameters()` が存在しません（実測:
+#   hasattr(cv2.aruco, "ArucoDetector") は False）。4.6 では
+#   `aruco.detectMarkers(img, dictionary, parameters=...)` と
+#   `aruco.DetectorParameters_create()` を使います。
+#   旧実装は `aruco.ArucoDetector(dictionary, params)` を直接生成していたため、
+#   カメラ復旧後の追跡ループで AttributeError になっていました。
+#   バージョン差の吸収はこの 1 箇所に集約し、呼び出し側は常に
+#   `(corners, ids, rejected)` を受け取ります（ids は aruco_ids_to_list() へ）。
+ARUCO_API_DETECTOR = "ArucoDetector (OpenCV 4.7+)"
+ARUCO_API_LEGACY = "detectMarkers (OpenCV 4.6 互換)"
+
+
+def aruco_create_detector_params(aruco_module=None):
+    """ArUco の検出パラメータを生成する（4.7+ / 4.6 両対応）。
+
+    `aruco.DetectorParameters()` が使えればそれを使い、無ければ
+    4.6 の `aruco.DetectorParameters_create()` にフォールバックします。
+    戻り値は (params, 生成に使った API 名)。どちらも無ければ AttributeError。
+    """
+    module = aruco if aruco_module is None else aruco_module
+    factory = getattr(module, "DetectorParameters", None)
+    if callable(factory):
+        return factory(), "DetectorParameters"
+    legacy_factory = getattr(module, "DetectorParameters_create", None)
+    if callable(legacy_factory):
+        return legacy_factory(), "DetectorParameters_create"
+    raise AttributeError(
+        "ArUco のパラメータ生成 API（DetectorParameters / "
+        "DetectorParameters_create）が見つかりません"
+    )
+
+
+def _aruco_normalize_detection(result):
+    """ArUco の検出結果を常に (corners, ids, rejected) の 3 要素へ正規化する。
+
+    4.7+ の ArucoDetector.detectMarkers() も 4.6 の aruco.detectMarkers() も
+    3 要素を返しますが、実装差で 2 要素（corners, ids）の場合も例外にせず
+    rejected を空リストで補います。
+    """
+    if result is None:
+        return [], None, []
+    try:
+        corners, ids, rejected = result
+    except (TypeError, ValueError):
+        try:
+            corners, ids = result
+        except (TypeError, ValueError):
+            raise TypeError(
+                "ArUco の検出結果を (corners, ids, rejected) として解釈できません"
+            )
+        rejected = []
+    return corners, ids, rejected
+
+
+def build_aruco_detector(aruco_module=None):
+    """ArUco の辞書・パラメータ・検出関数を組み立てる（OpenCV 4.6 / 4.7+ 両対応）。
+
+    戻り値: (detect, params, dictionary, api_label)
+      detect(img) -> (corners, ids, rejected)
+
+    * 辞書は両 API 共通の `getPredefinedDictionary(DICT_4X4_50)` を使う。
+    * `ArucoDetector` があれば `ArucoDetector(dictionary, params).detectMarkers(img)`、
+      無ければ `aruco.detectMarkers(img, dictionary, parameters=params)` を使う。
+    * corner refinement の設定値は従来と同じ（既定値を変えない）。
+    """
+    module = aruco if aruco_module is None else aruco_module
+    if module is None:
+        raise RuntimeError("cv2.aruco が利用できません（OpenCV 未導入の環境）")
+
+    dictionary = module.getPredefinedDictionary(module.DICT_4X4_50)
+    params, _params_api = aruco_create_detector_params(module)
+    # 既存の corner refinement 設定（しきい値・既定値）は変更しない。
+    params.cornerRefinementMethod = module.CORNER_REFINE_SUBPIX
+    params.cornerRefinementWinSize = 5
+    params.cornerRefinementMaxIterations = 30
+    params.cornerRefinementMinAccuracy = 0.1
+
+    detector_factory = getattr(module, "ArucoDetector", None)
+    if callable(detector_factory):
+        detector = detector_factory(dictionary, params)
+
+        def detect(image):
+            return _aruco_normalize_detection(detector.detectMarkers(image))
+
+        return detect, params, dictionary, ARUCO_API_DETECTOR
+
+    legacy_detect = getattr(module, "detectMarkers", None)
+    if not callable(legacy_detect):
+        raise AttributeError(
+            "ArUco の検出 API（ArucoDetector / detectMarkers）が見つかりません"
+        )
+
+    def detect(image):
+        return _aruco_normalize_detection(
+            legacy_detect(image, dictionary, parameters=params)
+        )
+
+    return detect, params, dictionary, ARUCO_API_LEGACY
+
 # ───── 状態監視スレッド ─────
 # ATTITUDE を 40Hz 要求で受けるため、監視ループは 5ms 周期（200Hz）で回す。
 # 5ms は 40Hz の 25ms 周期に対して十分細かく、姿勢の取り込み遅れを数msに抑える。
@@ -1893,15 +1995,31 @@ def camera_tracker_loop(comm, show_window=False, stream_enabled=False):
     else:
         print("⚠ camera_params.npz が見つかりません。デフォルトのキャリブレーション値を使用します。")
     # ArUcoディテクタの設定
-    dictionary = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
-
-    params = aruco.DetectorParameters()
-    params.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
-    params.cornerRefinementWinSize = 5
-    params.cornerRefinementMaxIterations = 30
-    params.cornerRefinementMinAccuracy = 0.1
-
-    detector = aruco.ArucoDetector(dictionary, params)
+    # ✅ OpenCV 4.6（Debian 12 の python3-opencv）と 4.7+ / 5.x の API 差は
+    #    build_aruco_detector() が吸収します（理由は同関数の直前のコメント）。
+    #    4.7+ は ArucoDetector、4.6 は detectMarkers を使い、戻り値は常に
+    #    (corners, ids, rejected) です。
+    try:
+        detect_markers, _aruco_params, _aruco_dictionary, aruco_api_label = (
+            build_aruco_detector()
+        )
+    except (AttributeError, RuntimeError) as exc:
+        cv2_version = getattr(cv2, "__version__", "unknown")
+        print(f"❌ ArUco ディテクタを初期化できません: {exc}")
+        print(
+            f"   OpenCV {cv2_version} の ArUco API を確認してください"
+            "（対応: 4.6〜5.x）。マーカー追跡ループを開始しません。"
+        )
+        if cap is not None:
+            cap.release()
+        if picam2 is not None:
+            try:
+                picam2.stop()
+            except Exception:
+                pass
+        return
+    # 起動時にどちらの API を使っているかを 1 行だけ記録する（実機の版確認用）。
+    print(f"ArUco: {aruco_api_label}")
     print("✓ マーカー追跡ループを開始します（中心ID: {}, 正方形頂点ID: {}）...".format(ID_CENTER_MARKER, SQUARE_MARKER_IDS))
     last_print_time = time.monotonic()
     fps_window_started = last_print_time
@@ -1953,8 +2071,9 @@ def camera_tracker_loop(comm, show_window=False, stream_enabled=False):
                 time.sleep(0.01)
                 continue
             fps_frame_count += 1
-            # マーカー検出
-            corners, ids, rejected = detector.detectMarkers(img)
+            # マーカー検出（OpenCV 4.6 の detectMarkers / 4.7+ の ArucoDetector を
+            # build_aruco_detector() が吸収済み。戻り値は常に 3 要素）
+            corners, ids, rejected = detect_markers(img)
             # ids の形状は OpenCV 4.x の (N,1) と 5.x の (N,) で異なるため、
             # 形状非依存ヘルパに集約する（None / 0 件検出は []）。
             detected_ids = aruco_ids_to_list(ids)
