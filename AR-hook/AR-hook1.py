@@ -1519,6 +1519,10 @@ def monitor_vehicle(comm):
             last_heartbeat_seq = state.heartbeat_seq
             hb = state.heartbeat
             if hb:
+                # state.guided / state.armed は通信部が確定した値（既定 2 連続フレーム）。
+                # 単発の破損フレーム（偽 armed）では立ち上がらない。生値は
+                # state.armed_raw / state.guided_raw で参照できる。
+                # 離陸カウントの開始もこの確定値だけで行う。
                 is_guided = state.guided
                 new_armed = state.armed
                 guided_mode_active = is_guided  # ← 状態を記録用に更新

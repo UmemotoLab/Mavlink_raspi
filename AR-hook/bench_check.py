@@ -8,8 +8,10 @@
 安全条件（本ツールが守ること）
   * アームしない / モード変更しない / 離陸指令（MAV_CMD_NAV_TAKEOFF）を送らない。
   * GUIDED へのモード変更要求を一切送らない（GUIDED にするのは統合プログラム）。
-  * HEARTBEAT で armed を検出したら即座に計測を中止する（setpoint も送らない）。
+  * HEARTBEAT で **確定 armed**（既定 2 連続フレーム。単発の偽 armed は無視）を
+    検出したら即座に計測を中止する（setpoint も送らない）。
   * 機体が GUIDED のときは setpoint を送らない（受信計測のみ）。
+  * HEARTBEAT は自機（srcSystem==1）かつ許容 component（既定 {1,0}）だけを採用する。
   * setpoint 送信は既定で無効。実機では --send-setpoints を明示したときだけ送る。
   * 送信する可能性があるのは次の 2 種類だけ:
       - MAV_CMD_SET_MESSAGE_INTERVAL（受信周期の要求。--no-request-intervals で無効化）
@@ -50,6 +52,7 @@
     python3 bench_check.py --simulate --duration 5 --csv /tmp/bench_sim.csv
     python3 bench_check.py --simulate --duration 5 --mode compare
     python3 bench_check.py --simulate --simulate-faults --duration 5   # 不合格判定の確認
+    python3 bench_check.py --simulate --sim-armed-spike --duration 3   # 偽 armed を無視する確認
 
 終了コード
     0: 実行した全項目が PASS
@@ -73,9 +76,12 @@ from pymavlink import mavutil
 
 ARHOOK_DIR = os.path.dirname(os.path.abspath(__file__))
 if ARHOOK_DIR not in sys.path:
-    # MODE_NAMES / GUIDED_CUSTOM_MODE を本番実装と共有する（接続は開かない）。
+    # 偽 armed 対策の送信元フィルタ／確定を本番実装と共有する（接続は開かない）。
     sys.path.insert(0, ARHOOK_DIR)
-from mavlink_comm import GUIDED_CUSTOM_MODE, MODE_NAMES  # noqa: E402
+from mavlink_comm import (  # noqa: E402
+    HeartbeatTracker,
+    is_allowed_heartbeat_source,
+)
 
 VERSION = "1.0"
 
@@ -445,7 +451,7 @@ class SimMaster:
 
     def __init__(self, heartbeat_hz=1.0, gpi_hz=5.0, gps_hz=5.0,
                  attitude_hz=40.0, simulate_faults=False, armed=False,
-                 send_latency_s=0.001):
+                 armed_spike=False, send_latency_s=0.001):
         self.target_system = 1
         self.target_component = 1
         self.mav = SimMav(self)
@@ -458,6 +464,10 @@ class SimMaster:
             "ATTITUDE": float(attitude_hz),
         }
         self._armed = bool(armed)
+        # 2 フレーム目だけ armed=True を 1 回注入する（偽 armed の自己テスト）。
+        # 確定には 2 連続が必要なので、計測は中止されないのが正しい。
+        self._armed_spike = bool(armed_spike)
+        self._heartbeat_count = 0
         self._faults = bool(simulate_faults)
         self._send_latency_s = max(0.0, float(send_latency_s))
         self._next = {}
@@ -484,7 +494,7 @@ class SimMaster:
         if "HEARTBEAT" in self._next:
             # 接続時の 1 件は受信スレッド開始前に消費されるのでカウントしない。
             self._next["HEARTBEAT"] += 1.0 / self._rates["HEARTBEAT"]
-        return self._heartbeat_message()
+        return self._next_heartbeat_message()
 
     def begin_measurement(self):
         """ウォームアップ後に呼ばれる。故障注入の時刻基準をリセットする。"""
@@ -540,9 +550,19 @@ class SimMaster:
                 return None
             time.sleep(0.002)
 
-    def _heartbeat_message(self):
+    def _next_heartbeat_message(self):
+        """次の HEARTBEAT を返す（--sim-armed-spike は 2 フレーム目だけ armed）。"""
+        self._heartbeat_count += 1
+        armed = self._armed
+        if self._armed_spike and self._heartbeat_count == 2:
+            armed = True
+        return self._heartbeat_message(armed=armed)
+
+    def _heartbeat_message(self, armed=None):
+        if armed is None:
+            armed = self._armed
         base_mode = (
-            mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED if self._armed else 0
+            mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED if armed else 0
         )
         return SimMessage(
             "HEARTBEAT", base_mode=base_mode, custom_mode=0,
@@ -551,7 +571,7 @@ class SimMaster:
 
     def _message(self, name):
         if name == "HEARTBEAT":
-            return self._heartbeat_message()
+            return self._next_heartbeat_message()
         if name == "GLOBAL_POSITION_INT":
             return SimMessage(
                 "GLOBAL_POSITION_INT", time_boot_ms=0,
@@ -590,69 +610,85 @@ class SafetyMonitor:
     """HEARTBEAT から armed / モードを監視する（読み取りはどのスレッドからでも可）。
 
     armed を検出したら送信スレッドと計測を止める。モード変更は一切しない。
-    GCS などコンポーネント ID が 1 以外の HEARTBEAT は無視する。
+    送信元フィルタと武装判定は通信部（mavlink_comm.HeartbeatTracker）と共通で、
+    自機（srcSystem==1）かつ許容コンポーネント（既定 {1, 0}、環境変数
+    ARHOOK_HB_ALLOWED_COMPONENTS）の HEARTBEAT だけを採用する。
+    単発の破損フレームで停止しないよう、armed は既定 2 連続フレームで確定する
+    （ARHOOK_HB_CONFIRM_FRAMES）。
     """
 
-    def __init__(self):
+    def __init__(self, allowed_components=None, confirm_frames=None,
+                 logger=print):
         self._lock = threading.Lock()
-        self._armed = False
-        self._custom_mode = None
-        self._mode_name = "UNKNOWN"
-        self._vehicle_heartbeats = 0
+        self._logger = logger
+        self._tracker = HeartbeatTracker(
+            allowed_components=allowed_components,
+            confirm_frames=confirm_frames,
+        )
         self._last_update_at = 0.0
 
+    @property
+    def allowed_components(self):
+        return self._tracker.allowed_components
+
     def update_from_heartbeat(self, message):
-        try:
-            component = int(message.get_srcComponent())
-        except Exception:
-            component = 1
-        if component != 1:
-            return
-        base_mode = int(getattr(message, "base_mode", 0) or 0)
-        custom_mode = getattr(message, "custom_mode", None)
-        armed = bool(
-            base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
-        )
-        try:
-            custom_mode = int(custom_mode)
-        except (TypeError, ValueError):
-            custom_mode = None
-        if custom_mode is None:
-            mode_name = "UNKNOWN"
-        else:
-            mode_name = MODE_NAMES.get(custom_mode, str(custom_mode))
         with self._lock:
-            self._armed = armed
-            self._custom_mode = custom_mode
-            self._mode_name = mode_name
-            self._vehicle_heartbeats += 1
-            self._last_update_at = time.monotonic()
+            update = self._tracker.update(message, now=time.monotonic())
+            if update.accepted:
+                self._last_update_at = time.monotonic()
+        if update.log_line and self._logger is not None:
+            self._logger(update.log_line)
 
     @property
     def armed(self):
+        """確定 armed（既定 2 連続フレーム）。"""
         with self._lock:
-            return self._armed
+            return self._tracker.armed
+
+    @property
+    def armed_raw(self):
+        with self._lock:
+            return self._tracker.armed_raw
 
     @property
     def guided(self):
         with self._lock:
-            return self._custom_mode == GUIDED_CUSTOM_MODE
+            return self._tracker.guided
+
+    @property
+    def guided_raw(self):
+        with self._lock:
+            return self._tracker.guided_raw
 
     @property
     def mode_name(self):
         with self._lock:
-            return self._mode_name
+            return self._tracker.mode_name
+
+    @property
+    def mode_name_confirmed(self):
+        with self._lock:
+            return self._tracker.mode_name_confirmed
 
     @property
     def vehicle_heartbeats(self):
         with self._lock:
-            return self._vehicle_heartbeats
+            return self._tracker.accepted_heartbeats
+
+    @property
+    def rejected_heartbeats(self):
+        with self._lock:
+            return self._tracker.rejected_heartbeats
 
     def status_text(self):
         with self._lock:
             return (
-                f"armed={self._armed} mode={self._mode_name} "
-                f"heartbeats={self._vehicle_heartbeats}"
+                f"armed={self._tracker.armed} mode={self._tracker.mode_name} "
+                f"heartbeats={self._tracker.accepted_heartbeats}"
+                + (
+                    f" rejected={self._tracker.rejected_heartbeats}"
+                    if self._tracker.rejected_heartbeats else ""
+                )
             )
 
 
@@ -750,7 +786,8 @@ class SetpointSender(threading.Thread):
                 self.gate.abort("armed detected (safety stop)")
                 self.stop_event.set()
                 break
-            if self.safety.guided:
+            # GUIDED は生値でも送信を止める（安全側。確定待ちの 1 秒間も送らない）。
+            if getattr(self.safety, "guided_raw", self.safety.guided):
                 self.gate.abort("GUIDED detected (setpoint stop)")
                 self.stop_event.set()
                 break
@@ -797,6 +834,7 @@ class BenchRunner:
                 attitude_hz=self.args.sim_attitude_hz,
                 simulate_faults=self.args.simulate_faults,
                 armed=self.args.sim_armed,
+                armed_spike=self.args.sim_armed_spike,
                 send_latency_s=self.args.sim_send_latency_ms / 1000.0,
             )
             self.master = self.sim
@@ -807,6 +845,12 @@ class BenchRunner:
                 f"GPS_RAW_INT {self.args.sim_gps_hz:g}Hz / "
                 f"HEARTBEAT {self.args.sim_heartbeat_hz:g}Hz)"
             )
+            if self.args.sim_armed_spike:
+                print(
+                    "[simulate] 2 フレーム目に armed を 1 回だけ注入します"
+                    f"（確定 {self.safety._tracker.confirm_frames} 連続に満たないため"
+                    " 計測は中止されないのが正しい）"
+                )
         else:
             print(
                 f"MAVLink 接続: {self.args.device} "
@@ -839,10 +883,11 @@ class BenchRunner:
         print(f"✓ 接続完了: {self.safety.status_text()}")
 
     def _wait_vehicle_heartbeat(self, timeout):
-        """機体（component ID 1）の HEARTBEAT を待つ。
+        """自機（srcSystem==1・許容 component）の HEARTBEAT を待つ。
 
-        GCS など他コンポーネントの HEARTBEAT は target ID の決定に使わない。
-        タイムアウトした場合は None を返す。
+        通信部（MavlinkComm.connect）と同じ送信元フィルタを使う。
+        GCS など他システム・他コンポーネントの HEARTBEAT は target ID の決定にも
+        状態更新にも使わない。タイムアウトした場合は None を返す。
         """
         deadline = time.monotonic() + max(0.0, float(timeout))
         while True:
@@ -852,14 +897,15 @@ class BenchRunner:
             heartbeat = self.master.wait_heartbeat(timeout=remaining)
             if heartbeat is None:
                 return None
-            getter = getattr(heartbeat, "get_srcComponent", None)
-            component = getter() if callable(getter) else 1
-            try:
-                component = int(component)
-            except (TypeError, ValueError):
-                component = 1
-            if component == 1:
+            if is_allowed_heartbeat_source(
+                heartbeat, self.safety.allowed_components
+            ):
                 return heartbeat
+            print(
+                "⚠ 自機以外の HEARTBEAT を無視します: "
+                f"src={heartbeat.get_srcSystem()}/{heartbeat.get_srcComponent()} "
+                f"(許容 component={sorted(self.safety.allowed_components)})"
+            )
 
     def _apply_target_ids(self, heartbeat):
         master = self.master
@@ -1497,7 +1543,8 @@ def resolve_setpoint_policy(runner, args):
         raise SafetyAbort(
             "機体が armed です。アームを解除してください（計測を中止）。"
         )
-    if runner.safety.guided:
+    # GUIDED は生値でも送信しない（安全側。確定待ちの間も動かさない）。
+    if getattr(runner.safety, "guided_raw", runner.safety.guided):
         return (
             f"機体が {runner.safety.mode_name} のため setpoint を送信しません"
             "（受信のみ計測。モード変更は行いません）"
@@ -1664,6 +1711,9 @@ def build_parser():
                         help="--simulate 時に例外・タイムアウト・BAD_DATA を注入する")
     parser.add_argument("--sim-armed", action="store_true",
                         help="自己テスト用: armed の HEARTBEAT を流す（安全停止の確認）")
+    parser.add_argument("--sim-armed-spike", action="store_true",
+                        help="自己テスト用: armed を 1 フレームだけ注入する"
+                             "（2 連続確定に満たないため計測が中止されないことを確認）")
     parser.add_argument("--sim-attitude-hz", type=float, default=40.0,
                         help="シミュレーションの ATTITUDE Hz")
     parser.add_argument("--sim-gpi-hz", type=float, default=5.0,
@@ -1694,6 +1744,10 @@ def parse_args(argv=None):
         parser.error("--simulate-faults は --simulate と一緒に使ってください")
     if args.sim_armed and not args.simulate:
         parser.error("--sim-armed は --simulate と一緒に使ってください")
+    if args.sim_armed_spike and not args.simulate:
+        parser.error("--sim-armed-spike は --simulate と一緒に使ってください")
+    if args.sim_armed and args.sim_armed_spike:
+        parser.error("--sim-armed と --sim-armed-spike は同時に指定できません")
     if not 0.0 <= args.lock_ratio_tolerance < 1.0:
         parser.error("--lock-ratio-tolerance は 0 以上 1 未満にしてください")
     if args.lock_abs_tolerance_hz < 0:

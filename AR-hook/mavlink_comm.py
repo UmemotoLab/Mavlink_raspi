@@ -30,6 +30,7 @@
     comm.setpoint(lat_e7, lon_e7, alt_m, yaw_rad=0.0, type_mask=0x09F8)
     comm.stop()                           # 停止要求 → 受信スレッド join → close
 """
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -46,6 +47,17 @@ DEFAULT_LINK_TIMEOUT_S = 3.0        # この秒数メッセージが来なけれ
 DEFAULT_TYPE_MASK = 0x09F8          # SET_POSITION_TARGET_GLOBAL_INT の type_mask
 DEFAULT_YAW_RAD = 0.0               # 目標 Yaw（北向き固定）
 GUIDED_CUSTOM_MODE = 4              # ArduCopter の GUIDED モード番号
+
+# ───── HEARTBEAT の送信元フィルタ / 武装判定の確定（偽 armed 対策） ─────
+# 破損フレームが HEARTBEAT として復号されると、SAFETY_ARMED ビットが立った
+# 「偽 armed」に見えることがある（実機ベンチで観測）。1 フレームで armed を
+# 確定すると意図しない自動離陸につながるため、送信元を限定し、armed / guided は
+# 既定で 2 連続フレーム同じ値を観測したときに確定する。
+VEHICLE_SYSTEM_ID = 1                  # 自機（Pixhawk）の MAVLink system ID
+DEFAULT_ALLOWED_COMPONENTS = (1, 0)    # 1=Pixhawk、0=一部ファームの慣例
+DEFAULT_CONFIRM_FRAMES = 2             # armed / guided の確定に必要な連続フレーム数
+ENV_HB_ALLOWED_COMPONENTS = "ARHOOK_HB_ALLOWED_COMPONENTS"
+ENV_HB_CONFIRM_FRAMES = "ARHOOK_HB_CONFIRM_FRAMES"
 
 # ArduCopter のモード番号 → 名前（EKF/point_to_point_flight.py と同じ表）
 MODE_NAMES = {
@@ -94,10 +106,17 @@ class MavlinkState:
     attitude: Optional[object] = None
     attitude_seq: int = 0
     attitude_age_s: float = float("nan")
-    custom_mode: Optional[int] = None
-    mode_name: str = "UNKNOWN"
-    armed: bool = False
-    guided: bool = False
+    custom_mode: Optional[int] = None          # 最新の採用フレーム（raw）
+    mode_name: str = "UNKNOWN"                  # 最新の採用フレーム（raw）
+    custom_mode_confirmed: Optional[int] = None # 連続確認で確定したモード
+    mode_name_confirmed: str = "UNKNOWN"
+    armed: bool = False                         # 確定 armed（既定 2 連続）
+    armed_raw: bool = False                     # 直近の採用フレームの armed
+    guided: bool = False                        # 確定 guided（custom_mode==4）
+    guided_raw: bool = False                    # 直近の採用フレームの guided
+    heartbeat_src_system: Optional[int] = None
+    heartbeat_src_component: Optional[int] = None
+    rejected_heartbeats: int = 0                # 送信元が許容外で無視した件数
     link_lost: bool = False
     last_error: Optional[BaseException] = None
     rx_count: int = 0
@@ -114,6 +133,283 @@ def _age_seconds(now: float, timestamp: float) -> float:
     if not timestamp:
         return float("nan")
     return max(0.0, now - timestamp)
+
+
+# ───── HEARTBEAT の送信元フィルタ / 武装確定 ─────
+
+def parse_allowed_components(raw=None) -> frozenset:
+    """許容する HEARTBEAT の srcComponent 集合を返す。
+
+    Args:
+        raw: カンマ区切りの文字列、または数値の集合。None なら環境変数
+            ARHOOK_HB_ALLOWED_COMPONENTS を読む。
+    不正な要素は無視し、有効な要素が 1 つも無ければ既定 {1, 0} に戻す。
+    （安全側に倒すため、誤設定で許容集合を広げない）
+    """
+    if raw is None:
+        raw = os.environ.get(ENV_HB_ALLOWED_COMPONENTS, "")
+    if isinstance(raw, (set, frozenset, list, tuple)):
+        values = list(raw)
+    else:
+        values = str(raw).split(",")
+    allowed = []
+    for value in values:
+        if isinstance(value, bool):
+            continue
+        try:
+            component = int(str(value).strip(), 10)
+        except (TypeError, ValueError):
+            continue
+        if component < 0:
+            continue
+        if component not in allowed:
+            allowed.append(component)
+    if not allowed:
+        return frozenset(DEFAULT_ALLOWED_COMPONENTS)
+    return frozenset(allowed)
+
+
+def parse_confirm_frames(raw=None) -> int:
+    """armed / guided の確定に必要な連続フレーム数を返す（既定 2）。
+
+    None なら環境変数 ARHOOK_HB_CONFIRM_FRAMES を読む。不正値・1 未満は既定へ戻す。
+    """
+    if raw is None:
+        raw = os.environ.get(ENV_HB_CONFIRM_FRAMES, "")
+    try:
+        frames = int(str(raw).strip(), 10)
+    except (TypeError, ValueError):
+        return DEFAULT_CONFIRM_FRAMES
+    return frames if frames >= 1 else DEFAULT_CONFIRM_FRAMES
+
+
+def heartbeat_source(message):
+    """HEARTBEAT の (srcSystem, srcComponent) を返す。取得できなければ (None, None)。"""
+    def _read(getter_name):
+        getter = getattr(message, getter_name, None)
+        if not callable(getter):
+            return None
+        try:
+            return int(getter())
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+    return _read("get_srcSystem"), _read("get_srcComponent")
+
+
+def is_allowed_heartbeat_source(message, allowed_components=None,
+                                system_id=VEHICLE_SYSTEM_ID) -> bool:
+    """自機（srcSystem==1）かつ許容コンポーネントの HEARTBEAT かどうか。"""
+    allowed = (
+        parse_allowed_components(allowed_components)
+        if allowed_components is not None
+        else parse_allowed_components()
+    )
+    system, component = heartbeat_source(message)
+    if system != int(system_id) or component is None:
+        return False
+    return component in allowed
+
+
+def heartbeat_armed(message) -> bool:
+    """HEARTBEAT の SAFETY_ARMED ビット（生値）。"""
+    base_mode = int(getattr(message, "base_mode", 0) or 0)
+    return bool(base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+
+
+def heartbeat_custom_mode(message):
+    """HEARTBEAT の custom_mode（int 化できなければ None）。"""
+    try:
+        return int(getattr(message, "custom_mode", None))
+    except (TypeError, ValueError):
+        return None
+
+
+def mode_name_for(custom_mode) -> str:
+    """custom_mode → モード名。"""
+    if custom_mode is None:
+        return "UNKNOWN"
+    return MODE_NAMES.get(custom_mode, str(custom_mode))
+
+
+@dataclass(frozen=True)
+class HeartbeatUpdate:
+    """HEARTBEAT 1 件を反映した結果（遷移時は 1 行ログ付き）。"""
+
+    accepted: bool
+    armed_changed: bool = False
+    mode_changed: bool = False
+    log_line: str = ""
+
+
+class HeartbeatTracker:
+    """HEARTBEAT の送信元フィルタと armed / guided の確定（ヒステリシス）。
+
+    - 採用条件: `srcSystem == 1` かつ `srcComponent` が許容集合（既定 {1, 0}）。
+      許容外の HEARTBEAT は armed / custom_mode / モード名を一切更新しない。
+    - 確定条件: armed / guided（custom_mode）は `confirm_frames` 連続の採用フレームで
+      同じ値を観測したときに確定する（既定 2）。単発のスパイクでは反転しない。
+    - `custom_mode` / `mode_name` は最新の採用フレーム（raw）、`armed_raw` /
+      `guided_raw` は生値を公開する（ログ・事後解析用）。
+    - モード名は確定前でも raw を返す（表示用）。離陸判定に使う `guided` は確定値。
+
+    スレッド安全ではありません。呼び出し側のロック内で update() を呼んでください。
+    """
+
+    def __init__(self, allowed_components=None, confirm_frames=None,
+                 system_id=VEHICLE_SYSTEM_ID):
+        self.system_id = int(system_id)
+        self.allowed_components = parse_allowed_components(allowed_components)
+        self.confirm_frames = parse_confirm_frames(confirm_frames)
+
+        # 確定値
+        self.armed = False
+        self._custom_mode_confirmed = None
+        # 最新の採用フレーム（raw）
+        self.custom_mode = None
+        self._armed_raw = False
+        # 送信元（最後に採用したフレーム）
+        self.src_system = None
+        self.src_component = None
+        self.base_mode = 0
+        # カウンタ・診断
+        self.accepted_heartbeats = 0
+        self.rejected_heartbeats = 0
+        self.last_rejection = ""
+        self._heartbeat_at = 0.0
+        # 連続確認の候補
+        self._armed_candidate = None
+        self._armed_candidate_count = 0
+        self._mode_candidate = None
+        self._mode_candidate_count = 0
+
+    # ── 参照 ──
+    @property
+    def mode_name(self) -> str:
+        return mode_name_for(self.custom_mode)
+
+    @property
+    def armed_raw(self) -> bool:
+        return self._armed_raw
+
+    @property
+    def custom_mode_confirmed(self):
+        return self._custom_mode_confirmed
+
+    @property
+    def mode_name_confirmed(self) -> str:
+        return mode_name_for(self._custom_mode_confirmed)
+
+    @property
+    def guided(self) -> bool:
+        return self._custom_mode_confirmed == GUIDED_CUSTOM_MODE
+
+    @property
+    def guided_raw(self) -> bool:
+        return self.custom_mode == GUIDED_CUSTOM_MODE
+
+    def _confirm(self, value, candidate, count, confirmed):
+        """連続確認の状態遷移（value が count 回続いたら confirmed を更新）。"""
+        if count > 0 and value == candidate:
+            count += 1
+        else:
+            candidate, count = value, 1
+        if count >= self.confirm_frames:
+            confirmed = value
+        return candidate, count, confirmed
+
+    def update(self, message, now=None, heartbeat_age_s=None) -> HeartbeatUpdate:
+        """HEARTBEAT 1 件を反映する（許容外は無視する）。
+
+        Args:
+            message: HEARTBEAT メッセージ。
+            now: 受信時刻（monotonic）。省略時は time.monotonic()。
+            heartbeat_age_s: ログ用の「直前の採用フレームからの経過秒」。
+                省略時は now と前回採用時刻から求める。
+        """
+        if not is_allowed_heartbeat_source(
+            message, self.allowed_components, self.system_id
+        ):
+            system, component = heartbeat_source(message)
+            self.rejected_heartbeats += 1
+            self.last_rejection = f"src={system}/{component}"
+            return HeartbeatUpdate(accepted=False)
+
+        if now is None:
+            now = time.monotonic()
+        if heartbeat_age_s is None:
+            heartbeat_age_s = (
+                now - self._heartbeat_at
+                if self._heartbeat_at
+                else float("nan")
+            )
+
+        raw_armed = heartbeat_armed(message)
+        raw_mode = heartbeat_custom_mode(message)
+        src_system, src_component = heartbeat_source(message)
+        base_mode = int(getattr(message, "base_mode", 0) or 0)
+
+        before_armed = self.armed
+        before_mode = self._custom_mode_confirmed
+        before_armed_raw = self._armed_raw
+        before_mode_raw = self.custom_mode
+        had_previous = self.accepted_heartbeats > 0
+        (self._armed_candidate, self._armed_candidate_count,
+         self.armed) = self._confirm(
+            raw_armed, self._armed_candidate, self._armed_candidate_count,
+            self.armed,
+        )
+        (self._mode_candidate, self._mode_candidate_count,
+         self._custom_mode_confirmed) = self._confirm(
+            raw_mode, self._mode_candidate, self._mode_candidate_count,
+            self._custom_mode_confirmed,
+        )
+
+        self._armed_raw = raw_armed
+        self.custom_mode = raw_mode
+        self.src_system, self.src_component = src_system, src_component
+        self.base_mode = base_mode
+        self._heartbeat_at = now
+        self.accepted_heartbeats += 1
+
+        armed_changed = self.armed != before_armed
+        mode_changed = self._custom_mode_confirmed != before_mode
+        raw_armed_changed = had_previous and raw_armed != before_armed_raw
+        raw_mode_changed = had_previous and raw_mode != before_mode_raw
+        log_line = ""
+        if armed_changed or mode_changed:
+            log_line = (
+                "HB遷移: "
+                f"armed {before_armed}->{self.armed} "
+                f"mode {mode_name_for(before_mode)}({before_mode})->"
+                f"{self.mode_name_confirmed}({self._custom_mode_confirmed}) "
+                f"sys={src_system} comp={src_component} "
+                f"base_mode=0x{base_mode:02X} custom_mode={raw_mode} "
+                f"armed_raw={raw_armed} guided_raw={self.guided_raw} "
+                f"heartbeat_age_s={heartbeat_age_s:.3f} "
+                f"confirm={self.confirm_frames}"
+            )
+        elif raw_armed_changed or raw_mode_changed:
+            # 確定値は変わらないが生値が動いた（偽 armed 等の切り分け用）。
+            log_line = (
+                "HB生値: "
+                f"armed={self.armed} armed_raw {before_armed_raw}->{raw_armed} "
+                f"mode {mode_name_for(before_mode_raw)}({before_mode_raw})->"
+                f"{self.mode_name}({raw_mode}) "
+                f"confirm_mode={self.mode_name_confirmed}"
+                f"({self._custom_mode_confirmed}) "
+                f"sys={src_system} comp={src_component} "
+                f"base_mode=0x{base_mode:02X} custom_mode={raw_mode} "
+                f"guided_raw={self.guided_raw} "
+                f"heartbeat_age_s={heartbeat_age_s:.3f} "
+                f"confirm={self.confirm_frames}"
+            )
+        return HeartbeatUpdate(
+            accepted=True,
+            armed_changed=armed_changed,
+            mode_changed=mode_changed,
+            log_line=log_line,
+        )
 
 
 class MavlinkComm:
@@ -138,6 +434,8 @@ class MavlinkComm:
         connection_factory=None,
         on_link_lost=None,
         logger=print,
+        allowed_components=None,
+        confirm_frames=None,
     ):
         """通信部を生成する（この時点ではシリアルを開かない）。
 
@@ -152,6 +450,10 @@ class MavlinkComm:
                 省略時は mavutil.mavlink_connection。単体テストでは fake を注入する。
             on_link_lost: リンク切断時に 1 回だけ呼ばれるコールバック（例外を引数に取る）。
             logger: ログ出力関数（既定 print）。
+            allowed_components: HEARTBEAT の許容 srcComponent（既定 {1, 0}）。
+                省略時は環境変数 ARHOOK_HB_ALLOWED_COMPONENTS（カンマ区切り）。
+            confirm_frames: armed / guided の確定に必要な連続フレーム数（既定 2）。
+                省略時は環境変数 ARHOOK_HB_CONFIRM_FRAMES。
         """
         self.device = device
         self.baud = baud
@@ -163,6 +465,12 @@ class MavlinkComm:
         self._connection_factory = connection_factory or _default_connection_factory
         self._on_link_lost = on_link_lost
         self._logger = logger
+
+        # HEARTBEAT の送信元フィルタと armed / guided の確定（偽 armed 対策）。
+        # 再接続時に作り直せるよう、コンストラクタ引数を保持しておく。
+        self._allowed_components = allowed_components
+        self._confirm_frames = confirm_frames
+        self._heartbeat_tracker = self._new_heartbeat_tracker()
 
         # ── 接続・スレッド ──
         self._master = None
@@ -200,6 +508,13 @@ class MavlinkComm:
         self._last_error = None
         self._link_lost_notified = False
 
+    def _new_heartbeat_tracker(self):
+        """HEARTBEAT フィルタ／確定器を生成する。"""
+        return HeartbeatTracker(
+            allowed_components=self._allowed_components,
+            confirm_frames=self._confirm_frames,
+        )
+
     # ──────────────────────────────────────────
     #  接続 / 停止
     # ──────────────────────────────────────────
@@ -231,10 +546,11 @@ class MavlinkComm:
         self._master = master
         self._logger(
             "ハートビート信号を待機中 "
-            f"(タイムアウト: {self.heartbeat_timeout_s:g}秒)..."
+            f"(タイムアウト: {self.heartbeat_timeout_s:g}秒, "
+            f"許容 component={sorted(self._heartbeat_tracker.allowed_components)})..."
         )
         try:
-            heartbeat = master.wait_heartbeat(timeout=self.heartbeat_timeout_s)
+            heartbeat = self._wait_vehicle_heartbeat(master)
         except Exception as exc:
             self._master = None
             self._close_master(master)
@@ -247,21 +563,60 @@ class MavlinkComm:
             self._close_master(master)
             error = MavlinkTimeoutError(
                 "ハートビートの受信タイムアウト: Pixhawkからの応答がありません"
+                f"（自機 srcSystem={VEHICLE_SYSTEM_ID} / 許容 component="
+                f"{sorted(self._heartbeat_tracker.allowed_components)} の"
+                "HEARTBEAT を待ちました）"
             )
             self._record_error(error)
             raise error
 
         self._apply_target_ids(heartbeat)
         # 再接続時に備えて異常状態をリセットする（初回接続では既に初期値）。
+        # 武装判定も作り直し、前回接続の確定値を引き継がない。
         with self._state_lock:
             self._link_lost = False
             self._link_lost_notified = False
             self._last_error = None
+            self._heartbeat_tracker = self._new_heartbeat_tracker()
+            self._heartbeat = None
+            self._heartbeat_seq = 0
+            self._heartbeat_at = 0.0
+            self._custom_mode = None
+            self._mode_name = "UNKNOWN"
+            self._armed = False
         self._handle_message(heartbeat)
         self._logger(
             "✓ MAVLink接続完了 "
-            f"(System ID: {self.target_system}, Component ID: {self.target_component})"
+            f"(System ID: {self.target_system}, Component ID: {self.target_component}, "
+            f"HEARTBEAT src={self._heartbeat_tracker.src_system}/"
+            f"{self._heartbeat_tracker.src_component})"
         )
+
+    def _wait_vehicle_heartbeat(self, master):
+        """自機（srcSystem==1・許容 component）の HEARTBEAT を待つ。
+
+        他システム・他コンポーネント（GCS 等）の HEARTBEAT は target ID の決定にも
+        状態更新にも使わない。タイムアウトした場合は None を返す。
+        """
+        deadline = time.monotonic() + max(0.0, float(self.heartbeat_timeout_s))
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            heartbeat = master.wait_heartbeat(timeout=remaining)
+            if heartbeat is None:
+                return None
+            if is_allowed_heartbeat_source(
+                heartbeat, self._heartbeat_tracker.allowed_components
+            ):
+                return heartbeat
+            self._logger(
+                "⚠ 自機以外の HEARTBEAT を無視します: "
+                f"src={heartbeat_source(heartbeat)} "
+                f"(許容 component={sorted(self._heartbeat_tracker.allowed_components)})"
+            )
+            # fake 接続が即座に同じフレームを返し続けても busy loop にしない。
+            time.sleep(min(0.01, max(0.0, remaining)))
 
     def start(self):
         """受信スレッドを 1 本だけ開始する。"""
@@ -354,23 +709,24 @@ class MavlinkComm:
         """
         msg_type = message.get_type() if hasattr(message, "get_type") else ""
         now = time.monotonic()
+        transition_log = ""
         with self._state_lock:
+            # 受信カウント・リンク監視は全メッセージで更新する（現行仕様を維持）。
             self._rx_count += 1
             self._last_rx_at = now
             if msg_type == "HEARTBEAT":
-                self._heartbeat = message
-                self._heartbeat_seq += 1
-                self._heartbeat_at = now
-                custom_mode = getattr(message, "custom_mode", None)
-                self._custom_mode = custom_mode
-                if custom_mode is None:
-                    self._mode_name = "UNKNOWN"
-                else:
-                    self._mode_name = MODE_NAMES.get(custom_mode, str(custom_mode))
-                base_mode = getattr(message, "base_mode", 0) or 0
-                self._armed = bool(
-                    base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
-                )
+                # 送信元フィルタと armed / guided の確定は HeartbeatTracker に集約。
+                # 許容外の HEARTBEAT はここで捨て、armed / mode を汚さない。
+                update = self._heartbeat_tracker.update(message, now=now)
+                if update.accepted:
+                    self._heartbeat = message
+                    self._heartbeat_seq += 1
+                    self._heartbeat_at = now
+                    self._custom_mode = self._heartbeat_tracker.custom_mode
+                    self._mode_name = self._heartbeat_tracker.mode_name
+                    self._armed = self._heartbeat_tracker.armed
+                if update.log_line:
+                    transition_log = update.log_line
             elif msg_type == "GLOBAL_POSITION_INT":
                 self._position = message
                 self._position_seq += 1
@@ -379,6 +735,9 @@ class MavlinkComm:
                 self._attitude = message
                 self._attitude_seq += 1
                 self._attitude_at = now
+        # ログ出力は状態ロックの外で行う（受信スレッドを I/O で止めない）。
+        if transition_log:
+            self._logger(transition_log)
 
     def snapshot(self):
         """最新値キャッシュのスナップショットを返す（読み取り専用）。"""
@@ -396,8 +755,17 @@ class MavlinkComm:
                 attitude_age_s=_age_seconds(now, self._attitude_at),
                 custom_mode=self._custom_mode,
                 mode_name=self._mode_name,
+                custom_mode_confirmed=(
+                    self._heartbeat_tracker.custom_mode_confirmed
+                ),
+                mode_name_confirmed=self._heartbeat_tracker.mode_name_confirmed,
                 armed=self._armed,
-                guided=self._custom_mode == GUIDED_CUSTOM_MODE,
+                armed_raw=self._heartbeat_tracker.armed_raw,
+                guided=self._heartbeat_tracker.guided,
+                guided_raw=self._heartbeat_tracker.guided_raw,
+                heartbeat_src_system=self._heartbeat_tracker.src_system,
+                heartbeat_src_component=self._heartbeat_tracker.src_component,
+                rejected_heartbeats=self._heartbeat_tracker.rejected_heartbeats,
                 link_lost=self._link_lost,
                 last_error=self._last_error,
                 rx_count=self._rx_count,
@@ -580,13 +948,26 @@ class MavlinkComm:
 
     @property
     def is_armed(self):
+        """確定 armed（既定 2 連続フレーム）。生値は is_armed_raw。"""
         with self._state_lock:
-            return self._armed
+            return self._heartbeat_tracker.armed
+
+    @property
+    def is_armed_raw(self):
+        """直近の採用フレームの armed（ログ・切り分け用）。"""
+        with self._state_lock:
+            return self._heartbeat_tracker.armed_raw
 
     @property
     def is_guided(self):
+        """確定 guided（custom_mode が 2 連続で 4）。生値は is_guided_raw。"""
         with self._state_lock:
-            return self._custom_mode == GUIDED_CUSTOM_MODE
+            return self._heartbeat_tracker.guided
+
+    @property
+    def is_guided_raw(self):
+        with self._state_lock:
+            return self._heartbeat_tracker.guided_raw
 
     @property
     def mode_name(self):

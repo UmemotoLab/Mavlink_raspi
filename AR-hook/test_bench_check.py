@@ -142,13 +142,34 @@ def test_lock_comparison_detects_overlap_and_passes_throughput():
 
 
 def test_armed_heartbeat_aborts_without_sending():
+    """継続的な armed は 2 連続で確定し、計測を中止する（exit 2）。
+
+    武装判定にヒステリシス（既定 2 連続）が入ったため、接続時の 1 フレーム目
+    では確定せず、受信スレッドが 2 件目を取り込んだ時点で中止する。
+    """
     phases, _criteria, exit_code, output = run_quiet([
-        "--simulate", "--sim-armed", "--duration", "2", "--warmup", "0",
+        "--simulate", "--sim-armed", "--duration", "3", "--warmup", "0",
     ])
     assert exit_code == 2, output
-    assert phases == [], phases
+    assert len(phases) <= 1, phases
+    if phases:
+        assert phases[0].safety_abort_reason, phases[0]
+        assert phases[0].duration_s < 3.0, phases[0].duration_s
     assert "安全停止" in output
     assert "armed" in output
+
+
+def test_armed_spike_is_ignored_by_hysteresis():
+    """単発の armed スパイク（1 フレーム）では計測を中止しない（偽 armed 対策）。"""
+    phases, criteria, exit_code, output = run_quiet([
+        "--simulate", "--sim-armed-spike", "--duration", "3", "--warmup", "0",
+    ])
+    assert exit_code == 0, output
+    assert len(phases) == 1, phases
+    assert phases[0].safety_abort_reason == "", phases[0]
+    assert all(c.status == bench_check.STATUS_PASS for c in criteria), [
+        (c.key, c.status) for c in criteria
+    ]
 
 
 def test_no_setpoints_are_skipped():

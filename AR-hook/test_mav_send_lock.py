@@ -116,11 +116,17 @@ def _load_mavlink_comm_module():
 
 # ───── 模擬 MAVLink 接続 ─────
 def _fake_heartbeat():
-    """MavlinkComm.connect() が要求する最小限の HEARTBEAT。"""
+    """MavlinkComm.connect() が要求する最小限の HEARTBEAT。
+
+    通信部は偽 armed 対策で送信元（srcSystem==1 / 許容 component）を検査するため、
+    実機の pymavlink メッセージと同じ getter を持たせる。
+    """
     return types.SimpleNamespace(
         custom_mode=0,
         base_mode=0,
         get_type=lambda: "HEARTBEAT",
+        get_srcSystem=lambda: 1,
+        get_srcComponent=lambda: 1,
     )
 
 

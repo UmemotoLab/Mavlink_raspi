@@ -207,7 +207,7 @@ def wait_until(predicate, timeout=2.0, interval=0.01):
 
 def test_connect_opens_serial_once():
     """connect() を 2 回呼んでも接続生成は 1 回だけ。"""
-    master = FakeMaster(heartbeat=make_heartbeat())
+    master = FakeMaster(heartbeat=make_heartbeat(), messages=[make_heartbeat()])
     factory = FakeFactory(master)
     comm = MavlinkComm(
         "fake-device", baud=115200, rtscts=False,
@@ -218,10 +218,18 @@ def test_connect_opens_serial_once():
     assert len(factory.calls) == 1, factory.calls
     assert factory.calls[0] == ("fake-device", 115200, False), factory.calls
     assert master.wait_heartbeat_calls == 1, master.wait_heartbeat_calls
-    # 接続時の HEARTBEAT も最新値キャッシュへ入る
+    # 接続時の HEARTBEAT も最新値キャッシュへ入る。ただし armed / guided は
+    # 既定 2 連続フレームで確定するため、1 フレーム目ではまだ立たない。
     state = comm.snapshot()
     assert state.heartbeat_seq == 1, state
     assert state.mode_name == "GUIDED", state
+    assert state.armed is False, state
+    assert state.armed_raw is True, state
+    assert state.guided is False, state
+    assert state.guided_raw is True, state
+    comm.start()
+    assert wait_until(lambda: comm.snapshot().heartbeat_seq >= 2), comm.snapshot()
+    state = comm.snapshot()
     assert state.armed is True, state
     assert state.guided is True, state
     assert comm.target_system == 1, comm.target_system

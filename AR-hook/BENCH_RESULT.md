@@ -3,8 +3,9 @@
 - 対象: `AR-hook/`（統合タスク完了後の状態） + 追加ツール `bench_check.py`
 - 目的: 実機搭載前に、配線・接続・受信周期・送信スループットを地上で実測する
 - 実施日時: 2026-11-18 16:15 JST（シミュレーション自己テスト）
-- 実機計測: **未実施（NOT RUN）**。この作業環境に Raspberry Pi / Pixhawk / 機体が無いため。
-  実機の数値は本ドキュメントの手順で取得し、下表の「未測定」を埋めること。
+- 実機計測: 本文 §2 の表はシミュレーション結果で、実機の再計測は **未実施（NOT RUN）**。
+  この作業環境に Raspberry Pi / Pixhawk / 機体が無いため。実機ベンチで観測された
+  レート・BAD_DATA・偽 armed 事象は **§7** に追記しています（§7 の再計測項目は NOT RUN）。
 
 ## 0. 安全条件（厳守）
 
@@ -283,3 +284,96 @@ python3 bench_check.py --device /dev/ttyAMA0 --duration 30 --warmup 3
 4. 終了コードと判定表を確認。FAIL があれば §5 の切り分けを実施。
 5. `--mode compare` を短時間（20 秒程度）で実行し、ロック前後の差を記録。
 6. 結果（日時・環境・実測値・合否・再現コマンド）を本書の §2.4 に追記する。
+
+## 7. 実機ベンチ追記（2026-11-25 / 偽 armed 事象と判定の堅牢化）
+
+条件: Raspberry Pi + Pixhawk、`/dev/ttyAMA0` / 1,000,000 bps / RTS-CTS、プロペラ外し・
+機体固定・disarmed・非 GUIDED。`bench_check.py` は送信ロック有効（本番と同じ経路）。
+本節の数値は実機ベンチでの観測記録で、再計測（下記 7.5）は **NOT RUN** です。
+
+### 7.1 受信レート（合格）
+
+| 種別 | 実測 | 基準 | 判定 |
+|---|---|---|---|
+| ATTITUDE (30) | 39.86〜40.00 Hz | ≥ 30 Hz（要求 40 Hz） | PASS（要求達成） |
+| GLOBAL_POSITION_INT (33) | 4.97〜5.00 Hz | 4〜6 Hz | PASS |
+| HEARTBEAT (0) | 1.00 Hz | ≥ 1 Hz | PASS |
+
+`dmesg` の overrun は 0 件、`/proc/tty/driver/ttyAMA` の `brk` は 12 で増加なし。
+
+### 7.2 BAD_DATA（初回のみ 7 件、以降 4/4 で 0 件）
+
+- 初回 30 秒: **BAD_DATA 7 件**（Bad prefix 6 + CRC 1）。
+- 同一条件の反復 3 回 + `--no-rtscts` 1 回: **4/4 で BAD_DATA 0 件（再現せず）**。
+- 受信レートは上記のとおり全回で良好。overrun 0、`brk` 増加なし。
+
+→ 常時発生する配線不良ではなく、**起動直後のポートが荒れた時間帯（SIGKILL された多重起動の
+直後）に限定した事象**と判断しています。再現性は未確認です。
+
+### 7.3 f1: 偽 armed による安全停止（推定原因）
+
+反復 1 回目（SIGKILL された多重起動の直後、ポートが荒れた時間帯）に、`bench_check.py` が
+**12.02 秒で「armed 検出」として安全停止（exit 2）**しました。しかし同時刻までの実測
+HEARTBEAT は **61 件すべて `sys=1` / `comp=1` / `base_mode=0x51` / `custom_mode=2`
+（ALT_HOLD, disarmed）**で、armed は一度も観測されていません。
+
+推定原因:
+- 破損フレーム（Bad prefix / CRC と同時刻）が comp=1 の HEARTBEAT として復号され、
+  `SAFETY_ARMED` ビットが立った **偽 armed** として 1 フレームだけ見えた。
+- 旧実装は HEARTBEAT の送信元を検査せず、**1 フレームで armed を確定**していた。
+- 過去に「comp 0」と報告された件は、60 秒の直接計測では再現せず、
+  `mavutil` の `target_component=0` との混同の可能性が高い。
+
+重大性: `AR-hook1.monitor_vehicle` は armed の立ち上がり + GUIDED で 3 秒後に
+`MAV_CMD_NAV_TAKEOFF` を送るため、偽 armed（+ 偽 GUIDED）で**意図しない自動離陸**に
+つながり得ます。今回、通信部とベンチで判定を次のように統一・強化しました（詳細は
+[FAILSAFE_CHECKLIST.md](./FAILSAFE_CHECKLIST.md) §1.3.1）。
+
+- `srcSystem == 1` を必須、`srcComponent` は許容集合（既定 `{1, 0}`、
+  `ARHOOK_HB_ALLOWED_COMPONENTS` で変更）。
+- armed / guided は既定 **2 連続フレーム**で確定（`ARHOOK_HB_CONFIRM_FRAMES`）。
+  生値は `armed_raw` / `guided_raw` として保持し、遷移時に
+  `sys / comp / base_mode(hex) / custom_mode / heartbeat_age_s` を 1 行ログ出力。
+- `AR-hook1.monitor_vehicle` は確定 armed + 確定 GUIDED のみで離陸カウントを開始。
+- `bench_check.SafetyMonitor` も同じ `HeartbeatTracker` を使用。確定 armed での中止
+  （exit 2）は維持。単発スパイクでは止まらない。
+
+### 7.4 合否基準の提案（実機の許容）
+
+実測と再現性を踏まえ、実機ベンチの許容基準を次で運用することを提案します。
+
+> **BAD_DATA ≤ 10 件 / 30 秒 かつ 受信レート合格**
+> （ATTITUDE ≥ 30 Hz、GPI 4〜6 Hz、HEARTBEAT ≥ 1 Hz、送信ロック経路で例外・競合 0）
+
+初回 7 件は許容内ですが、**連続して発生する場合・armed 遷移ログが出る場合は不合格**として
+配線（GND・終端・ケーブル長・EMI）と多重起動の有無を確認してください。偽 armed は
+遷移ログの `armed_raw=True` と `armed` の不一致、または `BAD_DATA` との同時刻で特定できます。
+
+### 7.5 未実施（NOT RUN）
+
+以下は本作業環境に実機が無いため **NOT RUN** です。実機で確認するまで「偽 armed 対策済み」と
+断定しないでください。
+
+- 対策後の実機ベンチ再計測（BAD_DATA・レート・遷移ログの実出力）
+- 実機リンクへの偽 armed 注入（破損フレームの再現、または GCS からの偽 HEARTBEAT）
+- f1 の再現性確認（同一手順・多重起動直後を含む）
+- 「comp 0」報告の再確認（60 秒以上の直接計測）
+- 長時間（30 分以上）の EMI・ケーブル揺動を含む連続計測
+
+### 7.6 自己テスト（ハードウェア不要 / 実行済み）
+
+- `python3 AR-hook/bench_check.py --simulate --duration 2` → **PASS 5 / FAIL 0**（exit 0）
+- `python3 AR-hook/bench_check.py --simulate --sim-armed-spike --duration 3 --warmup 0`
+  → **PASS 5 / FAIL 0**（exit 0）。2 フレーム目に armed を 1 回だけ注入しても、
+  2 連続確定に満たないため安全停止しないことを確認。
+- `python3 AR-hook/bench_check.py --simulate --sim-armed --duration 3 --warmup 0`
+  → **exit 2（安全停止）**。継続 armed は 2 連続で確定して中止する。
+- `test_armed_hardening.py` → 17/17 PASS（送信元 comp 1 / 0 / 2 / srcSystem 2、
+  単発 armed / 2 連続 armed / disarmed 方向、破損混在、遷移ログ・生値ログ、
+  AR-hook1 の偽 armed 非離陸）。
+- `pytest -q -p no:cacheprovider --ignore=archive` → 128 passed（既存 110 + 新規 18。
+  内訳: `test_armed_hardening.py` 17 件 + `test_bench_check.py` の spike 自己テスト 1 件）。
+- `./run_sitl_verify.sh`（実 ArduPilot SITL Copter、`~/ardupilot`）→ **6/6 PASS**
+  （takeoff / f6152 / 7f03b / 9c2a5 / 12794 / disarm）。armed / guided の確定を 2 連続に
+  しても、自動離陸は GUIDED+armed 検出から **3.002 秒後に 1 回だけ**（NAV_TAKEOFF 0.5 m）。
+  ログ: `~/arhook_sitl_logs/run_sitl_verify_20261125_094844/`。**実機での確認は NOT RUN**。

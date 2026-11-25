@@ -79,6 +79,8 @@ GUIDED 以外で setpoint を送らない要件に対し、**キーボード操�
   - GUIDED のみ 4 秒 → 離陸 0 回
   - GUIDED + armed → 3.0 秒超の最初の HEARTBEAT で 1 回だけ（3.0 < t ≤ 3.2）
   - 途中から GUIDED + armed → その検出時刻から 3 秒後に 1 回だけ
+- **armed / guided は確定値（既定 2 連続フレーム）を使う**（1.3.1）。単発の偽 armed では
+  離陸カウントを開始しない（`test_armed_hardening.py`）。
 - 注意: 判定は HEARTBEAT の `seq` 変化時だけ行うため、離陸指令は最大 1 HEARTBEAT 周期だけ遅れる。
   `set_msg_rate()`（L1001-1011）は 24/33/30 のみ要求し、HEARTBEAT 周期は要求していない。
 
@@ -103,6 +105,46 @@ GUIDED 以外で setpoint を送らない要件に対し、**キーボード操�
   - `record_data()` を 1 行動かし `save_csv()` → ヘッダーと行の列数一致、
     `Attitude_Age_ms` / `Attitude_Stale` / `Target_Hold_Active` / `Target_Update_Source` 等を確認
 - 注意: CSV はプロセス終了時の一括保存。電源断・`kill -9` では失われる（下記 5.6）。
+
+### 1.3.1 武装判定の仕様（送信元フィルタ・連続数・遷移ログ）
+
+**背景**: 実機ベンチで、破損フレーム（BAD prefix / CRC）と同時刻に armed が見えた事象
+（f1）が 1 回発生した。`bench_check.py` は 12.02 秒で「armed 検出」として安全停止したが、
+実際の HEARTBEAT 61 件はすべて disarmed（`base_mode=0x51`, `custom_mode=2`）だった。
+破損フレームが comp=1 の HEARTBEAT として復号され、SAFETY_ARMED ビットが立った
+**偽 armed** が原因と推定している。1 フレームで armed を確定すると、GUIDED と同時に
+成立した場合に 3 秒後の自動離陸（要件 1.2）へ進むため、次の 3 点で判定を堅牢化した。
+
+| 項目 | 仕様 | 実装 |
+|---|---|---|
+| 送信元 system | `srcSystem == 1`（自機）を必須 | `mavlink_comm.HeartbeatTracker` / `is_allowed_heartbeat_source()` |
+| 送信元 component | 許容集合で判定。既定 `{1, 0}`（0 は一部ファームの慣例）。環境変数 `ARHOOK_HB_ALLOWED_COMPONENTS`（カンマ区切り）で変更 | 同上 |
+| 許容外の HEARTBEAT | armed / custom_mode / モード名を**更新しない**。受信カウントとリンク監視（`rx_count` / `last_rx_at`）は従来どおり全メッセージで更新 | `MavlinkComm._handle_message` |
+| armed / guided の確定 | 既定 **2 連続フレーム**で同じ値を観測したときに確定。`ARHOOK_HB_CONFIRM_FRAMES` で変更（1 以上） | `HeartbeatTracker._confirm()` |
+| 生値（raw） | `armed_raw` / `guided_raw` / `custom_mode`（最新採用フレーム）を別途保持。確定値は `armed` / `guided` / `custom_mode_confirmed` | `MavlinkState` |
+| 遷移ログ | 確定 armed / 確定モードが変化したとき 1 行で `sys / comp / base_mode(hex) / custom_mode / heartbeat_age_s` 等を出力。確定しない生値の変化（偽 armed スパイク等）も `HB生値:` で 1 行残す | `HeartbeatTracker.update()` の `log_line` |
+| 接続時 | 自機の HEARTBEAT が来るまで待つ（`connect()`）。他システム・他コンポーネントの HEARTBEAT は target ID にも状態にも使わない | `MavlinkComm._wait_vehicle_heartbeat()` |
+
+遷移ログの例（1 行）:
+
+```text
+HB遷移: armed False->True mode UNKNOWN(None)->GUIDED(4) sys=1 comp=1 base_mode=0x80 custom_mode=4 armed_raw=True guided_raw=True heartbeat_age_s=1.000 confirm=2
+```
+
+`heartbeat_age_s` は「直前の採用フレームからの経過秒」で、1.0 秒前後なら正常、
+極端に小さい値は重複・バースト、大きい値は受信欠落の手がかりになる。
+
+**適用範囲（方針の統一）**
+
+| 利用側 | 実装 | 備考 |
+|---|---|---|
+| 本番 `AR-hook1.py` | `MavlinkComm.snapshot()` の `armed` / `guided`（確定値）だけを離陸判定に使用 | `monitor_vehicle()`。raw は使わない |
+| ベンチ `bench_check.py` | `SafetyMonitor` が同じ `HeartbeatTracker` を使用 | 確定 armed で計測中止（exit 2）は維持。単発スパイクでは止まらない |
+
+**自動試験**（`test_armed_hardening.py`, 17 件）:
+送信元 comp 1 / comp 0 / comp 2（許容外）/ srcSystem 2（許容外）、単発 armed スパイク、
+2 連続 armed、disarmed 方向の 2 連続、破損（BAD_DATA）と正常の混在、遷移ログの項目、
+`bench_check.SafetyMonitor` の同一フィルタ、`AR-hook1.monitor_vehicle` の偽 armed 非離陸。
 
 ### 1.4 姿勢 stale で自動追従が止まり、目標保持、警告は毎秒 1 回
 
