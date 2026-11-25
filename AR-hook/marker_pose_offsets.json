@@ -1,44 +1,47 @@
 {
   "schema_version": 1,
-  "transform_definition": "T_motive_rigid_body_from_ar_marker_group; position in meters, quaternion active Hamilton xyzw",
-  "source_csv": "20261021_152442_1.csv",
+  "transform_definition": "T_motive_rigid_body_from_ar_marker_group; position in meters, quaternion active Hamilton xyzw; translations jointly calibrated with camera optical offset",
+  "source_csvs": [
+    "20261104_123538_1.csv"
+  ],
   "max_time_delta_ms": 100.0,
+  "camera_extrinsics_file": "camera_extrinsics.json",
   "transforms": {
     "hand": {
       "motive_rigid_body_id": 1,
       "translation_m": [
-        0.11607027091534845,
-        0.05406031293335051,
-        -0.032652007539511946
+        -0.0330318229280805,
+        0.007908148488952991,
+        0.019714313492778347
       ],
       "quaternion_xyzw": [
-        0.7175622819818664,
-        0.6631422835949707,
-        -0.19606568285897913,
-        0.08309591560640045
+        0.6774518778334941,
+        0.7120515345186167,
+        -0.052042089806578776,
+        -0.17701182530588083
       ],
-      "sample_count": 2676,
-      "inlier_count": 2459,
-      "translation_rmse_m": 0.03627951252320207,
-      "rotation_rmse_deg": 17.7044345988674
+      "sample_count": 5681,
+      "inlier_count": 5010,
+      "joint_fit_rmse_m": 0.026657125206313737,
+      "rotation_rmse_deg": 18.11250695949958
     },
     "cargo": {
       "motive_rigid_body_id": 2,
       "translation_m": [
-        0.15767895184565073,
-        -0.0018877774772452138,
-        -0.04798048708676781
+        -0.06868406674079765,
+        0.03315419390214961,
+        0.06143119096004781
       ],
       "quaternion_xyzw": [
-        0.7073698480696582,
-        0.6890700441300782,
-        -0.09755522644337025,
-        -0.12366628529257025
+        0.6997897970451423,
+        0.7121190715195429,
+        0.03418617513527479,
+        -0.044855026020314576
       ],
-      "sample_count": 3590,
-      "inlier_count": 2824,
-      "translation_rmse_m": 0.07037169921215197,
-      "rotation_rmse_deg": 5.073139148978188
+      "sample_count": 5030,
+      "inlier_count": 3827,
+      "joint_fit_rmse_m": 0.026657125206313737,
+      "rotation_rmse_deg": 3.9293444261077717
     }
   }
 }

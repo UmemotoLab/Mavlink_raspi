@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "definition": "Motive camera rigid-body origin to OpenCV optical origin",
+  "camera_optical_offset_cv_m": [
+    0.006323792592454255,
+    -0.08288616528353439,
+    -0.00032698369035802366
+  ],
+  "coordinate_frame": "OpenCV camera (x right, y down, z forward)",
+  "camera_mount_direction": "down",
+  "calibrated_targets": [
+    "Hand",
+    "Cargo"
+  ],
+  "sample_count": 10711,
+  "inlier_count": 7900,
+  "translation_rmse_m": 0.026657125206313737,
+  "design_condition_number": 9.288273244639235,
+  "source_csvs": [
+    "20261104_123538_1.csv"
+  ]
+}
