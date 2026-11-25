@@ -6,6 +6,7 @@ Motive→ArduPilot GPS送信ブリッジ（15Hz定期送信版）
 - ラズパイ5対応の高精度タイミング制御
 """
 
+import os
 import socket
 import struct
 import math
@@ -13,6 +14,56 @@ import time
 import threading
 from datetime import datetime
 from pymavlink import mavutil
+
+# TELEM1 (ArduPilot SERIAL1_PROTOCOL=2, SERIAL1_BAUD=1000000) の接続先。
+# Raspberry Pi 5 + dtparam=uart0=on では /dev/ttyAMA0 が GPIO14(TXD0)/15(RXD0)。
+# 環境変数で上書きできる（例: ARHOOK_TELEM_DEVICE=/dev/ttyACM0）。
+TELEM_DEVICE = os.environ.get("ARHOOK_TELEM_DEVICE", "/dev/ttyAMA0")
+TELEM_BAUD = int(os.environ.get("ARHOOK_TELEM_BAUD", "1000000"))
+HEARTBEAT_TIMEOUT_SEC = float(os.environ.get("ARHOOK_HEARTBEAT_TIMEOUT", "10"))
+
+
+def _optional_int_env(name):
+    """環境変数を任意の整数として読む（未設定・不正値は None）。"""
+    raw = os.environ.get(name, "").strip()
+    if raw == "":
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"⚠ 環境変数 {name}={raw!r} は整数ではないため無視します")
+        return None
+
+
+# 送信する剛体ID。未設定なら最後に受信したIDをそのまま送る（従来動作）。
+TARGET_RIGID_BODY_ID = _optional_int_env("ARHOOK_RIGID_BODY_ID")
+
+
+# ArduPilot は GPS_INPUT の yaw=0 を「ヨー不明」として無視する
+# (AP_GPS_MAV.cpp: bool have_yaw = (packet.yaw != 0))。
+# そのため真北 0° は 36000 cdeg (=360°) として送る。受信側は
+# wrap_360(36000 * 0.01) = 0° とするので、意味は変わらない。
+GPS_YAW_UNKNOWN_CDEG = 0
+GPS_YAW_NORTH_CDEG = 36000
+
+
+def encode_gps_input_yaw_cdeg(yaw_cdeg):
+    """GPS_INPUT の yaw を ArduPilot が「ヨーあり」と判定する値に変換する。
+
+    Args:
+        yaw_cdeg: Motive の NED ヨー [cdeg]。None はヨー不明。
+
+    Returns:
+        0〜35999 cdeg。ただし 0° は 36000 に置き換える（0 は不明扱いのため）。
+        yaw_cdeg が None のときだけ 0（ヨー不明）を返す。
+    """
+    if yaw_cdeg is None:
+        return GPS_YAW_UNKNOWN_CDEG
+    wrapped = int(round(float(yaw_cdeg))) % 36000
+    if wrapped == 0:
+        return GPS_YAW_NORTH_CDEG
+    return wrapped
+
 
 class ArduPilotConnector:
     def __init__(self):
@@ -25,13 +76,21 @@ class ArduPilotConnector:
     def connect_to_autopilot(self):
         """ArduPilotに接続"""
         try:
-            print("ArduPilot接続開始...")
+            print(f"ArduPilot接続開始... ({TELEM_DEVICE} @ {TELEM_BAUD}bps)")
             print("telem1通信接続")
-            self.master = mavutil.mavlink_connection('/dev/ttyAMA0', 1000000, rtscts=True)
-            
-            print("Heartbeat待機中...")
-            self.master.wait_heartbeat()
-            
+            self.master = mavutil.mavlink_connection(
+                TELEM_DEVICE, TELEM_BAUD, rtscts=True
+            )
+
+            print(f"Heartbeat待機中... (最大{HEARTBEAT_TIMEOUT_SEC:.0f}s)")
+            heartbeat = self.master.wait_heartbeat(timeout=HEARTBEAT_TIMEOUT_SEC)
+            if heartbeat is None:
+                raise TimeoutError(
+                    f"Heartbeat未受信: {TELEM_DEVICE}。配線(TX/RXクロス・GND)と"
+                    "SERIAL1_BAUD/SERIAL1_PROTOCOLを確認してください。"
+                    "Pi5では /dev/ttyAMA0 が GPIO14(TXD0)/15(RXD0) です。"
+                )
+
             self.target_system = self.master.target_system
             self.target_component = self.master.target_component
             
@@ -58,6 +117,11 @@ class ArduPilotConnector:
                 
         except Exception as e:
             print(f"ArduPilot接続失敗: {e}")
+            if self.master is not None:
+                try:
+                    self.master.close()
+                except Exception:
+                    pass
             self.master = None
             return False
     
@@ -67,7 +131,7 @@ class ArduPilotConnector:
             return False
         
         try:
-            yaw_cdeg = int(yaw_cdeg) if yaw_cdeg is not None else 0
+            yaw_cdeg = encode_gps_input_yaw_cdeg(yaw_cdeg)
 
             # Unix時刻 → GPS週/ミリ秒 変換
             # 315964800 = Unix秒差 (1970-01-01 → 1980-01-06), +18 = 閏秒補正
@@ -253,6 +317,22 @@ def motive_to_ardupilot_bridge_15hz():
     print("=" * 60)
     print("Motive to ArduPilot Bridge (15Hz定期送信)")
     print("=" * 60)
+    print(
+        "ℹ 注意: ArduPilotはGPS_INPUTのyaw=0を「ヨー不明」として扱います。"
+        "そのため真北0°は36000 cdeg (360°) に変換して送信します。"
+    )
+    print(
+        f"ℹ TELEM1: {TELEM_DEVICE} @ {TELEM_BAUD}bps "
+        f"(Heartbeat timeout {HEARTBEAT_TIMEOUT_SEC:.0f}s)"
+    )
+    if TARGET_RIGID_BODY_ID is None:
+        print(
+            "ℹ 注意: 剛体IDでフィルタしていません。"
+            "複数IDを受信すると最後に受信したIDの位置・yawを送信します。"
+            "固定するには環境変数 ARHOOK_RIGID_BODY_ID を指定してください。"
+        )
+    else:
+        print(f"ℹ 剛体ID {TARGET_RIGID_BODY_ID} のデータのみ送信します。")
     
     # ArduPilot接続
     ardupilot = ArduPilotConnector()
@@ -277,6 +357,8 @@ def motive_to_ardupilot_bridge_15hz():
     # 統計変数
     packet_count = 0
     last_stats_time = time.time()
+    received_rigid_body_ids = set()
+    mixed_id_warning_shown = False
     
     try:
         while True:
@@ -291,6 +373,26 @@ def motive_to_ardupilot_bridge_15hz():
             # データ処理（タプル展開: rigid_body_id, lat_e7, lon_e7, alt_mm, yaw_cdeg, unix_time_sec）
             rigid_body_id, lat_e7, lon_e7, alt_mm, yaw_cdeg, unix_time_sec = received_data
             
+            received_rigid_body_ids.add(rigid_body_id)
+            if (
+                TARGET_RIGID_BODY_ID is None
+                and len(received_rigid_body_ids) > 1
+                and not mixed_id_warning_shown
+            ):
+                mixed_id_warning_shown = True
+                print(
+                    "⚠ 複数の剛体IDを受信しています "
+                    f"({sorted(received_rigid_body_ids)})。剛体IDでフィルタして"
+                    "いないため、最後に受信したIDの位置・yawをPixhawkへ送信します。"
+                )
+
+            # 送信対象の剛体IDが指定されていれば、それ以外は捨てる
+            if (
+                TARGET_RIGID_BODY_ID is not None
+                and rigid_body_id != TARGET_RIGID_BODY_ID
+            ):
+                continue
+
             periodic_sender.update_data(lat_e7, lon_e7, alt_mm, yaw_cdeg, unix_time_sec)
             
             # 詳細ログ（100パケットごと）

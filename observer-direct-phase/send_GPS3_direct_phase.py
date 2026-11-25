@@ -27,6 +27,7 @@ GPS_INPUT の内容は EKF/send_GPS3.py と同一:
     gps_id=0, fix_type=3(3D), hdop=0.8, vdop=1.0,
     speed_accuracy=0.1, horiz_accuracy=0.01, vert_accuracy=0.01,
     satellites_visible=12, vn/ve/vd=0（速度は送らない）, yaw=cdeg
+    ※ yaw=0 は ArduPilot が「ヨー不明」として無視するため、0° は 36000 cdeg で送る
 
 実行方法（observer-direct-phase の uv 環境）:
     cd observer-direct-phase
@@ -218,6 +219,23 @@ def unix_to_gps_week(unix_time_sec):
     return gps_week, gps_week_ms
 
 
+# ArduPilot は GPS_INPUT の yaw=0 を「ヨー不明」として無視する
+# (AP_GPS_MAV.cpp: bool have_yaw = (packet.yaw != 0))。
+# 真北 0° は 36000 cdeg (=360°) として送る（受信側の wrap_360 で 0°）。
+GPS_YAW_UNKNOWN_CDEG = 0
+GPS_YAW_NORTH_CDEG = 36000
+
+
+def encode_gps_input_yaw_cdeg(yaw_cdeg):
+    """GPS_INPUT の yaw を ArduPilot が「ヨーあり」と判定する値に変換する。"""
+    if yaw_cdeg is None:
+        return GPS_YAW_UNKNOWN_CDEG
+    wrapped = int(round(float(yaw_cdeg))) % 36000
+    if wrapped == 0:
+        return GPS_YAW_NORTH_CDEG
+    return wrapped
+
+
 # ================================
 # ArduPilot 接続
 # ================================
@@ -282,7 +300,7 @@ class ArduPilotLink:
             return False
         try:
             gps_week, gps_week_ms = unix_to_gps_week(sample["unix_time_sec"])
-            yaw_cdeg = int(sample["yaw_cdeg"]) if sample["yaw_cdeg"] is not None else 0
+            yaw_cdeg = encode_gps_input_yaw_cdeg(sample["yaw_cdeg"])
             self.master.mav.gps_input_send(
                 int(sample["unix_time_sec"] * 1e6),  # time_usec
                 self.gps_id,                          # gps_id

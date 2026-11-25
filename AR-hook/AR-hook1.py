@@ -34,6 +34,10 @@ AR_LOG_HZ = 40
 AR_FRAME_DURATION_US = round(1_000_000 / AR_MEASUREMENT_FPS)
 MASK = 0x09F8
 TARGET_YAW_DEG = 0.0  # 北向き固定（MAVLink NED yaw）
+# ───── ヨー診断表示 ─────
+# True: 1HzのTracker表示に、Pixhawk ATTITUDE yawとMotive各剛体のNEDヨー、
+#       およびその差（一定オフセットか）を [YawDebug] 行で追加表示する。
+DEBUG_YAW = True
 CAMERA_WIDTH = 1640
 CAMERA_HEIGHT = 1232
 # ───── ArUco・カメラ追跡設定 ─────
@@ -312,6 +316,69 @@ def quaternion_to_euler_ned(qx, qy, qz, qw):
     pitch = math.asin(max(-1,min(1, 2*(qw*qy-qz*qx))))
     yaw   = math.atan2(2*(qw*qz+qx*qy), 1-2*(qy**2+qz**2))
     return roll, pitch, yaw
+
+
+def _angle_difference_deg(target_rad, reference_rad):
+    """2つの角度[rad]の差を (-180, 180] 度で返す。"""
+    return math.degrees(math.atan2(
+        math.sin(target_rad - reference_rad),
+        math.cos(target_rad - reference_rad),
+    ))
+
+
+def format_yaw_debug_line(pixhawk_yaw_rad, pixhawk_received, motive_attitudes):
+    """PixhawkヨーとMotive各剛体ヨーの比較文字列を作る（診断専用）。
+
+    Args:
+        pixhawk_yaw_rad: MAVLink ATTITUDE の yaw [rad]。
+        pixhawk_received: ATTITUDE を受信済みなら True。
+        motive_attitudes: {rigid_body_id: (attitude, quaternion, received)}。
+            attitude は (roll, pitch, yaw)[rad]、quaternion は (qx, qy, qz, qw)。
+
+    Returns:
+        1行の文字列。Pixhawk差が一定なら、PixhawkヨーがMotiveヨーと無関係
+        （コンパス由来など）であることを示す。再計算差は変換式の自己診断で、
+        正常時は 0 deg になる。
+    """
+    if pixhawk_received:
+        header = (
+            "[YawDebug] Pixhawk ATTITUDE yaw="
+            f"{math.degrees(pixhawk_yaw_rad):+7.2f}deg "
+            "(MAVLink生値・Motive変換ではない)"
+        )
+    else:
+        header = "[YawDebug] Pixhawk ATTITUDE yaw=N/A (ATTITUDE未受信)"
+
+    parts = []
+    for rigid_body_id, (attitude, quaternion, received) in motive_attitudes.items():
+        if not received:
+            parts.append(f"RB{rigid_body_id}=N/A")
+            continue
+        body_yaw_rad = attitude[2]
+        try:
+            recomputed_yaw_rad = quaternion_to_euler_ned(
+                *_motive_quaternion_to_ned_xyzw(*quaternion)
+            )[2]
+        except ValueError:
+            parts.append(
+                f"RB{rigid_body_id} NEDyaw="
+                f"{math.degrees(body_yaw_rad):+7.2f}deg (再計算不能)"
+            )
+            continue
+        recompute_error_deg = _angle_difference_deg(
+            recomputed_yaw_rad, body_yaw_rad
+        )
+        pixhawk_offset_deg = _angle_difference_deg(
+            pixhawk_yaw_rad, body_yaw_rad
+        )
+        parts.append(
+            f"RB{rigid_body_id} NEDyaw={math.degrees(body_yaw_rad):+7.2f}deg "
+            f"(再計算差={recompute_error_deg:+.1e}deg, "
+            f"Pixhawk差={pixhawk_offset_deg:+7.2f}deg)"
+        )
+    if not parts:
+        return header
+    return header + " | " + " | ".join(parts)
 
 
 def _motive_yaw_south_positive(yaw_ned_rad):
@@ -1951,6 +2018,15 @@ def camera_tracker_loop(m, show_window=False, stream_enabled=False):
                     f"{motive_cargo if motive_cargo_available else 'N/A'} "
                     f"camera={'received' if motive_camera_available else 'N/A'}"
                 )
+                if DEBUG_YAW:
+                    # Pixhawk yawはMAVLink ATTITUDEの生値。Motiveクォータニオン
+                    # から計算した値ではないことを、差と併記して切り分けられる
+                    # ようにする。再計算差は変換式の自己診断（常に0になるはず）。
+                    print(
+                        format_yaw_debug_line(
+                            p_yaw, p_attitude_received, motive_attitudes
+                        )
+                    )
                 last_print_time = now
                 fps_window_started = now
                 fps_frame_count = 0
@@ -2374,6 +2450,16 @@ def main():
     print("="*50)
     print("ArduPilot 精密制御 - 下向きカメラ用 (ID1センサ利用)")
     print("="*50)
+    if DEBUG_YAW:
+        print(
+            "ℹ [YawDebug] Pixhawkのyaw表示はMAVLink ATTITUDEの生値です。"
+            "AR-hookはMotive姿勢からPixhawk yawを計算しません。"
+        )
+        print(
+            f"ℹ [YawDebug] Motive姿勢はUDP {MOTIVE_POSE_PORT} (RBPS) を使用。"
+            "15769のGPS/yaw電文はAR-hookでは受信しません"
+            "（send_GPS3がPixhawkへGPS_INPUTとして送信）。"
+        )
     
     try:
         mav = connect_mavlink()

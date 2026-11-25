@@ -2,7 +2,7 @@
 
 1. Motive UDP パケット（'<BiiiHd', 23 バイト）のデコード。
 2. Unix 時刻 → GPS 週/週内ms の換算。
-3. GPS_INPUT の引数（19個・gps_id/fix_type/衛星数/yaw）。
+3. GPS_INPUT の引数（19個・gps_id/fix_type/衛星数/yaw）。yaw=0° は 36000 cdeg に変換。
 4. 起動時にブリッジを停止し、終了時に再起動する実装であること（シミュレーション）。
 5. CLI（--no-stop-bridge / --dry-run / 既定 device・baud）の存在。
 """
@@ -86,6 +86,35 @@ def test_gps_input_send_arguments():
     assert args[9] == 0.8 and args[10] == 1.0    # hdop, vdop
     assert args[17] == 12                        # satellites_visible
     assert args[18] == 4500                      # yaw cdeg
+
+
+def test_encode_gps_input_yaw_cdeg():
+    assert S.encode_gps_input_yaw_cdeg(0) == 36000
+    assert S.encode_gps_input_yaw_cdeg(36000) == 36000
+    assert S.encode_gps_input_yaw_cdeg(4500) == 4500
+    assert S.encode_gps_input_yaw_cdeg(35999) == 35999
+    assert S.encode_gps_input_yaw_cdeg(-1) == 35999
+    assert S.encode_gps_input_yaw_cdeg(None) == 0
+
+
+def test_gps_input_north_yaw_is_not_zero():
+    class FakeMav:
+        def __init__(self):
+            self.args = None
+
+        def gps_input_send(self, *args):
+            self.args = args
+
+    class FakeMaster:
+        def __init__(self):
+            self.mav = FakeMav()
+
+    link = S.ArduPilotLink(device="/dev/ttyAMA0")
+    link.master = FakeMaster()
+    s = sample()
+    s["yaw_cdeg"] = 0
+    assert link.send_gps_input(s) is True
+    assert link.master.mav.args[18] == 36000
 
 
 def test_bridge_stop_and_restore_simulation():
