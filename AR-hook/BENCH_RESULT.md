@@ -103,6 +103,10 @@
 | 例外・タイムアウト・フレーム競合 | 未測定 | NOT RUN |
 | 送信ロック前後の比較 | 未測定 | NOT RUN |
 
+> 2026-11-26 追記: この表は 2026-11-18 時点（シミュレーションのみ）の記録として `NOT RUN` のまま残します。
+> 実機での計測は 2026-11-25 に実施し、**§7.6.1** と
+> [REAL_MACHINE_VERIFY.md](./REAL_MACHINE_VERIFY.md) §8.1 に記入しました（電源投入直後の条件は未達）。
+
 ## 3. 再現コマンド
 
 ### 3.1 シミュレーション（ハードウェア不要 / 自己テスト）
@@ -289,7 +293,8 @@ python3 bench_check.py --device /dev/ttyAMA0 --duration 30 --warmup 3
 
 条件: Raspberry Pi + Pixhawk、`/dev/ttyAMA0` / 1,000,000 bps / RTS-CTS、プロペラ外し・
 機体固定・disarmed・非 GUIDED。`bench_check.py` は送信ロック有効（本番と同じ経路）。
-本節の数値は実機ベンチでの観測記録で、再計測（下記 7.5）は **NOT RUN** です。
+本節の数値は実機ベンチでの観測記録です。再計測は 2026-11-25 19:37〜19:42 JST の 1 セッションで
+**一部を実施**し §7.6.1 に記入しました（**電源投入直後の条件は未達**で、行 1 は `NOT RUN` のまま）。
 
 ### 7.1 受信レート（合格）
 
@@ -360,23 +365,30 @@ HEARTBEAT は **61 件すべて `sys=1` / `comp=1` / `base_mode=0x51` / `custom_
 - 「comp 0」報告の再確認（60 秒以上の直接計測）
 - 長時間（30 分以上）の EMI・ケーブル揺動を含む連続計測
 
-再計測の記録欄は §7.6 です（**未記入 / NOT RUN**）。手順は
+> 2026-11-26 追記: 2026-11-25 19:37〜19:42 JST の 1 セッション（4 run）で、上の 1 のうち
+> **受信レート・BAD_DATA・遷移ログ（`HB遷移:` は初回 1 行のみ）**を取得し §7.6.1 に記入しました。
+> **電源投入直後の条件は未達**のため「1 は完了」とはせず、2〜5 も `NOT RUN` のまま残します
+> （f1 の再現条件に達していないため、偽 armed が解消したとは断定しません）。
+
+再計測の記録欄は §7.6 です（**A のみ記入済み / B〜D は NOT RUN**）。手順は
 [REAL_MACHINE_VERIFY.md](./REAL_MACHINE_VERIFY.md) を参照してください。
 
 2026-11-26 に、A（ベンチ再計測）・B（GUIDED 自動移動）・C（ArUco 互換）・D（yaw 撮像）を
 **1 回の実機セッションでまとめて実施するための記録欄**（§7.6.1〜§7.6.4）と、
 [実験手順書.md](./実験手順書.md) §6.1・[CAMERA_YAW_MATERIAL.md](./CAMERA_YAW_MATERIAL.md) を用意しました。
 ただし実機ログの提供が無いため、**A〜D はすべて `NOT RUN` のまま**です（本節の項目も未確認のまま）。
+その後 2026-11-25 の 1 セッションで **A のみ実測を取得**し、§7.6.1 に記入しました
+（**B〜D は `NOT RUN` のまま**。A も電源投入直後の条件は未達）。
 
-### 7.6 実機再計測の記録欄（NOT RUN / 人間が記入）
+### 7.6 実機再計測の記録欄（A のみ記入 / B〜D は NOT RUN）
 
-**この欄は未記入（NOT RUN）です。** 本作業環境には実機（Raspberry Pi / Pixhawk / カメラ / Motive）が
-無いため、7.5 の再計測は行っていません。実機での実施と記入は人間が行います。
+**A（§7.6.1）のみ実測を記入しました。B〜D（§7.6.2〜§7.6.4）は `NOT RUN` のままです。**
+実測していない欄は `NOT RUN` のまま残します（削除しない）。
 
-- 実施状態（2026-11-26 時点）: **NOT RUN**。判定対象の実測ログ（`~/arhook_verify_logs/run*.txt`）は
-  本作業環境に存在せず、提供も受けていません。したがって `bench_log_check.py` による**実測の判定は
-  未実施**です（本節に実測値・推測値は入れていません）。7.6.5 は判定ツールの動作確認であり、
-  実機再計測の結果ではありません。
+- 実施状態（2026-11-26 記入）: **A のみ記入済み**。実測は 2026-11-25 19:37〜19:42 JST の
+  1 セッション（RTS-CTS 有効 3 run + `--no-rtscts` 1 run）。**ただし電源投入直後の条件は未達**で、
+  行 1（`run1_boot`）は `NOT RUN` のままです。**B（§7.6.2）・C（§7.6.3）・D（§7.6.4）は `NOT RUN`。**
+  実測ログの実体（`~/arhook_verify_logs/run*.txt`）はリポジトリにコミットしていません。
 - 1 回の実機セッションで **A（ベンチ再計測）・B（GUIDED 自動移動）・C（ArUco 互換）・D（yaw 撮像）**
   をまとめて実施し、A は 7.6.1、B は 7.6.2、C は 7.6.3、D は
   [CAMERA_YAW_MATERIAL.md](./CAMERA_YAW_MATERIAL.md) に記入します。
@@ -396,10 +408,55 @@ HEARTBEAT は **61 件すべて `sys=1` / `comp=1` / `base_mode=0x51` / `custom_
 
 | # | 実行 | 日時 (JST) | BAD_DATA | ATTITUDE Hz | GPI Hz | HB Hz | 例外/失敗/TO/競合 | 確定 armed | 偽 armed | exit | 判定 |
 |---|---|---|---:|---:|---:|---:|---|---:|---:|---:|---|
-| 1 | `run1_boot`（電源投入直後） | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN |
-| 2 | `run2_settled`（落ち着いた状態 1） | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN |
-| 3 | `run3_settled`（落ち着いた状態 2） | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN |
-| 4 | `run4_no_rtscts`（任意・参考） | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN |
+| 1 | `run1_boot`（電源投入直後） | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN（**電源投入直後の条件は未達**。実測は行 1a に記載） |
+| 1a | `run1`（RTS-CTS 有効・セッション 1 回目 / **電源投入直後ではない**: uptime 46 分） | 2026-11-25 19:37:47 | 0（0/30s） | 40.00 | 5.00 | 0.97 | 0/0/0/0 | 0 回 | 0/1 | 3 | PASS（`bench_log_check.py` exit=0） |
+| 2 | `run2_settled`（落ち着いた状態 1 / 1a の 60 秒後） | 2026-11-25 19:39:21 | 0（0/30s） | 40.00 | 5.00 | 0.97 | 0/0/0/0 | 0 回 | 0/1 | 3 | PASS（`bench_log_check.py` exit=0） |
+| 3 | `run3_settled`（落ち着いた状態 2 / 2 の 60 秒後） | 2026-11-25 19:40:55 | 0（0/30s） | 40.00 | 5.00 | 0.97 | 0/0/0/0 | 0 回 | 0/1 | 3 | PASS（`bench_log_check.py` exit=0） |
+| 4 | `run4_no_rtscts`（任意・参考 / 3 の 60 秒後） | 2026-11-25 19:42:29 | 0（0/30s） | 40.00 | 5.00 | 0.97 | 0/0/0/0 | 0 回 | 0/1 | 3 | PASS（**参考・合否に含めない**） |
+
+記入内容（2026-11-26 記入 / 実測は 2026-11-25 19:37〜19:42 JST）:
+
+- 1 セッション 4 run。run 間は 60 秒。4 run すべて `bench_log_check.py` が PASS
+  （`SUMMARY: PASS 4 / FAIL 0 / ERROR 0` / `結果: 合格（4 ログ）` / **judge exit=0**）。
+  表の値は 1 行サマリからの転記です（`bad_data=0`、`att=40.00Hz`、`gpi=5.00Hz`、`hb=0.97Hz`、
+  `errors=0/0/0/0`、`armed_true=0`、`fake_armed=0/1`、`bench_check exit=3`。
+  行 4 は `--no-rtscts` の参考値で合否に含めない）。
+- setpoint 送信 **0.00 Hz** / 失敗 **0**（既定どおり `--send-setpoints` を付けていない）。
+- 接続時に送ったのは HB / ATT / GPI / GPS_RAW の `MAV_CMD_SET_MESSAGE_INTERVAL` のみ。
+  モードは STABILIZE、`base_mode=0x51`、`armed_raw=False` のまま。
+- `HB遷移:` は 1a の初回 1 行のみ（`UNKNOWN→STABILIZE`、armed `False→False`）。
+  **`armed False->True` も `armed_raw=True` も 0 回**で、f1（偽 armed）は本セッションでは
+  再現しませんでした。ただし下記の条件未達があるため、**「偽 armed が解消した」とは断定しません**。
+  行 1 の条件（電源投入直後）を満たすまで、この欄の合格は確定しません。
+
+**条件未達（併記必須）**:
+
+- 行 1a は「電源投入直後」ではありません。Pixhawk の電源再投入を実施せず、**uptime 46 分**での
+  計測です。したがって f1 / BAD_DATA 7 件が出た「起動直後の荒れた時間帯」の再現条件には
+  達していません（行 1 `run1_boot` は `NOT RUN` のまま）。
+- 計測前に `send_GPS3.py`（PID 1084、pts/0 の別端末で手動起動）を SIGINT で停止しました
+  （18:53 起動 → 19:35 停止）。この間 EKF への GPS_INPUT は停止していました。
+- 環境: Raspberry Pi 5 / Debian 12 / Python 3.11.2 / pymavlink 2.4.49 / pytest 9.2.0
+  （venv: `/home/taki/Mavlink_venv`）/ OpenCV 4.6。リポジトリ HEAD=`524ca84`
+  （feature/arhook-fixes, clean）。Pixhawk のファーム・`SERIALx_BAUD`・`BRD_SERx_RTSCTS` の
+  値は未取得（`NOT RUN`。[REAL_MACHINE_VERIFY.md](./REAL_MACHINE_VERIFY.md) §8.2）。
+- pytest（Pi 実機, venv）: **198 passed, 2 skipped, 7 subtests passed**（Mac では 200 passed）。
+  差分の 2 skipped は仮想シリアル等が必要とみられますが、断定はしません。
+
+**行 1（電源投入直後の run1）の再取得手順（未実施 / `NOT RUN`）**:
+
+1. Pixhawk の電源を完全に切る（バッテリ・USB とも外す）。多重起動が無いことを
+   `pgrep -af 'bench_check|AR-hook1'` と `sudo lsof /dev/ttyAMA0` で確認する。
+2. 電源投入後 **1 分以内**に `run1_boot` を開始する
+   （`python3 bench_check.py --device /dev/ttyAMA0 --duration 30 --warmup 3`、RTS-CTS 有効）。
+   ログは `tee` で `~/arhook_verify_logs/run1_boot.txt` に保存し、`PIPESTATUS` で終了コードを
+   記録する（[REAL_MACHINE_VERIFY.md](./REAL_MACHINE_VERIFY.md) §4.1 の例）。
+3. `run1_boot` 終了後 **60 秒あけて** `run2_settled` / `run3_settled` を同じ条件で実行する
+   （`run2_settled.txt` / `run3_settled.txt`）。
+4. 3 ログを `python3 bench_log_check.py --verbose ~/arhook_verify_logs/run1_boot.txt ~/arhook_verify_logs/run2_settled.txt ~/arhook_verify_logs/run3_settled.txt`
+   で判定し、`SUMMARY` と judge exit を行 1〜3 に記入する。
+5. 実施するまで行 1 は `NOT RUN` のまま残す（この欄の合格は「起動直後 1 回 + 落ち着いた状態 2 回以上」が
+   揃ったときだけ確定する）。
 
 記入ルール:
 
@@ -467,7 +524,7 @@ C1 の行は [AR-hook1.py](./AR-hook1.py) の `print(f"ArUco: {aruco_api_label}"
 
 #### 7.6.5 判定ツールの動作確認（実機再計測ではない・参考）
 
-実測ログが無いため合否の判定はできませんが、`bench_log_check.py` が**実機ログを読んで判定できること**は
+§7.6.1 の実測（2026-11-25）とは別に、`bench_log_check.py` が**実機ログを読んで判定できること**は
 対策前のログ（`~/arhook_hw_logs/2026-11-24`, `2026-11-25`）で確認しました。**下記は §7.1〜§7.3 で既報の
 対策前データであり、今回の再計測結果ではありません。合否にも使いません。**
 
@@ -537,3 +594,7 @@ exit=0
   → **200 passed / 0 failed（33.93 s）**。3bb4b（`AR_HOOK_AUTO_START`、`test_auto_start.py` 24 件）と
   2f83c（`test_aruco_compat.py`）を含む現行ブランチ全体の結果で、**失敗 0**です。
   **この数はハードウェア不要のオフライン試験のみ**で、実機の判定（§7.6）は `NOT RUN` のままです。
+- **2026-11-26 再実行**（e3956 `test_space_takeoff.py` 18 件を含む現行ブランチ）:
+  `cd AR-hook && python3 -m pytest -q -p no:cacheprovider --ignore=archive`
+  → **218 passed / 0 failed（41.54 s）**（本作業環境の Mac。ハードウェア不要のオフライン試験）。
+  Pi 実機（venv）での同スイートは §7.6.1 のとおり 198 passed / 2 skipped / 7 subtests passed。

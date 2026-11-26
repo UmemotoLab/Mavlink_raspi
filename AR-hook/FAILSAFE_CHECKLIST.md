@@ -170,11 +170,26 @@ HB遷移: armed False->True mode UNKNOWN(None)->GUIDED(4) sys=1 comp=1 base_mode
 2 連続 armed、disarmed 方向の 2 連続、破損（BAD_DATA）と正常の混在、遷移ログの項目、
 `bench_check.SafetyMonitor` の同一フィルタ、`AR-hook1.monitor_vehicle` の偽 armed 非離陸。
 
+**実機結果（2026-11-25 19:37〜19:42 JST / 4 run）**: 実機 4 run で偽 armed 0 回（ただし電源投入直後条件は未達）。
+
+- `bench_log_check.py`: `fake_armed=0/1` / `armed_true=0` / `SUMMARY: PASS 4 / FAIL 0 / ERROR 0`（judge exit=0）。
+- `HB遷移:` は初回 1 行のみ（`UNKNOWN→STABILIZE`、armed `False→False`）。`armed False->True` 0 回、
+  `armed_raw=True` 0 回。誤停止（`bench_check.py` の exit 2）も 0 回（4 run すべて exit=3 = setpoint SKIP のみ）。
+- 4 run の内訳: RTS-CTS 有効 3 run + `--no-rtscts` 1 run（**参考・合否に含めない**）。
+  計測中は armed にせず GUIDED にもしていない（setpoint 送信 0.00 Hz / 失敗 0）。
+- **電源投入直後条件は未達**（Pixhawk の電源再投入をせず uptime 46 分で計測。計測前に `send_GPS3.py`
+  PID 1084 を SIGINT 停止）。f1 の再現条件に達していないため、**「偽 armed が解消した」とは断定しません**。
+- 詳細: [BENCH_RESULT.md](./BENCH_RESULT.md) §7.6.1 / [REAL_MACHINE_VERIFY.md](./REAL_MACHINE_VERIFY.md) §8.1
+
 #### 1.3.2 実機結果（NOT RUN / 人間が記入）
 
-**状態: NOT RUN。** 本作業環境に実機（Raspberry Pi / Pixhawk）が無いため、対策後の実機ベンチでの
-武装判定は未確認です。判定対象の実測ログ（`~/arhook_verify_logs/run*.txt`）は存在せず、提供も
-受けていません。**「偽 armed 対策済み」と断定できるのは、下表が実測で埋まったときだけ**です。
+**状態: NOT RUN。** 本作業環境に実機（Raspberry Pi / Pixhawk）が無いため、下表は未記入です。
+判定対象の実測ログの実体（`~/arhook_verify_logs/run*.txt`）は本作業環境には無く、遷移ログの
+実出力も未提供です。**「偽 armed 対策済み」と断定できるのは、下表が実測で埋まったときだけ**です。
+
+> 2026-11-26 追記: 2026-11-25 の実機 4 run の概要は §1.3.1 に追記しました（偽 armed 0 回 /
+> 起動直後条件は未達）。ただし遷移ログの実出力（行 4）を貼っていないため、下表は `NOT RUN` の
+> まま残します。
 
 | # | 確認項目 | 期待 | 実測 / 結果 |
 |---|---|---|---|

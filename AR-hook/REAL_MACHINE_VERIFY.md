@@ -251,6 +251,7 @@ SUMMARY: PASS 4 / FAIL 0 / ERROR 0
 - 計測分解能の許容は `bench_check.py` と同じです
   （HEARTBEAT ±0.1 Hz、ATTITUDE / GPI ±0.05 Hz）。`bench_log_check.py` がこの許容を含めて判定します。
 - 3 回以上の計測すべてが合格であること（`SUMMARY: PASS N / FAIL 0 / ERROR 0`）。
+- **2026-11-25 実測との整合**: `bench_check.py` の終了コードは 4 run すべて **3**（SKIP は `setpoint 送信レート` のみ）で、`bench_log_check.py` は `SUMMARY: PASS 4 / FAIL 0 / ERROR 0`・judge exit=0 でした。§5.1 の「終了コード 0」は §5.2 のとおり「`bench_log_check.py` の判定が PASS」と読み替える（実測はこの読み替えと整合）。
 
 ### 5.2 終了コードの読み替え（重要）
 
@@ -341,10 +342,40 @@ SUMMARY: PASS 4 / FAIL 0 / ERROR 0
 
 | # | 実行 | 日時 (JST) | bench_check exit | BAD_DATA | ATTITUDE Hz | GPI Hz | HEARTBEAT Hz | 例外/送信失敗/タイムアウト/競合 | 確定 armed 遷移 | 偽 armed 候補 | bench_log_check 判定 | 備考 |
 |---|---|---|---:|---:|---:|---:|---:|---|---:|---:|---|---|
-| 1 | `run1_boot`（起動直後） | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | |
-| 2 | `run2_settled` | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | |
-| 3 | `run3_settled` | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | |
-| 4 | `run4_no_rtscts`（任意・参考） | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | 合否には含めない |
+| 1 | `run1_boot`（起動直後） | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | NOT RUN | **電源投入直後の条件は未達**（実測は行 1a） |
+| 1a | `run1`（RTS-CTS 有効・セッション 1 回目 / **起動直後ではない**: uptime 46 分） | 2026-11-25 19:37:47 | 3 | 0（0/30s） | 40.00 | 5.00 | 0.97 | 0/0/0/0 | 0 回 | 0/1 | PASS（judge exit=0） | 電源投入直後ではない |
+| 2 | `run2_settled`（1a の 60 秒後） | 2026-11-25 19:39:21 | 3 | 0（0/30s） | 40.00 | 5.00 | 0.97 | 0/0/0/0 | 0 回 | 0/1 | PASS（judge exit=0） | |
+| 3 | `run3_settled`（2 の 60 秒後） | 2026-11-25 19:40:55 | 3 | 0（0/30s） | 40.00 | 5.00 | 0.97 | 0/0/0/0 | 0 回 | 0/1 | PASS（judge exit=0） | |
+| 4 | `run4_no_rtscts`（任意・参考 / 3 の 60 秒後） | 2026-11-25 19:42:29 | 3 | 0（0/30s） | 40.00 | 5.00 | 0.97 | 0/0/0/0 | 0 回 | 0/1 | PASS（judge exit=0） | **参考・合否には含めない** |
+
+実測の要約（2026-11-26 記入 / 実測は 2026-11-25 19:37〜19:42 JST）:
+
+- 1 セッション 4 run（run 間 60 秒）。4 run すべて `bench_log_check.py` が PASS:
+  `SUMMARY: PASS 4 / FAIL 0 / ERROR 0` / `結果: 合格（4 ログ）` / **judge exit=0**。
+  表の数値は 1 行サマリからの転記です（`bad_data=0`、`att=40.00Hz`、`gpi=5.00Hz`、`hb=0.97Hz`、
+  `errors=0/0/0/0`、`armed_true=0`、`fake_armed=0/1`、`bench_check exit=3`）。
+- setpoint 送信 **0.00 Hz** / 失敗 **0**（既定どおり `--send-setpoints` 未指定）。接続時に送ったのは
+  HB / ATT / GPI / GPS_RAW の `MAV_CMD_SET_MESSAGE_INTERVAL` のみ。モードは STABILIZE、
+  `base_mode=0x51`、`armed_raw=False` のまま。計測中は armed にせず GUIDED にもしていません。
+- `HB遷移:` は 1a の初回 1 行のみ（`UNKNOWN→STABILIZE`、armed `False→False`）。
+  **`armed False->True` も `armed_raw=True` も 0 回**で、f1（偽 armed）は本セッションでは
+  再現しませんでした。ただし下記の条件未達のため、**「偽 armed が解消した」とは断定しません**。
+- **条件未達（必ず併記）**: 行 1a は「電源投入直後」ではありません。Pixhawk の電源再投入を実施せず、
+  **uptime 46 分**での計測です。したがって f1 / BAD_DATA 7 件が出た「起動直後の荒れた時間帯」の
+  再現条件には達していません（行 1 `run1_boot` は `NOT RUN` のまま）。
+- 計測前に `send_GPS3.py`（PID 1084、pts/0 の別端末で手動起動）を SIGINT で停止しました
+  （18:53 起動 → 19:35 停止）。この間 EKF への GPS_INPUT は停止していました。
+- pytest（Pi 実機, venv）: **198 passed, 2 skipped, 7 subtests passed**（Mac では 200 passed）。
+  差分の 2 skipped は仮想シリアル等が必要とみられますが、断定はしません。
+
+**行 1（電源投入直後の run1）の再取得手順（未実施 / `NOT RUN`）**:
+
+1. Pixhawk の電源を完全に切る（バッテリ・USB とも外す）。多重起動が無いことを
+   `pgrep -af 'bench_check|AR-hook1'` と `sudo lsof /dev/ttyAMA0` で確認する（§3.1）。
+2. 電源投入後 **1 分以内**に `run1_boot` を開始する（§4.1 の `tee` + `PIPESTATUS` の例）。
+3. `run1_boot` 終了後 **60 秒あけて** `run2_settled` / `run3_settled` を同じ条件で実行する。
+4. `python3 bench_log_check.py --verbose ~/arhook_verify_logs/run1_boot.txt ~/arhook_verify_logs/run2_settled.txt ~/arhook_verify_logs/run3_settled.txt`
+   で判定し、`SUMMARY` と judge exit を §8.1 と §8.3 に記入する（実施するまで行 1 は `NOT RUN`）。
 
 - 追加で計測した場合は行を足してください（3 回以上あれば合格判定できます）。
 - 「例外/送信失敗/タイムアウト/競合」は `bench_log_check.py` の `errors=a/b/c/d` をそのまま転記します。
@@ -356,24 +387,34 @@ SUMMARY: PASS 4 / FAIL 0 / ERROR 0
 
 | 項目 | 記入 |
 |---|---|
-| 実施日 / 実施者 | NOT RUN |
-| Raspberry Pi の機種 | NOT RUN |
-| OS / カーネル | NOT RUN |
-| Python / pymavlink | NOT RUN |
-| OpenCV（`python3 -c 'import cv2; print(cv2.__version__)'`） | NOT RUN |
-| Pixhawk のファームウェア | NOT RUN |
-| `SERIALx_BAUD` / `SERIALx_PROTOCOL` | NOT RUN |
-| `BRD_SERx_RTSCTS` | NOT RUN |
-| `SRx_EXTRA1` / `SRx_POSITION` | NOT RUN |
-| 配線（ケーブル長・GND・終端） | NOT RUN |
-| 多重起動の確認結果（§3.1） | NOT RUN |
-| その他（気象・電源・特記事項） | NOT RUN |
+| 実施日 / 実施者 | 2026-11-25 19:37〜19:42 JST / 実施者名は NOT RUN（記録なし） |
+| Raspberry Pi の機種 | Raspberry Pi 5 |
+| OS / カーネル | Debian 12 / カーネルは NOT RUN（未取得） |
+| Python / pymavlink | Python 3.11.2 / pymavlink 2.4.49（venv: `/home/taki/Mavlink_venv`、pytest 9.2.0） |
+| OpenCV（`python3 -c 'import cv2; print(cv2.__version__)'`） | 4.6 |
+| Pixhawk のファームウェア | NOT RUN（未取得） |
+| `SERIALx_BAUD` / `SERIALx_PROTOCOL` | NOT RUN（パラメータ値は未取得。run 1a〜3 は RTS-CTS 有効、run4 は `--no-rtscts` で計測） |
+| `BRD_SERx_RTSCTS` | NOT RUN（パラメータ値は未取得） |
+| `SRx_EXTRA1` / `SRx_POSITION` | NOT RUN（パラメータ値は未取得。実測レートは ATTITUDE 40.00 Hz / GPI 5.00 Hz） |
+| 配線（ケーブル長・GND・終端） | NOT RUN（未記録） |
+| 多重起動の確認結果（§3.1） | NOT RUN（`pgrep -af` / `sudo lsof` の記録なし）。参考: 計測前に `send_GPS3.py`（PID 1084、pts/0 の別端末で手動起動）を SIGINT で停止（18:53 起動 → 19:35 停止） |
+| その他（気象・電源・特記事項） | プロペラ無し・機体固定・armed にしない・GUIDED にしない・setpoint 送信なし（`--send-setpoints` 未指定）。run 間 60 秒。**Pixhawk の電源再投入は未実施（uptime 46 分）＝「電源投入直後」の条件は未達**。リポジトリ HEAD=`524ca84`（feature/arhook-fixes, clean） |
 
 ### 8.3 `bench_log_check.py` の出力（1 行サマリを貼る）
 
+実行: `python3 bench_log_check.py --verbose ~/arhook_verify_logs/run*.txt`
+（2026-11-25 実測。上の §8.1 の 1a・2・3・4 の 4 ログ）
+
 ```text
-NOT RUN
+SUMMARY: PASS 4 / FAIL 0 / ERROR 0
+結果: 合格（4 ログ）
+judge exit=0
 ```
+
+上の 3 行は実測時の出力からの引用です。各ログの `[PASS]` 行はログ実体
+（`~/arhook_verify_logs/`、**リポジトリ外**）にあります。**起動直後の `run1_boot` は未実施**
+なので、§8.1 の行 1 は `NOT RUN` のままです（judge exit=0 も「起動直後条件を含めて合格」を
+意味しません）。
 
 ### 8.4 付録1（座標系・高度・yaw）の記入欄
 
@@ -392,9 +433,15 @@ NOT RUN
 以下はこの作業環境（実機なし）では実施できていません。**実機で確認するまで「合格」と
 書かないでください。**
 
+> 2026-11-26 追記: 下の 1〜3 のうち、**実機での計測（落ち着いた状態 2 回以上 + 起動直後以外の
+> 1 回）・`--no-rtscts` 1 回・実機ログに対する判定は 2026-11-25 に実施**し §8.1 に記入しました。
+> ただし**起動直後（`run1_boot`）の条件は未達**なので、`run1_boot` は `NOT RUN` のままです。
+> 4 以降は `NOT RUN` のまま残します。
+
 - 実機での計測 3 回以上（`run1_boot` / `run2_settled` / `run3_settled`）
-- 実機での `--no-rtscts` 1 回（`run4_no_rtscts`）
-- 実機ログに対する `bench_log_check.py` の判定
+  （`run2_settled` / `run3_settled` は 2026-11-25 実施。**`run1_boot` は NOT RUN**）
+- 実機での `--no-rtscts` 1 回（`run4_no_rtscts`）（2026-11-25 実施。参考・合否に含めない）
+- 実機ログに対する `bench_log_check.py` の判定（2026-11-25 実施。`SUMMARY: PASS 4 / FAIL 0 / ERROR 0` / judge exit=0）
 - 付録1 の実機確認（離陸地点 REF 座標ログ、REF_ALT との整合、yaw 表示）
 - 付録1.2 の TAKEOFF 高度（home 相対）の**送信値**の実機確認（アーム + GUIDED が必要）
 - 付録2 の GUIDED 自動移動（`AR_HOOK_AUTO_START` は**実装済み（3bb4b）だが実機では未実施**）
