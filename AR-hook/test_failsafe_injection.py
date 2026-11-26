@@ -467,7 +467,10 @@ def test_disarm_stops_and_csv_is_saved():
     shutdown_src = src[shutdown_start:shutdown_end]
     assert shutdown_src.index("comm.stop()") < shutdown_src.index("save_csv()")
     main_src = src[src.index("def main("):]
-    assert "finalize_shutdown(comm, control_thread, stream_server)" in main_src
+    # GPS_INPUT 供給部（第 3 段階）も終了処理へ渡す。順序は finalize_shutdown 内で
+    # 「供給部 → comm.stop() → save_csv()」。
+    assert "finalize_shutdown(" in main_src
+    assert "gps_supplier=gps_input_supplier" in main_src
 
 
 # ───── 4. ATTITUDE 停止（モック）: 追従停止・目標保持・警告 1 秒 1 回 ─────

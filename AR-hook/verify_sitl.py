@@ -102,6 +102,15 @@ AUTO_START_PHASE_TIMEOUT_S = 90.0  # 離陸待ち＋移動＋到着の上限（�
 AUTO_START_TRACK_SETPOINT_TOL_M = 0.50  # TRACK 後の setpoint が開始位置から外れてよい距離
 AUTO_START_POST_TRACK_FRAMES = 5   # TRACK 後に疑似カメラ更新を送る回数
 
+# ── gps_input（AR-hook が Motive→GPS_INPUT を送る 1 ポート運用）──
+GPS_INPUT_SCENARIO_DURATION_S = 3.0   # 15Hz 送信と位置維持を測る時間
+GPS_INPUT_FEED_HZ = 20.0              # Motive 相当の位置入力（供給部は 15Hz で送る）
+GPS_INPUT_MIN_MESSAGES = 30           # 3 秒 × 15Hz = 45 件。起動遅れを見て 30 件以上
+GPS_INPUT_RATE_MIN_HZ = 13.0
+GPS_INPUT_RATE_MAX_HZ = 17.0
+GPS_INPUT_POSITION_TOL_M = 1.0        # 送信中の位置維持（水平・垂直）
+GPS_INPUT_STUB_MIN_ROWS = 30          # 同梱スタブが受信した GPS_INPUT の最小行数
+
 # ── external（実 SITL）でのみ使う値 ──
 # 実 SITL は地上では yaw 指令に追従しないため、ホバリング高度まで上げてから測る。
 EXTERNAL_HOVER_ALT_M = 1.5
@@ -172,10 +181,11 @@ def load_ar_hook1_module(env=None):
 #  計測ユーティリティ
 # ──────────────────────────────────────────────
 def instrument_comm(comm):
-    """送信 setpoint と周期要求を記録する（実送信はそのまま通信部へ渡す）。"""
-    records = {"setpoints": [], "intervals": []}
+    """送信 setpoint / 周期要求 / GPS_INPUT を記録する（実送信は通信部へ渡す）。"""
+    records = {"setpoints": [], "intervals": [], "gps_inputs": []}
     original_setpoint = comm.setpoint
     original_interval = comm.set_message_interval
+    original_gps_input = comm.gps_input
 
     def setpoint(lat_e7, lon_e7, alt_m, yaw_rad=0.0,
                  type_mask=0x09F8, frame=None):
@@ -202,8 +212,16 @@ def instrument_comm(comm):
         })
         return original_interval(message_id, interval_us)
 
+    def gps_input(**kwargs):
+        records["gps_inputs"].append({
+            "t_s": time.monotonic(),
+            **kwargs,
+        })
+        return original_gps_input(**kwargs)
+
     comm.setpoint = setpoint
     comm.set_message_interval = set_message_interval
+    comm.gps_input = gps_input
     return records
 
 
@@ -1904,6 +1922,164 @@ def scenario_space_takeoff(module, args):
     }
 
 
+def scenario_gps_input(module, args):
+    """AR-hook が Motive 位置を GPS_INPUT として 15Hz で送り、位置を維持するか。
+
+    供給部（gps_supplier.GpsInputSupplier）を有効にして、GLOBAL_POSITION_INT から
+    作った REF 基準の現在位置を Motive 入力として 20Hz で与えます。供給部は
+    15Hz で GPS_INPUT を送り、SITL（同梱スタブ／実 ArduPilot）の位置が
+    その間ほぼ動かないことを確認します。
+
+    実 ArduPilot で GPS_INPUT を EKF に使わせるには GPS_TYPE=14（MAVLink GPS）
+    などの設定が必要です。既定の SITL（uBlox シミュレーション）では GPS_INPUT は
+    無視されますが、本シナリオは「15Hz で送れている」ことと「送信で位置が乱れない」
+    ことを測ります（設定手順は 統合メモ / 実験手順書を参照）。
+    """
+    with vehicle_session(module, args, "gps_input") as (
+        comm, records, _port, out_dir
+    ):
+        # 実 SITL では着陸直後だと高度が動くため、地上（home 相対 < 0.2m）を待つ。
+        wait_for(
+            lambda: (
+                _relative_alt_m(comm) is not None
+                and _relative_alt_m(comm) < 0.2
+            ),
+            timeout=10.0,
+        )
+        position, _ = wait_position(comm, timeout=6.0)
+        state = comm.snapshot()
+        lat0 = position.lat / 1e7
+        lon0 = position.lon / 1e7
+        alt0 = position.alt / 1000.0
+        north, east, down = module.gps_to_local_xyz(lat0, lon0, alt0)
+        yaw_rad = 0.0
+        if state.attitude is not None:
+            yaw_rad = float(state.attitude.yaw)
+
+        logs = []
+        supplier = module.GpsInputSupplier(
+            comm, enabled=True, logger=logs.append
+        )
+        supplier_started = supplier.start()
+        feeds = 0
+        try:
+            deadline = time.monotonic() + GPS_INPUT_SCENARIO_DURATION_S
+            while time.monotonic() < deadline:
+                supplier.update_pose(
+                    (north, east, down), time.time(), yaw_rad=yaw_rad
+                )
+                feeds += 1
+                time.sleep(1.0 / GPS_INPUT_FEED_HZ)
+        finally:
+            supplier.stop(timeout=2.0)
+
+        calls = list(records["gps_inputs"])
+        status = supplier.status()
+        after = comm.snapshot().position
+        if after is not None:
+            north1, east1, down1 = module.gps_to_local_xyz(
+                after.lat / 1e7, after.lon / 1e7, after.alt / 1000.0
+            )
+            horizontal_drift = math.hypot(north1 - north, east1 - east)
+            vertical_drift = abs(down1 - down)
+        else:
+            horizontal_drift = float("inf")
+            vertical_drift = float("inf")
+
+        if len(calls) >= 2:
+            rate_hz = (len(calls) - 1) / (calls[-1]["t_s"] - calls[0]["t_s"])
+        else:
+            rate_hz = 0.0
+
+        first = calls[0] if calls else {}
+        last = calls[-1] if calls else {}
+        expected_lat_e7 = int(round(lat0 * 1e7))
+        expected_lon_e7 = int(round(lon0 * 1e7))
+
+        stub_rows = None
+        if not args.external_connection:
+            stub_path = Path(out_dir) / "vehicle" / "gps_input.csv"
+            if stub_path.exists():
+                with open(stub_path, newline="", encoding="utf-8") as handle:
+                    stub_rows = max(0, len(list(csv.reader(handle))) - 1)
+
+        checks = {
+            "supplier_enabled_logged": (
+                supplier_started
+                and any(
+                    line == "GPS_INPUT: 有効（15Hz, REF基準）" for line in logs
+                )
+            ),
+            "dual_send_warning_logged": any(
+                "send_GPS3.py" in line for line in logs
+            ),
+            "messages_sent_15hz": len(calls) >= GPS_INPUT_MIN_MESSAGES,
+            "measured_rate_15hz": (
+                GPS_INPUT_RATE_MIN_HZ <= rate_hz <= GPS_INPUT_RATE_MAX_HZ
+            ),
+            "send_errors_zero": status.error_count == 0,
+            "fix_type_3d_and_12_sats": (
+                first.get("fix_type") == 3
+                and first.get("satellites_visible") == 12
+            ),
+            "lat_lon_follow_motive_position": (
+                abs(first.get("lat_e7", 0) - expected_lat_e7) <= 2
+                and abs(first.get("lon_e7", 0) - expected_lon_e7) <= 2
+            ),
+            "position_maintained": (
+                horizontal_drift <= GPS_INPUT_POSITION_TOL_M
+                and vertical_drift <= GPS_INPUT_POSITION_TOL_M
+            ),
+            "supplier_stopped": status.running is False,
+        }
+        if stub_rows is not None:
+            checks["stub_received_gps_input"] = (
+                stub_rows >= GPS_INPUT_STUB_MIN_ROWS
+            )
+
+        measurements = {
+            "duration_s": GPS_INPUT_SCENARIO_DURATION_S,
+            "motive_feeds": feeds,
+            "gps_input_messages": len(calls),
+            "measured_rate_hz": round(rate_hz, 3),
+            "supplier_sent_count": status.sent_count,
+            "supplier_error_count": status.error_count,
+            "first_lat_e7": first.get("lat_e7"),
+            "first_lon_e7": first.get("lon_e7"),
+            "first_alt_m": (
+                None if not first else round(first.get("alt_m", 0.0), 3)
+            ),
+            "last_time_usec": last.get("time_usec"),
+            "expected_lat_e7": expected_lat_e7,
+            "expected_lon_e7": expected_lon_e7,
+            "horizontal_drift_m": round(horizontal_drift, 4),
+            "vertical_drift_m": round(vertical_drift, 4),
+            "stub_gps_input_rows": stub_rows,
+        }
+        write_observations(out_dir / "observations.csv", [
+            ("gps_input", "measurement", "gps_input_messages",
+             len(calls), ""),
+            ("gps_input", "measurement", "measured_rate_hz",
+             round(rate_hz, 3), "Hz"),
+            ("gps_input", "measurement", "horizontal_drift_m",
+             round(horizontal_drift, 4), "m"),
+        ])
+
+    return {
+        "id": "gps_input",
+        "name": "GPS_INPUT 15Hz 供給（Motive→Pixhawk / 1 ポート運用）",
+        "conditions": {
+            "enabled_by": "AR_HOOK_GPS_INPUT_ENABLE=1",
+            "scenario_enables_supplier": True,
+            "default_state": "無効（既存シナリオは GPS_INPUT を送らない）",
+            "dual_send": "send_GPS3.py を同時に動かさない",
+        },
+        "measurements": measurements,
+        "checks": checks,
+        "pass": all(checks.values()),
+    }
+
+
 SCENARIOS = [
     ("f6152", scenario_f6152),
     ("7f03b", scenario_7f03b),
@@ -1913,6 +2089,7 @@ SCENARIOS = [
     ("disarm", scenario_disarm),
     ("space_takeoff", scenario_space_takeoff),
     ("auto_start", scenario_auto_start),
+    ("gps_input", scenario_gps_input),
 ]
 
 

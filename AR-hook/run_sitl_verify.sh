@@ -197,6 +197,15 @@ sleep 3
 arm_guided
 run_scenario "auto_start（離陸→開始位置→TRACK）" 7_auto_start --only auto_start
 
+# ── 8) GPS_INPUT（AR-hook が Motive→GPS_INPUT を 15Hz で送る 1 ポート運用）──
+# 実機では send_GPS3.py を同時に動かさないこと（同じ Pixhawk への二重送信は
+# EKF を混乱させる）。ここでは AR-hook の供給部だけを有効にして、15Hz 送信と
+# その間の位置維持を測る。
+cmd --timeout 40 land >/dev/null || log "⚠ 着陸できませんでした"
+sleep 8
+arm_guided
+run_scenario "gps_input（GPS_INPUT 15Hz / 位置維持）" 8_gps_input --only gps_input
+
 log ""
 log "================================================================"
 log "結果一覧"

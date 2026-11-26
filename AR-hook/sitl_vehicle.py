@@ -10,6 +10,7 @@ SITL が必要とする MAVLink の契約だけを実装したスタブです。
   - GLOBAL_POSITION_INT (既定 5Hz, MAV_CMD_SET_MESSAGE_INTERVAL を尊重)
   - ATTITUDE (既定 10Hz, 同上。AR-hook は 40Hz を要求する)
   - SET_POSITION_TARGET_GLOBAL_INT (frame 5/6/11 の位置 + yaw を反映)
+  - GPS_INPUT (位置を EKF 推定として採用。gps_input シナリオ用)
   - COMMAND_LONG: MAV_CMD_SET_MESSAGE_INTERVAL / NAV_TAKEOFF / ARM_DISARM
   - home は REF_LAT/REF_LON/REF_ALT から --home-north/--home-east/--home-up だけ
     ずらせる（f6152 の「home と REF をずらした条件」用）
@@ -24,7 +25,7 @@ SITL が必要とする MAVLink の契約だけを実装したスタブです。
     python3 AR-hook1.py --sitl
 
 ログ:
-    setpoints.csv / state.csv / commands.csv / attitude_tx.csv
+    setpoints.csv / state.csv / commands.csv / attitude_tx.csv / gps_input.csv
 """
 import argparse
 import csv
@@ -120,6 +121,7 @@ class SitlVehicle:
         self.next_attitude = 0.0
         self.next_state_log = 0.0
         self.setpoint_count = 0
+        self.gps_input_count = 0
 
         self.loggers = {}
         self._master = None
@@ -150,6 +152,11 @@ class SitlVehicle:
         )
         self.loggers["attitude_tx"] = CsvLogger(
             base / "attitude_tx.csv", ["t_s", "yaw_deg"],
+        )
+        self.loggers["gps_input"] = CsvLogger(
+            base / "gps_input.csv",
+            ["t_s", "time_usec", "fix_type", "lat_e7", "lon_e7", "alt_m",
+             "vn", "ve", "vd", "satellites_visible", "yaw_cdeg"],
         )
         self.args.log_dir = str(base)
         print(f"[SITL] logs: {base}")
@@ -342,6 +349,50 @@ class SitlVehicle:
                 f"yaw={math.degrees(self.target_yaw):.1f}deg"
             )
 
+    def _handle_gps_input(self, msg):
+        """GPS_INPUT を EKF の位置推定として採用する（スタブの契約）。
+
+        実 ArduPilot では GPS_TYPE / EKF の設定に依存します。スタブでは
+        「GPS_INPUT が届けばその位置を推定位置として維持する」最小動作にし、
+        gps_input シナリオが位置維持を測れるようにします。
+        """
+        self.gps_input_count += 1
+        lat = float(msg.lat) / 1e7
+        lon = float(msg.lon) / 1e7
+        alt_amsl = float(msg.alt)
+        north = (lat - REF_LAT) * METERS_PER_DEG_LAT
+        east = (lon - REF_LON) * meters_per_deg_lon(REF_LAT)
+        up = alt_amsl - (REF_ALT + float(self.args.home_up))
+
+        if int(msg.fix_type) >= 3:
+            # 推定位置と目標を同じ値にして「その位置を維持」させる。
+            self.north = self.target_north = north
+            self.east = self.target_east = east
+            self.up = self.target_up = up
+
+        logger = self.loggers.get("gps_input")
+        if logger is not None:
+            logger.row([
+                f"{self._t():.6f}",
+                int(msg.time_usec),
+                int(msg.fix_type),
+                int(msg.lat),
+                int(msg.lon),
+                f"{alt_amsl:.4f}",
+                f"{float(msg.vn):.4f}",
+                f"{float(msg.ve):.4f}",
+                f"{float(msg.vd):.4f}",
+                int(msg.satellites_visible),
+                # 古い pymavlink の GPS_INPUT には yaw フィールドが無い。
+                int(getattr(msg, "yaw", 0)),
+            ])
+        if self.gps_input_count <= 2 or self.gps_input_count % 45 == 0:
+            print(
+                f"[SITL] GPS_INPUT #{self.gps_input_count}: "
+                f"fix={int(msg.fix_type)} lat={lat:.7f} lon={lon:.7f} "
+                f"alt={alt_amsl:.3f}m sats={int(msg.satellites_visible)}"
+            )
+
     def _handle_command_long(self, msg):
         command = int(msg.command)
         params = (
@@ -370,6 +421,8 @@ class SitlVehicle:
         msg_type = msg.get_type()
         if msg_type == "SET_POSITION_TARGET_GLOBAL_INT":
             self._handle_setpoint(msg)
+        elif msg_type == "GPS_INPUT":
+            self._handle_gps_input(msg)
         elif msg_type == "COMMAND_LONG":
             self._handle_command_long(msg)
 

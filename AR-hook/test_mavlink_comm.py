@@ -24,6 +24,8 @@ sys.path.insert(0, ARHOOK_DIR)
 
 from pymavlink import mavutil  # noqa: E402
 
+import mavlink_comm  # noqa: E402
+
 from mavlink_comm import (  # noqa: E402
     MavlinkComm,
     MavlinkConnectionError,
@@ -88,6 +90,9 @@ class FakeMav:
 
     def set_position_target_global_int_send(self, *args):
         self._record("set_position_target_global_int_send", args)
+
+    def gps_input_send(self, *args):
+        self._record("gps_input_send", args)
 
     def calls_named(self, name):
         return [call for call in self.calls if call[0] == name]
@@ -410,6 +415,49 @@ def test_thin_api_builds_expected_mavlink_calls():
     assert setpoint_args[5] == 357578000 and setpoint_args[6] == 1362132900
     assert abs(setpoint_args[7] - 1.1) < 1e-9, setpoint_args
     assert abs(setpoint_args[14] - 0.25) < 1e-9, setpoint_args
+    comm.stop()
+
+
+def test_gps_input_builds_expected_mavlink_call():
+    """gps_input() が send_GPS3.py と同じ並び・既定値で送る。"""
+    master = FakeMaster(heartbeat=make_heartbeat())
+    comm = build_comm(master)
+    comm.connect()
+
+    comm.gps_input(
+        1700000000000000, 360757800, 1362132900, 12.5,
+        time_week_ms=252818000, time_week=2288,
+        vn=0.1, ve=-0.2, vd=0.0, yaw_cdeg=9000,
+    )
+
+    calls = master.mav.calls_named("gps_input_send")
+    assert len(calls) == 1, calls
+    args = calls[0][1]
+    assert args[:18] == (
+        1700000000000000, 0, 0, 252818000, 2288, 3,
+        360757800, 1362132900, 12.5,
+        0.8, 1.0, 0.1, -0.2, 0.0,
+        0.1, 0.01, 0.01, 12,
+    ), args
+    # yaw は pymavlink の dialect が対応しているときだけ 19 個目に付く。
+    if mavlink_comm.GPS_INPUT_SUPPORTS_YAW:
+        assert args[18] == 9000, args
+    else:
+        assert len(args) == 18, args
+    comm.stop()
+
+
+def test_gps_input_appends_yaw_only_when_dialect_supports_it(monkeypatch):
+    """GPS_INPUT.yaw がある dialect では centidegree を付加する。"""
+    monkeypatch.setattr(mavlink_comm, "GPS_INPUT_SUPPORTS_YAW", True)
+    master = FakeMaster(heartbeat=make_heartbeat())
+    comm = build_comm(master)
+    comm.connect()
+
+    comm.gps_input(1, 2, 3, 4.0, yaw_cdeg=12345)
+
+    args = master.mav.calls_named("gps_input_send")[0][1]
+    assert len(args) == 19 and args[18] == 12345, args
     comm.stop()
 
 

@@ -26,7 +26,7 @@ AR-hook1.py は現在、次の機能が 1 ファイルに同居しています�
 |---|---|---|---|
 | 1 | 統合プログラム | `AR-hook1.py`（`main`） | 既存を維持（第 1 段階で通信部を接続） |
 | 2 | MAVLink 通信部 | `mavlink_comm.py` | **本タスクで実装済み** |
-| 3 | GPS 供給部 | `gps_supplier.py`（新規予定） | フォローアップ |
+| 3 | GPS 供給部 | `gps_supplier.py` | **第 3 段階で実装済み**（既定は無効） |
 | 4 | 機体制御部 | `vehicle_controller.py`（新規予定） | フォローアップ |
 | 5 | Motive 受信部 | `motive_receiver.py`（新規予定） | フォローアップ |
 | 6 | カメラ部 | `camera_tracker.py`（新規予定） | フォローアップ |
@@ -106,13 +106,19 @@ AR-hook1.py からは `m.mav` への直接アクセスを完全に削除しま�
   `MavlinkSendError`）と `link_lost` / `on_link_lost` で通知。
 - メッセージの意味解釈（離陸判断・目標生成）は**しない**。それは機体制御部の仕事。
 
-**3. GPS 供給部（`gps_supplier.py`、フォローアップ）**
-- Motive 受信部が保持する剛体姿勢から `GPS_INPUT` を生成し、通信部経由で送信。
-- 緯度経度の `1e7` 変換、`unix_time`・`yaw`・精度パラメータの付与。
-- 送信周期（既定 50Hz）と「最新 1 件のみ」キューを持つ。
-- 既存の `AR-hook/send_GPS3.py`（`ArduPilotConnector`）のロジックを移植する。
-- 注意: 現行 `AR-hook1.py` は GPS_INPUT を送っていない。分離時も既定は「送らない」とし、
-  明示的に有効化した場合のみ送る（挙動変更を避ける）。
+**3. GPS 供給部（`gps_supplier.py`・実装済み）**
+- Motive 受信部が保持する剛体姿勢（剛体 ID=1）から `GPS_INPUT` を生成し、
+  通信部の `gps_input()` 経由で送信する。
+- 緯度経度の `1e7` 変換、`unix_time`・`yaw`・精度パラメータの付与は
+  `send_GPS3.py` と同一（REF 基準・AMSL スケール）。
+- 送信周期は **15 Hz**（`GPS_INPUT_RATE_HZ = 15.0`）。「最新 1 件のみ」キュー
+  （`deque(maxlen=1)`）から送る。速度は位置差分 + 指数平滑で求める。
+- 既定は **無効**（`AR_HOOK_GPS_INPUT_ENABLE=0`）。無効時はスレッドも作らず、
+  送信 API も呼ばない。有効時は起動ログに
+  `GPS_INPUT: 有効（15Hz, REF基準）` と `send_GPS3.py` 同時運用禁止を表示する。
+- 実機はシリアル 1 本（`/dev/ttyAMA0`）のため、`send_GPS3.py` と同時に
+  GPS_INPUT を送ってはならない（二重送信で EKF が混乱する）。プロセス検知は
+  行わず、運用で排他する。
 
 **4. 機体制御部（`vehicle_controller.py`、フォローアップ）**
 - 通信部の最新値（位置・姿勢・モード・アーム状態）とカメラ部の検出結果を参照し、
@@ -231,6 +237,12 @@ class MavlinkComm:
     def takeoff(self, alt_m: float) -> None
     def setpoint(self, lat_e7: int, lon_e7: int, alt_m: float,
                  yaw_rad=0.0, type_mask=0x09F8, frame=None) -> None
+    def gps_input(self, time_usec: int, lat_e7: int, lon_e7: int, alt_m: float,
+                  gps_id=0, ignore_flags=0, time_week_ms=0, time_week=0,
+                  fix_type=3, hdop=0.8, vdop=1.0,
+                  vn=0.0, ve=0.0, vd=0.0,
+                  speed_accuracy=0.1, horiz_accuracy=0.01, vert_accuracy=0.01,
+                  satellites_visible=12, yaw_cdeg=0) -> None
 ```
 
 ```python
@@ -265,21 +277,38 @@ class MavlinkSendError(MavlinkError)          # 送信失敗・切断中の送�
 **公開しないもの**: `_master`（pymavlink 接続）、`_send`、`_rx_loop`、`_state_lock`、
 `_send_lock`。他コンポーネントは `snapshot()` と上記の送信 API 以外を使いません。
 
-### 2.3 GPS 供給部（`gps_supplier.py`・予定）
+### 2.3 GPS 供給部（`gps_supplier.py`・実装済み）
 
 ```python
-class GpsSupplier:
-    def __init__(self, comm: MavlinkComm, ref_lat: float, ref_lon: float,
-                 ref_alt: float, rate_hz: float = 50.0,
-                 enabled: bool = False, logger=print) -> None
-    def start(self) -> None
-    def stop(self, timeout=2.0) -> None
-    def update_pose(self, rigid_body_id: int, position_ned: tuple[float, float, float],
-                    unix_time_s: float, yaw_rad: float) -> None
-    def status(self) -> "GpsSupplierStatus"
+# 純関数（ハードウェア不要で試験可能）
+def build_gps_input(position_ned, unix_time_s, yaw_rad=0.0,
+                    velocity_ned=(0.0, 0.0, 0.0)) -> GpsInputFields
+def gps_week_and_time_ms(unix_time_s) -> tuple[int, int]
+def normalize_yaw_cdeg(yaw_rad) -> int
+
+class VelocityEstimator:                     # 位置差分 + 指数平滑
+    def update(self, position_ned, timestamp_s) -> tuple[float, float, float]
+    def reset(self) -> None
+
+class GpsInputSupplier:
+    def __init__(self, comm: MavlinkComm, enabled: bool = False,
+                 rate_hz: float = 15.0, logger=print,
+                 monotonic=time.monotonic, sleep=time.sleep,
+                 velocity_smoothing: float = 0.25) -> None
+    def start(self) -> bool                  # 無効時は False（スレッドを作らない）
+    def stop(self, timeout: float = 2.0) -> None
+    def update_pose(self, position_ned, unix_time_s,
+                    yaw_rad=None) -> bool    # Motive 受信スレッドから
+    def status(self) -> GpsSupplierStatus
 ```
 
-`MavlinkComm` には第 3 段階で `gps_input(...)` を追加する（送信ロック内で 1 メッセージ）。
+`AR-hook1.py` は `publish_gps_input_pose(rigid_body_id, position_ned,
+unix_time_s, yaw_rad)` で剛体 ID=1 の最新位置だけを供給部へ渡します（`io_lock` 外）。
+有効化は `AR_HOOK_GPS_INPUT_ENABLE=1` のときだけで、無効時は供給部を生成しても
+送信スレッドを開始しません（`gps_input()` は呼ばれません）。
+`MavlinkComm.GPS_INPUT_SUPPORTS_YAW` は pymavlink の GPS_INPUT 定義に `yaw` が
+あるかを起動時に判定し、無い dialect では yaw を付加しません（19 個目の引数が
+`force_mavlink1` として解釈されるのを防ぐ）。
 
 ### 2.4 機体制御部（`vehicle_controller.py`・予定）
 
@@ -332,7 +361,8 @@ class CameraTracker:
 | `monitor_vehicle` | `AR-hook1.py` | 10Hz（`SEND_HZ`） | `snapshot()` 読み → モード遷移・離陸・gps_now 更新 | 受信 API を呼ばない |
 | `control_loop` | `AR-hook1.py` | 20Hz（sleep 0.05） | キー入力 → 目標更新 → `comm.setpoint()` | デーモンでない（join 対象） |
 | `record_data` | `AR-hook1.py` | 40Hz（`AR_LOG_HZ`） | `io_lock` 内でスナップショット → `data_records.append` | CSV 列は追加のみ可 |
-| `motive_rigid_body_pose_udp_listener` | `AR-hook1.py` | UDP 到着駆動（timeout 0.5s） | 剛体姿勢の最新値・履歴・時計オフセット更新 | 第 2 段階で Motive 受信部へ |
+| `motive_rigid_body_pose_udp_listener` | `AR-hook1.py` | UDP 到着駆動（timeout 0.5s） | 剛体姿勢の最新値・履歴・時計オフセット更新、ID1 を供給部へ | 第 2 段階で Motive 受信部へ |
+| `gps-input` | `gps_supplier.GpsInputSupplier._send_loop` | 15Hz（有効時のみ） | 最新の ID1 位置 → `comm.gps_input()` | 無効時はスレッドを作らない |
 | `ThreadingHTTPServer` | `start_camera_stream_server` | リクエスト駆動 | MJPEG 配信（`_camera_stream_lock`） | 第 5 段階でカメラ部へ |
 | （未起動）`motive_udp_listener` | `AR-hook1.py` | — | 15769 の GPS 剛体受信 | 現在 `main` から起動していない |
 
@@ -344,6 +374,7 @@ class CameraTracker:
 | キーボードスレッド | `comm.setpoint()` | 20Hz（キー入力時のみ） |
 | 状態監視スレッド | `comm.takeoff()` | 1 回（Guided + Arm 後 3 秒） |
 | 統合プログラム（起動時） | `comm.set_message_interval()` | 3 回 |
+| GPS 供給部（有効時） | `comm.gps_input()` | 15Hz |
 
 すべて `_send_lock` を取るため、シリアルへ同時に書き込むスレッドは常に 1 本です。
 送信専用スレッドを別に立てない理由は、送信順序（離陸 → setpoint など）を保証するためです。
@@ -352,7 +383,7 @@ class CameraTracker:
 
 ## 4. データフロー
 
-### 4.1 Motive UDP → GPS 供給部 → MAVLink 送信（第 3 段階で有効化）
+### 4.1 Motive UDP → GPS 供給部 → MAVLink 送信（第 3 段階・実装済み）
 
 ```
 Motive (UDP 15770 / 15769)
@@ -362,7 +393,7 @@ Motive (UDP 15770 / 15769)
 │ Motive 受信部        │ ────────────────────────▶ │ GPS 供給部           │
 │  - パケット検証      │                           │  - NED → 緯度経度    │
 │  - 最新位置/姿勢保持 │                           │  - GPS_INPUT 生成     │
-│  - 時計オフセット推定│                           │  - 50Hz 送信ループ    │
+│  - 時計オフセット推定│                           │  - 15Hz 送信ループ    │
 └──────────────────────┘                           └──────────┬───────────┘
                                                               │ comm.gps_input()
                                                               ▼
@@ -580,13 +611,17 @@ monitor_vehicle record_data 機体制御部(予定) CSV 保存（終了時）
   カメラスレッドと CSV 記録が読む変数名・値は変わらない。
 - 受け入れ: 同じ Motive パケット列を流して、移行前後で CSV の Motive 列が一致すること。
 
-### 第 3 段階: GPS 供給部の分離（フォローアップ）
+### 第 3 段階: GPS 供給部の分離（実装済み）
 
-- 新規: `gps_supplier.py`（`GpsSupplier`）。`send_GPS3.py` の `GPS_INPUT` 生成を移植。
+- 新規: `gps_supplier.py`（`GpsInputSupplier` / `build_gps_input` / `VelocityEstimator`）。
+  `send_GPS3.py` の `GPS_INPUT` 生成を移植し、`AR-hook1.py` から Motive の ID1 位置を渡す。
 - `MavlinkComm` に `gps_input(...)`（送信ロック内の薄い API）を追加。
-- **中間状態**: 既定は `enabled=False`（GPS_INPUT を送らない）。有効化は明示設定のみ。
-  有効時も送信周期・座標変換は `send_GPS3.py` と同一で、既存の MAVLink 送信経路に影響しない。
-- 受け入れ: `enabled=False` で従来と完全同一の MAVLink 送信ログになること。
+- **中間状態（既定）**: `AR_HOOK_GPS_INPUT_ENABLE=0` では供給部の送信スレッドを作らず、
+  `gps_input()` を呼ばない。既存の MAVLink 送信経路・CSV 列は変わらない。
+- **有効時**: 15Hz・REF 基準・Motive と同じ AMSL スケールで送る。速度は位置差分 +
+  指数平滑。`send_GPS3.py` と同時に動かさない（1 ポート運用）。
+- 受け入れ: `enabled=False` で従来と同一の MAVLink 送信ログになること（
+  `test_gps_supplier.py` の「無効時は送信 API を呼ばない」と SITL 既存 8 シナリオ）。
 
 ### 第 4 段階: 機体制御部の分離（フォローアップ）
 
@@ -658,9 +693,9 @@ python3 test_mavlink_comm.py
 以下は**明示的に後続タスク**とします。本タスクでは設計（公開 API・スレッド・ロック方針）
 のみ確定し、実装は行いません。
 
-1. **GPS 供給部の分離**（`gps_supplier.py`）
-   - `send_GPS3.py` の `GPS_INPUT` 生成ロジック移植、`MavlinkComm.gps_input()` 追加。
-   - 送信周期・精度パラメータ・有効化フラグの設計。
+1. ~~**GPS 供給部の分離**（`gps_supplier.py`）~~
+   - 第 3 段階として実装済み（`MavlinkComm.gps_input()`、15Hz、既定は無効）。
+   - 残作業は実機での GPS_TYPE / EKF 設定確認のみ（SITL では `verify_sitl.py --only gps_input`）。
 2. **機体制御部の分離**（`vehicle_controller.py`）
    - モード遷移・離陸判断・キーボード操作・目標管理の移動。
    - `guided_mode_active` / `initial_target_set` のロック内スナップショット化。
@@ -680,4 +715,5 @@ python3 test_mavlink_comm.py
 | 日付 | 内容 |
 |---|---|
 | 2026-11-18 | 初版。6 コンポーネントの責務・公開 API・スレッドモデル・データフロー・共有状態・移行手順を定義。第 1 段階として `mavlink_comm.py` を実装し、AR-hook1.py を通信部経由へ置換。前提タスクの送信ロックを `MavlinkComm._send_lock` へ移設。 |
+| 2026-11-26 | 第 3 段階（GPS 供給部）を実装。`gps_supplier.py`（15Hz・REF 基準・速度平滑化）と `MavlinkComm.gps_input()` を追加し、Motive の剛体 ID=1 位置から GPS_INPUT を送れるようにした。既定は無効（`AR_HOOK_GPS_INPUT_ENABLE=0`）。SITL に `gps_input` シナリオを追加（全 9 シナリオ）。 |
 

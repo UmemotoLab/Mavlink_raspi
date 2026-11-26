@@ -47,6 +47,13 @@ from mavlink_comm import (
     MavlinkConnectionError,
     MavlinkTimeoutError,
 )
+# ✅ Motive 位置から GPS_INPUT を生成する GPS 供給部（第 3 段階）。
+#    1 シリアル運用で send_GPS3.py とポートを奪い合わないよう、AR-hook 自身が
+#    15Hz で送れるようにします。既定は無効（AR_HOOK_GPS_INPUT_ENABLE=1 で有効）。
+from gps_supplier import (
+    GPS_INPUT_ENV_VAR,
+    GpsInputSupplier,
+)
 # ✅ 接続先は本番デフォルト（/dev/ttyAMA0, 1000000bps, RTS/CTS）のまま、
 #    環境変数 / 起動引数 / 対話入力で SITL（UDP）へ切り替えられます。
 #    既定値とプロンプトの既定（1=Serial）は connection_config.py が保持します。
@@ -229,6 +236,17 @@ TAKEOFF_ALT, TAKEOFF_ALT_SOURCE = _env_float_param(
 AUTO_TAKEOFF_ENABLED, AUTO_TAKEOFF_SOURCE = _env_flag_param(
     AUTO_TAKEOFF_ENV_VAR, 0
 )
+# ───── GPS_INPUT 供給（Motive → Pixhawk）─────
+# 実機はシリアル 1 本（/dev/ttyAMA0）しか使えないため、send_GPS3.py と同じ
+# ポートを奪い合わないよう、AR-hook 自身が Motive 位置から GPS_INPUT を
+# 15Hz で送れるようにします。既定は無効（従来どおり一切送らない）。
+#   AR_HOOK_GPS_INPUT_ENABLE=1 → 有効（Motive の ID1 位置を受信してから送信開始）
+# 注意: 有効時は send_GPS3.py を同時に動かさないでください（二重送信で EKF 混乱）。
+GPS_INPUT_ENABLED, GPS_INPUT_SOURCE = _env_flag_param(
+    GPS_INPUT_ENV_VAR, 0
+)
+# 供給部の実体（main() で生成・起動。Motive 受信スレッドはこの変数を参照する）
+gps_input_supplier = None
 # ───── ArUco・カメラ追跡設定 ─────
 MARKER_SIZE = 0.04  # マーカーの一辺の長さ（メートル、4cm）
 ID_CENTER_MARKER = 1  # 正方形の中心に配置されるマーカーID（ID 1）
@@ -879,6 +897,27 @@ def _apply_motive_camera_pose(position_ned, qx, qy, qz, qw, timestamp):
         t_cam_world = cam_pos_corrected.copy()
         motive_camera_received = True
 
+
+def publish_gps_input_pose(rigid_body_id, position_ned, unix_time_s,
+                           yaw_rad=None):
+    """Motive 受信スレッドから GPS 供給部へ最新位置を渡す（剛体 ID=1 のみ）。
+
+    供給部が無効（`gps_input_supplier is None` または enabled=False）のときは
+    何もせず False を返します。既定動作（GPS_INPUT を送らない）は変わりません。
+    io_lock は保持せずに呼び出してください（位置は値のコピー）。
+    """
+    supplier = gps_input_supplier
+    if supplier is None:
+        return False
+    try:
+        is_drone = int(rigid_body_id) == 1
+    except (TypeError, ValueError):
+        return False
+    if not is_drone:
+        return False
+    return supplier.update_pose(position_ned, unix_time_s, yaw_rad=yaw_rad)
+
+
 def motive_udp_listener():
     global motive_drone_x, motive_drone_y, motive_drone_z
     global motive_roll_rad, motive_pitch_rad, motive_yaw_rad
@@ -1104,6 +1143,13 @@ def motive_rigid_body_pose_udp_listener():
                 with io_lock:
                     motive_drone_x, motive_drone_y, motive_drone_z = position_ned
                     motive_drone_pos_received = True
+                    # GPS_INPUT の yaw は ID1 の NED 姿勢から作る（0=北）。
+                    gps_input_yaw_rad = motive_rigid_body_attitudes_ned[1][2]
+                # io_lock を離れてから供給部へ渡す（送信ロックをロック内で取らない）。
+                # 供給部が無効なら False を返すだけで、従来動作は変わらない。
+                publish_gps_input_pose(
+                    1, position_ned, timestamp, yaw_rad=gps_input_yaw_rad
+                )
             elif rigid_body_id == 2:
                 with io_lock:
                     motive_cargo_x, motive_cargo_y, motive_cargo_z = position_ned
@@ -3782,16 +3828,17 @@ CONTROL_THREAD_JOIN_TIMEOUT_S = 2.0
 
 
 def finalize_shutdown(comm, control_thread=None, stream_server=None,
-                      join_timeout=None):
+                      join_timeout=None, gps_supplier=None):
     """終了処理を 1 箇所にまとめ、CSV 保存を必ず実行する。
 
     順序は従来どおり変えない:
       1. running=False（各スレッドへ停止を通知）
       2. キーボード制御スレッドの終了待機（join はタイムアウト付き）
-      3. comm.stop()（受信スレッド停止・シリアル/UDP を閉じる）
-      4. save_csv()（記録の保存）
+      3. GPS_INPUT 供給スレッドの停止（有効時のみ）
+      4. comm.stop()（受信スレッド停止・シリアル/UDP を閉じる）
+      5. save_csv()（記録の保存）
 
-    2 の join がタイムアウトしても 3・4 を続行する。save_csv() は finally で
+    2 の join がタイムアウトしても 3〜5 を続行する。save_csv() は finally で
     呼ぶため、join のタイムアウト・comm.stop() の例外でも保存を試みる。
     戻り値は「制御スレッドが期限内に終了したか」（終了不要なら True）。
     """
@@ -3820,6 +3867,13 @@ def finalize_shutdown(comm, control_thread=None, stream_server=None,
                 )
     finally:
         try:
+            # GPS_INPUT の送信スレッドを通信部より先に止める
+            # （送信中にシリアルを閉じない）。無効時は None で何もしない。
+            if gps_supplier is not None:
+                try:
+                    gps_supplier.stop()
+                except Exception as exc:
+                    print(f"⚠ GPS_INPUT 供給部の停止に失敗しました ({exc})")
             if comm is not None:
                 comm.stop()
         finally:
@@ -3831,7 +3885,7 @@ def finalize_shutdown(comm, control_thread=None, stream_server=None,
 
 # ───── メイン関数 ─────
 def main(argv=None):
-    global running
+    global running, gps_input_supplier
     # 接続先の切り替え引数だけを解釈する（引数なしなら従来どおり対話プロンプト）。
     args = build_arg_parser().parse_args(argv)
     stream_server = None
@@ -3888,6 +3942,13 @@ def main(argv=None):
         comm = connect_mavlink(args=args)
         set_msg_rate(comm)            # 受信頻度の要求（送信ロック内）
         comm.start()                  # 受信スレッドを 1 本だけ開始
+
+        # ───── GPS_INPUT 供給（Motive → Pixhawk）─────
+        # 有効時だけ送信スレッドを開始する（既定は無効 = 従来どおり送らない）。
+        # 起動ログ「GPS_INPUT: 有効（15Hz, REF基準）」と、send_GPS3.py との
+        # 同時運用禁止は GpsInputSupplier.start() が 1 行ずつ表示します。
+        gps_input_supplier = GpsInputSupplier(comm, enabled=GPS_INPUT_ENABLED)
+        gps_input_supplier.start()
         
         # ───── カメラ向きソースの選択 ─────
         global CAMERA_ORIENTATION_SOURCE
@@ -3959,7 +4020,10 @@ def main(argv=None):
         # save_csv()）は変えずに finalize_shutdown() へ集約する。
         # スレッド停止は join(timeout) で行うため、戻らない環境
         # （macOS の疑似 TTY 等）でも save_csv() が必ず実行される。
-        finalize_shutdown(comm, control_thread, stream_server)
+        finalize_shutdown(
+            comm, control_thread, stream_server,
+            gps_supplier=gps_input_supplier,
+        )
 if __name__ == "__main__":
     main()
 

@@ -48,6 +48,31 @@ DEFAULT_TYPE_MASK = 0x09F8          # SET_POSITION_TARGET_GLOBAL_INT の type_ma
 DEFAULT_YAW_RAD = 0.0               # 目標 Yaw（北向き固定）
 GUIDED_CUSTOM_MODE = 4              # ArduCopter の GUIDED モード番号
 
+# ───── GPS_INPUT（Motive → Pixhawk）─────
+# 既定値は send_GPS3.py の gps_input_send() と同じ値です。
+DEFAULT_GPS_FIX_TYPE_3D = 3         # GPS_INPUT.fix_type: 3D fix
+DEFAULT_GPS_SATELLITES = 12         # GPS_INPUT.satellites_visible
+DEFAULT_GPS_HDOP = 0.8              # GPS_INPUT.hdop
+DEFAULT_GPS_VDOP = 1.0              # GPS_INPUT.vdop
+DEFAULT_GPS_SPEED_ACCURACY = 0.1    # GPS_INPUT.speed_accuracy [m/s]
+DEFAULT_GPS_HORIZ_ACCURACY = 0.01   # GPS_INPUT.horiz_accuracy [m]
+DEFAULT_GPS_VERT_ACCURACY = 0.01    # GPS_INPUT.vert_accuracy [m]
+
+
+def _gps_input_supports_yaw():
+    """pymavlink の GPS_INPUT が yaw（centidegree）を持つかを返す。
+
+    MAVLink の GPS_INPUT.yaw は後から追加された拡張フィールドで、古い
+    pymavlink／dialect には存在しない。存在しない環境で 19 個目の引数を渡すと
+    `force_mavlink1` として解釈されてしまうため、フィールド定義を見て付加を決める。
+    """
+    message_class = getattr(mavutil.mavlink, "MAVLink_gps_input_message", None)
+    fieldnames = getattr(message_class, "fieldnames", None)
+    return bool(fieldnames) and "yaw" in fieldnames
+
+
+GPS_INPUT_SUPPORTS_YAW = _gps_input_supports_yaw()
+
 # ───── HEARTBEAT の送信元フィルタ / 武装判定の確定（偽 armed 対策） ─────
 # 破損フレームが HEARTBEAT として復号されると、SAFETY_ARMED ビットが立った
 # 「偽 armed」に見えることがある（実機ベンチで観測）。1 フレームで armed を
@@ -832,6 +857,56 @@ class MavlinkComm:
             )
 
         self._send("SET_POSITION_TARGET_GLOBAL_INT", _send)
+
+    def gps_input(self, time_usec, lat_e7, lon_e7, alt_m,
+                  gps_id=0, ignore_flags=0, time_week_ms=0, time_week=0,
+                  fix_type=DEFAULT_GPS_FIX_TYPE_3D,
+                  hdop=DEFAULT_GPS_HDOP, vdop=DEFAULT_GPS_VDOP,
+                  vn=0.0, ve=0.0, vd=0.0,
+                  speed_accuracy=DEFAULT_GPS_SPEED_ACCURACY,
+                  horiz_accuracy=DEFAULT_GPS_HORIZ_ACCURACY,
+                  vert_accuracy=DEFAULT_GPS_VERT_ACCURACY,
+                  satellites_visible=DEFAULT_GPS_SATELLITES,
+                  yaw_cdeg=0):
+        """GPS_INPUT を送る（Motive → Pixhawk の位置供給）。
+
+        引数の並びは pymavlink の ``gps_input_send()`` と同じです。既定値は
+        ``send_GPS3.py`` と同一（fix_type=3 / 12 衛星 / hdop 0.8 / vdop 1.0 /
+        speed_accuracy 0.1 / horiz・vert 0.01）。送信は他の API と同じく
+        ``_send_lock`` 内で 1 メッセージだけ行います。
+
+        Args:
+            time_usec: UNIX 時刻 [us]（GPS_INPUT.time_usec）。
+            lat_e7, lon_e7: 緯度・経度（度 × 1e7 の整数）。
+            alt_m: 高度 [m]（REF_ALT と同じ AMSL スケール）。
+            gps_id: GPS インスタンス番号（既定 0）。
+            ignore_flags: 無視するフィールドのビットマスク（既定 0 = 全て使用）。
+            time_week_ms, time_week: GPS 週と週内ミリ秒（0 は未設定）。
+            fix_type: 3 = 3D fix。
+            hdop, vdop: 精度（DOP）。
+            vn, ve, vd: 速度 [m/s]（NED）。
+            speed_accuracy, horiz_accuracy, vert_accuracy: 推定精度。
+            satellites_visible: 可視衛星数。
+            yaw_cdeg: 機首方位 [centidegree]（0〜35999、NED）。
+        """
+
+        def _send(master):
+            arguments = [
+                int(time_usec), int(gps_id), int(ignore_flags),
+                int(time_week_ms), int(time_week), int(fix_type),
+                int(lat_e7), int(lon_e7), float(alt_m),
+                float(hdop), float(vdop),
+                float(vn), float(ve), float(vd),
+                float(speed_accuracy), float(horiz_accuracy),
+                float(vert_accuracy), int(satellites_visible),
+            ]
+            # yaw は古い pymavlink に無い。無い環境で渡すと force_mavlink1 に
+            # 化けるため、フィールドがあるときだけ付加する。
+            if GPS_INPUT_SUPPORTS_YAW:
+                arguments.append(int(yaw_cdeg))
+            master.mav.gps_input_send(*arguments)
+
+        self._send("GPS_INPUT", _send)
 
     def _send(self, description, sender):
         """送信ロック内で sender(master) を実行する唯一の入口。

@@ -360,6 +360,7 @@ NaN などの異常計測では前回目標を維持する。
 | 6 | yaw | 固定値・範囲チェック・rad 変換 | OK | `test_yaw...`（180→π、不正値は SystemExit） |
 | 7 | 送信直列化 | `_send_lock` 1 本・生送信なし | OK | `test_send_serialization...` + `test_mav_send_lock.py` |
 | 8 | オフセット誤差 | クランプ・レート制限内 | OK | `test_offset...`（step ≤ 0.0125、偏差 ≤ 1.20、対照は発散） |
+| 9 | GPS_INPUT 供給 | 既定は送らない。有効時のみ 15Hz。二重送信しない | OK（SITL / モック） | `test_gps_supplier.py`（無効時 0 件・15Hz 仮想時計）、`verify_sitl.py --only gps_input`、§1.11 |
 
 ---
 
@@ -386,6 +387,31 @@ NaN などの異常計測では前回目標を維持する。
 - モード遷移要求（GUIDED への変更要求）・arm/disarm・着陸指令は一切送りません。
 - 机上検証は `test_auto_start.py`（ハードウェア不要）と
   `verify_sitl.py --only auto_start`（ArduPilot SITL）で行います。
+
+### 1.11 GPS_INPUT 供給（1 ポート運用 / `AR_HOOK_GPS_INPUT_ENABLE`）
+
+**期待（既定 = 安全側）**: GPS_INPUT を送らない。明示的に
+`AR_HOOK_GPS_INPUT_ENABLE=1` を指定したときだけ、Motive 剛体 ID=1 の位置から
+15Hz で送る。ArUco 誘導・離陸・キーボードの判定は変えない。
+
+| 根拠 | 内容 |
+|---|---|
+| `AR-hook1.py` `GPS_INPUT_ENABLED` | `_env_flag_param("AR_HOOK_GPS_INPUT_ENABLE", 0)`。不正値は起動時に `SystemExit` |
+| `AR-hook1.py` `publish_gps_input_pose()` | 剛体 ID=1 のみ供給部へ渡す。供給部が無効なら `False` を返すだけで送信しない |
+| `gps_supplier.GpsInputSupplier.start()` | 無効時は `False` を返し、スレッドも作らない。有効時は 15Hz 送信スレッド 1 本 |
+| `MavlinkComm.gps_input()` | 他の送信と同じ `_send_lock` 内で 1 メッセージ。`io_lock` 保持中に呼ばない |
+| `finalize_shutdown()` | 「GPS 供給部 stop → `comm.stop()` → `save_csv()`」。送信中にシリアルを閉じない |
+| 送信失敗 | 供給部スレッド内で捕捉し、1 秒に 1 回だけ警告。ArUco 誘導スレッドは停止しない |
+| Motive 未受信 | 位置が来るまで送らない（0 件）。途絶時は最後の 1 件を保持して送り続ける（§5.11） |
+
+- **二重送信の禁止**: 有効時は `send_GPS3.py` を同時に動かさない。同じ Pixhawk への
+  2 系統の GPS_INPUT は EKF を混乱させる。プロセス検知は行わない（運用で排他）。
+  起動ログに `⚠ GPS_INPUT: send_GPS3.py を同時に動かさないでください...` を表示する。
+- 自動試験: `test_gps_supplier.py`（生成フィールド・速度平滑化・15Hz 仮想時計・
+  無効時に送信 API が呼ばれないこと・Motive→供給部の ID1 限定・終了順）。
+- SITL: `verify_sitl.py --only gps_input`（15Hz・45 件・位置維持）。
+- **実機未確認（NOT RUN）**: Pixhawk 実機での GPS_INPUT 採用（`GPS_TYPE` / EKF 設定）、
+  Motive 実データでの位置一致、`send_GPS3.py` との排他運用。
 
 ## 2. 注入試験（ハード無しで自動化）
 
@@ -622,6 +648,16 @@ Pixhawk 側の実挙動は未確認です。
 終了が遅れる可能性があります。`q` / ディスアーム後の終了時間は実機で未計測です。
 
 ---
+
+### 5.11 GPS_INPUT 供給の未確認事項
+
+- 実 Pixhawk で GPS_INPUT が EKF に採用されるかは `GPS_TYPE`（例: 14 = MAVLink GPS）と
+  EKF3 の設定に依存します。**実機では未確認（NOT RUN）**。
+- Motive が途絶えた場合、供給部は最後の 1 件を送り続けます。これは「古い位置を GPS として
+  送り続ける」ことを意味するため、飛行中は Motive UDP 15770 の受信を監視してください。
+  GPS_INPUT の速度は 0 に戻りますが、位置は保持されます（EKF 側のイノベーションで棄却され得ます）。
+- `send_GPS3.py` との二重送信は禁止です（EKF 混乱）。プロセス検知は行いません。
+- 実 ArUco 誘導との同時運用（CPU 負荷・UDP 遅延・シリアル帯域）は未確認です。
 
 ## 6. 成果物と再実行方法
 

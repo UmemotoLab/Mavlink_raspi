@@ -187,7 +187,10 @@ def test_shutdown_source_keeps_order_and_uses_join_timeout():
     assert module.CONTROL_THREAD_JOIN_TIMEOUT_S > 0
 
     main_src = src[src.index("def main("):]
-    assert "finalize_shutdown(comm, control_thread, stream_server)" in main_src
+    # 第 3 段階で GPS_INPUT 供給部も終了処理へ渡すようになった（順序は
+    # finalize_shutdown 内で「供給部 → comm.stop() → save_csv()」）。
+    assert "finalize_shutdown(" in main_src
+    assert "gps_supplier=gps_input_supplier" in main_src
     assert "control_thread.join()" not in main_src, (
         "タイムアウト無しの join() が main() に残っています"
     )
