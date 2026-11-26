@@ -236,6 +236,33 @@ TAKEOFF_ALT, TAKEOFF_ALT_SOURCE = _env_float_param(
 AUTO_TAKEOFF_ENABLED, AUTO_TAKEOFF_SOURCE = _env_flag_param(
     AUTO_TAKEOFF_ENV_VAR, 0
 )
+# ───── GUIDED setpoint の定期再送（送信が途切れたときの保険）─────
+# カメラ追従（40Hz）とキー入力（押した瞬間だけ）では、手動キー運用や離陸直後
+# （キーを離している間）に setpoint が途切れ、ArduPilot の GUIDED 目標タイムアウト
+# （GUID_TIMEOUT）に掛かる可能性があります。GUIDED かつ離陸到達後
+# （initial_target_set）は、control_loop が「クランプ済みの target」を一定周期で
+# 再送します（target は変更しません）。
+#   AR_HOOK_SETPOINT_RESEND_HZ=5  → 0.2 秒ごとに再送（既定）
+#   AR_HOOK_SETPOINT_RESEND_HZ=0  → 無効（従来どおりキー／カメラ送信のみ）
+# 範囲 0〜20 の外・数値でない値は起動時にエラー終了します。
+SETPOINT_RESEND_HZ_ENV_VAR = "AR_HOOK_SETPOINT_RESEND_HZ"
+SETPOINT_RESEND_HZ_DEFAULT = 5.0
+SETPOINT_RESEND_HZ_MIN = 0.0
+SETPOINT_RESEND_HZ_MAX = 20.0
+SETPOINT_RESEND_HZ, SETPOINT_RESEND_HZ_SOURCE = _env_float_param(
+    SETPOINT_RESEND_HZ_ENV_VAR,
+    SETPOINT_RESEND_HZ_DEFAULT,
+    "setpoint 再送周期 [Hz]（0 で無効）",
+    SETPOINT_RESEND_HZ_MIN,
+    SETPOINT_RESEND_HZ_MAX,
+)
+# 再送間隔 [s]。0（無効）のときは inf にして「再送しない」を表す。
+SETPOINT_RESEND_INTERVAL_S = (
+    1.0 / SETPOINT_RESEND_HZ if SETPOINT_RESEND_HZ > 0 else float("inf")
+)
+# 経過時間の比較に使う許容差 [s]。time.monotonic() の丸め（例: 0.4 - 0.2 が
+# 0.19999999999999996 になる）で 1 周期ぶん送信が遅れるのを防ぎます。
+SETPOINT_RESEND_TOLERANCE_S = 1e-6
 # ───── GPS_INPUT 供給（Motive → Pixhawk）─────
 # 実機はシリアル 1 本（/dev/ttyAMA0）しか使えないため、send_GPS3.py と同じ
 # ポートを奪い合わないよう、AR-hook 自身が Motive 位置から GPS_INPUT を
@@ -486,6 +513,10 @@ io_lock = threading.Lock()
 # ・送信は必ず「MAVLink 送受信ラッパー」セクションの関数経由で行います。
 initial_target_set = False
 guided_mode_active = False  # Guidedモード判定用
+# GUIDED setpoint を最後に送った時刻（time.monotonic）。カメラスレッドと
+# キーボードスレッドが共有し、定期再送の重複送信を避けるために io_lock 配下で
+# 読み書きします（None は未送信）。書き換えは send_local_target() の 1 箇所です。
+_last_setpoint_sent_s = None
 # ───── スペースキー離陸（手動離陸）の状態 ─────
 # 「スペースキーで離陸 → 床から TAKEOFF_ALT まで自動上昇 → キーで手動移動」の運用で使います。
 #   * SPACE_TAKEOFF_KEY: キーボードスレッドが離陸指令として扱うキー（半角スペース）。
@@ -1399,6 +1430,7 @@ def send_local_target(comm, x, y, z, home_down_m):
     Returns:
         送信した home 相対高度 [m]。
     """
+    global _last_setpoint_sent_s
     lat, lon, _alt_ref = local_xyz_to_gps(x, y, z)
     alt_above_home = local_down_to_home_relative_alt(z, home_down_m)
     # ヨーは固定ヨー設定（TARGET_YAW_DEG / AR_HOOK_TARGET_YAW_DEG、既定 0.0=北向き）
@@ -1406,6 +1438,11 @@ def send_local_target(comm, x, y, z, home_down_m):
         comm, int(lat * 1e7), int(lon * 1e7), alt_above_home,
         yaw_deg=TARGET_YAW_SEND_DEG,
     )
+    # ✅ 送信時刻を io_lock 配下で共有する（定期再送の重複送信防止）。
+    #    送信は済んでいるので、ここから io_lock を取っても取得順序
+    #    （io_lock → 通信部の _send_lock）に反しない。
+    with io_lock:
+        _last_setpoint_sent_s = time.monotonic()
     return alt_above_home
 
 
@@ -1428,6 +1465,53 @@ def can_send_guided_setpoint(guided_active, target_ready, home_down_m):
     if target_ready is not None and not target_ready:
         return False
     return home_down_m is not None and math.isfinite(home_down_m)
+
+
+def resend_target_if_due(comm, now_s=None):
+    """確定済み target を一定周期で再送する（GUIDED 目標タイムアウト対策）。
+
+    カメラ追従（40Hz）とキーボード操作（押した瞬間だけ）では、手動キー運用や
+    離陸直後に setpoint が途切れ、ArduPilot の GUIDED 目標タイムアウト
+    （GUID_TIMEOUT）に掛かる可能性があります。ここでは target を変更せず
+    （commit_target_command() は呼ばない）、クランプ済みの現在 target を
+    send_local_target() で送るだけにします。
+
+    送信条件:
+        * ``AR_HOOK_SETPOINT_RESEND_HZ`` > 0（既定 5Hz。0 で無効）
+        * 直近の送信（カメラ／キーボード経路を含む）から 1/Hz 秒以上経過
+          → カメラが 40Hz で送っている間やキー入力直後は重複送信しない
+        * can_send_guided_setpoint() が真（GUIDED かつ ``initial_target_set``
+          かつ home 高度確定）。GUIDED 以外・未離陸・home 未確定では送らない。
+
+    呼び出し側は io_lock を保持せずに呼び出してください（この関数が内部で取る）。
+
+    Args:
+        comm: MAVLink 通信部（MavlinkComm）
+        now_s: 現在時刻 [s]（省略時は time.monotonic()。テスト用に注入できる）
+
+    Returns:
+        bool: 送信したら True、条件を満たさず送らなかったら False。
+    """
+    if SETPOINT_RESEND_HZ <= 0:
+        return False
+    now = time.monotonic() if now_s is None else float(now_s)
+    with io_lock:
+        last_sent_s = _last_setpoint_sent_s
+        guided_active = guided_mode_active
+        target_ready = initial_target_set
+        home_down_m = gps_origin['z']
+        send_x, send_y, send_z = target['x'], target['y'], target['z']
+    if not can_send_guided_setpoint(guided_active, target_ready, home_down_m):
+        return False
+    if not all(math.isfinite(value) for value in (send_x, send_y, send_z)):
+        return False
+    elapsed_s = None if last_sent_s is None else now - last_sent_s
+    if elapsed_s is not None and elapsed_s < (
+        SETPOINT_RESEND_INTERVAL_S - SETPOINT_RESEND_TOLERANCE_S
+    ):
+        return False
+    send_local_target(comm, send_x, send_y, send_z, home_down_m)
+    return True
 
 
 def rotation_matrix_to_euler_rpy(rotation):
@@ -3507,6 +3591,11 @@ def control_loop(comm):
                         print("⚠ Guidedモードではないため目標を送信しません")
                     else:
                         print("⚠ 離陸地点の高度が未確定のため目標を送信しません")
+            # ✅ GUIDED かつ離陸到達後は、キー入力もカメラ検出も無い間も
+            #    確定済み target を AR_HOOK_SETPOINT_RESEND_HZ（既定 5Hz）で再送する。
+            #    直近にカメラ／キーボード経路が送っていればスキップする
+            #    （＝同じ目標の二重送信をしない）。target は変更しない。
+            resend_target_if_due(comm)
             # running=False を受けたら最大 50ms でループを抜ける（速やかな終了）。
             # 終了処理は join(timeout=...) で待つ設計だが、ここが長引くと
             # 記録停止と CSV 保存が遅れるため、1 回の待機は 50ms に固定する。
@@ -3932,6 +4021,17 @@ def main(argv=None):
             f"タイムアウト {AUTO_START_TIMEOUT_S:.1f}s）"
             if AUTO_START_ENABLED
             else f"無効（{AUTO_START_ENV_VAR}=0、既定どおり離陸後すぐカメラ追従）"
+        )
+    )
+    # キー入力・カメラ検出が無い間も target を再送する周期（GUID_TIMEOUT 対策）
+    print(
+        "ℹ setpoint 定期再送: "
+        + (
+            f"{SETPOINT_RESEND_HZ:.1f}Hz（{SETPOINT_RESEND_INTERVAL_S:.2f}s ごと、"
+            f"設定ソース: {SETPOINT_RESEND_HZ_SOURCE}"
+            f" / 環境変数 {SETPOINT_RESEND_HZ_ENV_VAR}、0 で無効）"
+            if SETPOINT_RESEND_HZ > 0
+            else f"無効（{SETPOINT_RESEND_HZ_ENV_VAR}=0）"
         )
     )
     

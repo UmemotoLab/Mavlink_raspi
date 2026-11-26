@@ -413,6 +413,34 @@ NaN などの異常計測では前回目標を維持する。
 - **実機未確認（NOT RUN）**: Pixhawk 実機での GPS_INPUT 採用（`GPS_TYPE` / EKF 設定）、
   Motive 実データでの位置一致、`send_GPS3.py` との排他運用。
 
+### 1.12 GUIDED setpoint の定期再送（`AR_HOOK_SETPOINT_RESEND_HZ` / GUID_TIMEOUT 対策）
+
+**期待**: GUIDED かつ離陸高度到達後（`initial_target_set=True`）は、キー入力も
+カメラ検出も無い間も、`control_loop` が現在 target を **既定 5Hz（0.2 秒周期）**で
+再送する。これにより ArduPilot の GUIDED 目標タイムアウト（`GUID_TIMEOUT`）が
+成立しない。**既定値（5Hz）とカメラ経路の 40Hz は変更しない**。target は変更しない
+（`commit_target_command()` は呼ばない）。
+
+| 根拠 | 内容 |
+|---|---|
+| `AR-hook1.py` `SETPOINT_RESEND_HZ` | `_env_float_param("AR_HOOK_SETPOINT_RESEND_HZ", 5.0, 範囲 0〜20)`。0 で無効、範囲外・数値でない値は起動時に `SystemExit` |
+| `AR-hook1.py` `SETPOINT_RESEND_INTERVAL_S` | `1/Hz`（既定 0.2 s）。0 のとき `inf`（再送しない） |
+| `AR-hook1.py` `resend_target_if_due()` | 可否は `can_send_guided_setpoint()` を経由（GUIDED 以外・未離陸・home 未確定では送らない）。送るのはクランプ済み `target` を `send_local_target()` に渡すだけ |
+| `send_local_target()` | 送信後に最終送信時刻 `_last_setpoint_sent_s` を `io_lock` 配下で更新（唯一の書き換え元） |
+| `control_loop()` | ループ末尾（50 ms 周期）で `resend_target_if_due(comm)` を呼ぶ。キー入力やカメラが直近に送っていればスキップ（二重送信しない） |
+| 対象外 | 40Hz のカメラ経路・クランプ既定値・GUIDED へのモード変更要求は変更しない |
+
+- 周期と `GUID_TIMEOUT` の関係: 0.2 s 周期は現行 `GUID_TIMEOUT=3.0 s` の **1/15**、
+  `setup_AR-hook1.py` が投入する 30.0 s の **1/150**。再送が 1〜2 回失敗しても
+  3.0 s 以内に 14 回以上送れるため、キーから手を離しても目標は途切れない。
+- 自動試験: `test_setpoint_resend.py`（既定 5Hz・0.2 s 周期・キー入力なしで送信・
+  キー／カメラ直後は重複送信しない・GUIDED 以外／未離陸／home 未確定で送らない・
+  0 で無効・範囲外で起動時エラー・`GUID_TIMEOUT` との周期計算）。
+- SITL: `verify_sitl.py --only setpoint_resend`（キー・カメラを起動せず 4 秒間で
+  20 件・実測 4.8Hz・最小間隔 0.201 s・target 不変・直後再送のスキップ）。
+- **実機未確認（NOT RUN）**: 実機 Pixhawk の `GUID_TIMEOUT` 実値と、キー操作だけの
+  運用でタイムアウトが成立しないことは未確認です。
+
 ## 2. 注入試験（ハード無しで自動化）
 
 **実行**:
@@ -586,6 +614,13 @@ python3 bench_failsafe_check.py --fake-motive --duration 10
 `GUID_TIMEOUT` など Pixhawk 側の設定に依存し、**実機では未確認**です。
 本リポジトリの過去資料（`archive/2026-11-16-unused/setup_ELRS_5.py`）には `GUID_TIMEOUT=3.0` の設定例がありますが、
 現在の機体設定値は確認していません。空中で q / Ctrl+C を使う前に、必ず GUID_TIMEOUT の値を確認してください。
+
+**定期再送との関係（§1.12）**: AR-hook が動いている間は、GUIDED かつ離陸高度到達後なら
+`AR_HOOK_SETPOINT_RESEND_HZ`（既定 5Hz = **0.2 秒周期**）で target を再送し続けます。
+0.2 s は `GUID_TIMEOUT=3.0 s` の 1/15、30.0 s の 1/150 なので、キー入力が無くても
+タイムアウトは成立しません。**タイムアウトが問題になるのは「AR-hook 自体を止めた後」**
+（`q` / Ctrl+C / リンク切断 / 電源断）だけです。再送を `AR_HOOK_SETPOINT_RESEND_HZ=0` で
+無効にした場合は、従来どおりキー入力とカメラ送信の間隔だけが頼りになります。
 
 ### 5.2 GUIDED 再進入時の再離陸指令（自動離陸を有効にした場合のみ）
 

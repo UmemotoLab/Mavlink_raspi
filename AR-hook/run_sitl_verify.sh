@@ -206,6 +206,16 @@ sleep 8
 arm_guided
 run_scenario "gps_input（GPS_INPUT 15Hz / 位置維持）" 8_gps_input --only gps_input
 
+# ── 9) setpoint の定期再送（キー入力なしでも 5Hz で出続ける）──
+# 手動キー運用・離陸直後に setpoint が途切れて GUID_TIMEOUT に掛からないよう、
+# control_loop が現在 target を AR_HOOK_SETPOINT_RESEND_HZ（既定 5Hz = 0.2s）で
+# 再送する。verify_sitl.py はキー入力もカメラも起動せず、再送だけを 4 秒回して
+# 送信レート・間隔・target 不変・重複送信の抑制を測る。
+cmd --timeout 40 land >/dev/null || log "⚠ 着陸できませんでした"
+sleep 3
+arm_guided
+run_scenario "setpoint_resend（キー入力なしで 5Hz 再送）" 9_setpoint_resend --only setpoint_resend
+
 log ""
 log "================================================================"
 log "結果一覧"

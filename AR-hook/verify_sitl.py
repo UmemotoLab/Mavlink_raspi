@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """verify_sitl.py — AR-hook の座標・高度・yaw・クランプ・受信周期・離陸/終了を検証。
 
-ハードウェア（Pixhawk・カメラ・Motive）を使わずに、次の 6 項目を確認します。
+ハードウェア（Pixhawk・カメラ・Motive）を使わずに、次の項目を確認します。
 
   f6152 : 原点・高度基準。home と REF をずらした条件で送信 alt と到達高度。
   7f03b : クランプ。段差目標に対する 1 フレーム移動量と目標偏差の上限。
@@ -14,6 +14,9 @@
   auto_start : 離陸後の自動移動（AR_HOOK_AUTO_START=1 のときだけ）。
   space_takeoff : スペースキー離陸。キー入力を注入し、1 回だけ NAV_TAKEOFF(1.5m) →
             上昇するか。既定では自動離陸が送られないことも同時に確認する。
+  gps_input : AR-hook が Motive→GPS_INPUT を 15Hz で送り、位置が乱れないか。
+  setpoint_resend : キー入力・カメラ検出が無くても setpoint が 5Hz で出続けるか
+            （AR_HOOK_SETPOINT_RESEND_HZ の既定 5Hz、GUID_TIMEOUT 対策）。
 
 実行方法（ハードウェア不要）:
     cd AR-hook
@@ -110,6 +113,17 @@ GPS_INPUT_RATE_MIN_HZ = 13.0
 GPS_INPUT_RATE_MAX_HZ = 17.0
 GPS_INPUT_POSITION_TOL_M = 1.0        # 送信中の位置維持（水平・垂直）
 GPS_INPUT_STUB_MIN_ROWS = 30          # 同梱スタブが受信した GPS_INPUT の最小行数
+
+# ── setpoint_resend（キー入力なしでも target を 5Hz で再送）──
+# AR_HOOK_SETPOINT_RESEND_HZ の既定 5Hz = 0.2 秒周期。4 秒で 20 件程度になる。
+RESEND_SCENARIO_DURATION_S = 4.0
+RESEND_RATE_MIN_HZ = 4.0
+RESEND_RATE_MAX_HZ = 6.0
+RESEND_MIN_MESSAGES = 15              # 4 s × 5Hz = 20 件。起動遅れを見て 15 件以上
+RESEND_MIN_INTERVAL_S = 0.15          # これ未満の連続送信は「二重送信」とみなす
+RESEND_MAX_INTERVAL_S = 0.30          # これ超の空白は「途切れ」とみなす（1.5 周期）
+RESEND_TARGET_TOL_M = 1e-6            # 全 setpoint が同じ目標（target 不変）
+RESEND_POSITION_TOL_M = 0.50          # 再送中に機体位置が動かないこと（実 SITL の目安）
 
 # ── external（実 SITL）でのみ使う値 ──
 # 実 SITL は地上では yaw 指令に追従しないため、ホバリング高度まで上げてから測る。
@@ -2080,6 +2094,227 @@ def scenario_gps_input(module, args):
     }
 
 
+# ──────────────────────────────────────────────
+#  setpoint_resend: キー入力なしでも target を 5Hz で再送し続ける
+# ──────────────────────────────────────────────
+def scenario_setpoint_resend(module, args):
+    """キー入力・カメラ検出が無くても setpoint が 5Hz で出続けるか。
+
+    AR-hook1.py の定期再送（resend_target_if_due()、既定
+    AR_HOOK_SETPOINT_RESEND_HZ=5 → 0.2 秒周期）だけを実 SITL／同梱スタブへ
+    向けて回します。control_loop()（キー入力）もカメラスレッドも起動しないため、
+    「何も操作していない間も target が再送され続ける」ことの検証になります。
+
+    測るもの:
+      * 送信レート（4〜6Hz）と送信件数、送信間隔（二重送信・途切れが無い）
+      * target が書き換わらないこと（commit_target_command を呼ばない）
+      * 直近に送った直後の再送はスキップされること（カメラ／キーとの重複防止）
+      * 再送中に機体位置が動かないこと（実 SITL のみ意味を持つ目安）
+    """
+    timeline = []
+    with vehicle_session(module, args, "setpoint_resend", port_offset=9) as (
+        comm, records, _port, out_dir
+    ):
+        wait_position(comm, timeout=10.0)
+        started = time.monotonic()
+
+        def mark(event, detail=""):
+            timeline.append([
+                len(timeline) + 1, round(time.monotonic() - started, 6),
+                event, detail,
+            ])
+
+        # 離陸前に地上の位置を読み、home（離陸地点）の Down を確定する。
+        # これをしないと home 高度を空中の高さと誤認し、目標 alt が 0 m になる。
+        ground = comm.snapshot().position
+        if ground is None:
+            raise RuntimeError("GLOBAL_POSITION_INT を受信できませんでした")
+        _north0, _east0, home_down_m = module.gps_to_local_xyz(
+            ground.lat / 1e7, ground.lon / 1e7, ground.alt / 1000.0
+        )
+        mark("home_down", f"home_down={home_down_m:.3f} m")
+
+        if args.external_connection:
+            # 実 SITL は GUIDED 位置目標だけでは地上から離陸しない（ensure_airborne）。
+            took_off, alt_after_takeoff = ensure_airborne(
+                module, comm, EXTERNAL_HOVER_ALT_M
+            )
+            mark(
+                "ensure_airborne",
+                f"sent={took_off} rel_alt={alt_after_takeoff}",
+            )
+        else:
+            alt_after_takeoff = _relative_alt_m(comm)
+
+        position = comm.snapshot().position
+        if position is None:
+            raise RuntimeError("GLOBAL_POSITION_INT を受信できませんでした")
+        north, east, down_now = module.gps_to_local_xyz(
+            position.lat / 1e7, position.lon / 1e7, position.alt / 1000.0
+        )
+        # クランプ済み target（現在の水平位置 + ホバリング高度）を固定する。
+        # target は「送信するだけ」で、再送が書き換えないことを検証する。
+        target_down = module.alt_above_home_to_local_down(
+            EXTERNAL_HOVER_ALT_M, home_down_m
+        )
+        with module.io_lock:
+            module.gps_now.update(x=north, y=east, z=down_now)
+            module.gps_origin.update(x=0.0, y=0.0, z=home_down_m)
+            module.target.update(x=north, y=east, z=target_down)
+            module.initial_target_set = True
+            module.guided_mode_active = True
+            module._last_setpoint_sent_s = None
+        target_before = (north, east, target_down)
+        mark(
+            "resend_state",
+            f"target N={north:.3f} E={east:.3f} D={target_down:.3f}",
+        )
+
+        records["setpoints"].clear()
+        measure_started = time.monotonic()
+        mark("resend_loop_start", f"duration={RESEND_SCENARIO_DURATION_S:.1f}s")
+        while time.monotonic() - measure_started < RESEND_SCENARIO_DURATION_S:
+            module.resend_target_if_due(comm)
+            time.sleep(0.01)
+        mark("resend_loop_end")
+
+        calls = list(records["setpoints"])
+        target_after = (module.target["x"], module.target["y"], module.target["z"])
+        after = comm.snapshot().position
+        if after is not None:
+            north1, east1, down1 = module.gps_to_local_xyz(
+                after.lat / 1e7, after.lon / 1e7, after.alt / 1000.0
+            )
+            horizontal_drift = math.hypot(north1 - north, east1 - east)
+            vertical_drift = abs(down1 - target_down)
+        else:
+            horizontal_drift = float("inf")
+            vertical_drift = float("inf")
+
+        # 直近に送った直後の再送はスキップされる（二重送信しない）。
+        count_before_resend = len(records["setpoints"])
+        resend_after_send = module.resend_target_if_due(comm)
+        count_after_resend = len(records["setpoints"])
+        # カメラ相当の 1 回送信 → その直後の再送もスキップされる。
+        module.send_local_target(
+            comm, north, east, target_down, home_down_m
+        )
+        sent_by_camera = len(records["setpoints"])
+        resend_after_camera = module.resend_target_if_due(comm)
+        count_after_camera = len(records["setpoints"])
+        mark(
+            "duplicate_send_check",
+            f"resend_after_send={resend_after_send} "
+            f"resend_after_camera={resend_after_camera}",
+        )
+
+        if len(calls) >= 2:
+            rate_hz = (len(calls) - 1) / (calls[-1]["t_s"] - calls[0]["t_s"])
+            intervals = [
+                later["t_s"] - earlier["t_s"]
+                for earlier, later in zip(calls, calls[1:])
+            ]
+            min_interval = min(intervals)
+            max_interval = max(intervals)
+        else:
+            rate_hz = 0.0
+            min_interval = None
+            max_interval = None
+
+        sent_targets = [
+            _setpoint_local(module, record, home_down_m) for record in calls
+        ]
+        same_target = bool(sent_targets) and all(
+            abs(target[0] - sent_targets[0][0]) <= RESEND_TARGET_TOL_M
+            and abs(target[1] - sent_targets[0][1]) <= RESEND_TARGET_TOL_M
+            and abs(target[2] - sent_targets[0][2]) <= RESEND_TARGET_TOL_M
+            for target in sent_targets
+        )
+
+        checks = {
+            "guided_and_target_ready": bool(
+                module.guided_mode_active and module.initial_target_set
+            ),
+            "messages_sent": len(calls) >= RESEND_MIN_MESSAGES,
+            "measured_rate_5hz": (
+                RESEND_RATE_MIN_HZ <= rate_hz <= RESEND_RATE_MAX_HZ
+            ),
+            "no_duplicate_burst": (
+                min_interval is not None
+                and min_interval >= RESEND_MIN_INTERVAL_S
+            ),
+            "no_setpoint_gap": (
+                max_interval is not None
+                and max_interval <= RESEND_MAX_INTERVAL_S
+            ),
+            "target_not_modified": all(
+                abs(a - b) <= RESEND_TARGET_TOL_M
+                for a, b in zip(target_before, target_after)
+            ),
+            "setpoints_hold_same_target": same_target,
+            "recent_send_suppresses_resend": (
+                resend_after_send is False
+                and count_after_resend == count_before_resend
+                and resend_after_camera is False
+                and count_after_camera == sent_by_camera
+            ),
+            "position_maintained": (
+                horizontal_drift <= RESEND_POSITION_TOL_M
+                and vertical_drift <= RESEND_POSITION_TOL_M
+            ),
+        }
+
+        measurements = {
+            "duration_s": RESEND_SCENARIO_DURATION_S,
+            "resend_hz_setting": round(float(module.SETPOINT_RESEND_HZ), 3),
+            "resend_interval_setting_s": round(
+                float(module.SETPOINT_RESEND_INTERVAL_S), 6
+            ),
+            "setpoint_messages": len(calls),
+            "measured_rate_hz": round(rate_hz, 3),
+            "min_interval_s": (
+                None if min_interval is None else round(min_interval, 4)
+            ),
+            "max_interval_s": (
+                None if max_interval is None else round(max_interval, 4)
+            ),
+            "relative_alt_after_takeoff_m": alt_after_takeoff,
+            "horizontal_drift_m": round(horizontal_drift, 4),
+            "vertical_drift_m": round(vertical_drift, 4),
+            "target_local_ned_m": [round(value, 4) for value in target_before],
+            "timeline": timeline,
+        }
+        write_observations(out_dir / "observations.csv", [
+            ("setpoint_resend", "measurement", "setpoint_messages",
+             len(calls), ""),
+            ("setpoint_resend", "measurement", "measured_rate_hz",
+             round(rate_hz, 3), "Hz"),
+            ("setpoint_resend", "measurement", "max_interval_s",
+             measurements["max_interval_s"], "s"),
+        ])
+
+    return {
+        "id": "setpoint_resend",
+        "name": "setpoint 定期再送（キー入力なしでも 5Hz で送り続ける）",
+        "conditions": {
+            "enabled_by": (
+                f"{module.SETPOINT_RESEND_HZ_ENV_VAR}="
+                f"{module.SETPOINT_RESEND_HZ:g}（既定。0 で無効）"
+            ),
+            "command_path": (
+                "control_loop() -> resend_target_if_due() -> "
+                "can_send_guided_setpoint() -> send_local_target()"
+            ),
+            "target_policy": "target は変更しない（commit_target_command を呼ばない）",
+            "keyboard_and_camera": "起動しない（キー入力・カメラ検出なしの条件）",
+            "duplicate_send": "直近の送信から 1/Hz 秒は再送しない",
+        },
+        "measurements": measurements,
+        "checks": checks,
+        "pass": all(checks.values()),
+    }
+
+
 SCENARIOS = [
     ("f6152", scenario_f6152),
     ("7f03b", scenario_7f03b),
@@ -2090,6 +2325,7 @@ SCENARIOS = [
     ("space_takeoff", scenario_space_takeoff),
     ("auto_start", scenario_auto_start),
     ("gps_input", scenario_gps_input),
+    ("setpoint_resend", scenario_setpoint_resend),
 ]
 
 
