@@ -4,8 +4,17 @@ Motive→ArduPilot GPS送信ブリッジ（15Hz定期送信版）
 - UDPでMotiveデータを受信（50Hz）
 - ArduPilotへ15Hz（66.67ms間隔）で定期送信
 - ラズパイ5対応の高精度タイミング制御
+
+接続先は CLI で指定できる（既定は従来と同じ /dev/ttyAMA0 @1,000,000 rtscts=True）:
+    python3 send_GPS3.py                                          # 既定（従来と同一）
+    python3 send_GPS3.py --device /dev/ttyACM0 --baud 115200 --no-rtscts   # USB 経由
+    python3 send_GPS3.py --device /dev/serial/by-id/usb-...        # ACM 番号変動対策
+    python3 send_GPS3.py --url udpin:0.0.0.0:14560                 # pymavlink URL（device/baud 無視）
+
+送信周期（15Hz）・座標変換・GPS_INPUT のパラメータは変更していない。
 """
 
+import argparse
 import socket
 import struct
 import math
@@ -14,9 +23,27 @@ import threading
 from datetime import datetime
 from pymavlink import mavutil
 
+# ───── 既定の接続先（従来と同じ値。変更しないこと） ─────
+DEFAULT_DEVICE = '/dev/ttyAMA0'   # TELEM1（SERIAL1_BAUD=1000000 / BRD_SER1_RTSCTS=2）
+DEFAULT_BAUD = 1000000
+DEFAULT_RTSCTS = True
+
+
+def describe_connection(device=DEFAULT_DEVICE, baud=DEFAULT_BAUD, rtscts=DEFAULT_RTSCTS, url=None):
+    """起動ログ用の「GPS_INPUT 送信先」1 行を組み立てる（接続はしない）。"""
+    if url:
+        return f"GPS_INPUT 送信先: {url} (pymavlink URL。--device/--baud/--rtscts は使いません)"
+    return f"GPS_INPUT 送信先: {device} (baud={baud}, rtscts={rtscts})"
+
+
 class ArduPilotConnector:
-    def __init__(self):
-        """ArduPilot接続クラス"""
+    def __init__(self, device=DEFAULT_DEVICE, baud=DEFAULT_BAUD,
+                 rtscts=DEFAULT_RTSCTS, url=None):
+        """ArduPilot接続クラス（既定は従来と同じ /dev/ttyAMA0 @1,000,000 rtscts=True）"""
+        self.device = device
+        self.baud = baud
+        self.rtscts = rtscts
+        self.url = url
         self.master = None
         self.target_system = None
         self.target_component = None
@@ -26,8 +53,13 @@ class ArduPilotConnector:
         """ArduPilotに接続"""
         try:
             print("ArduPilot接続開始...")
-            print("telem1通信接続")
-            self.master = mavutil.mavlink_connection('/dev/ttyAMA0', 1000000, rtscts=True)
+            print(describe_connection(self.device, self.baud, self.rtscts, self.url))
+            if self.url:
+                # pymavlink の接続文字列（udpin: / udpout: / tcp: 等）。シリアルは開かない。
+                self.master = mavutil.mavlink_connection(self.url)
+            else:
+                print("telem1通信接続")
+                self.master = mavutil.mavlink_connection(self.device, self.baud, rtscts=self.rtscts)
             
             print("Heartbeat待機中...")
             self.master.wait_heartbeat()
@@ -245,9 +277,13 @@ class PeriodicSender:
             if abs(timing_error) > 10:  # 10ms以上ずれた場合
                 next_send_time = time.time()
 
-def motive_to_ardupilot_bridge_15hz():
+def motive_to_ardupilot_bridge_15hz(device=DEFAULT_DEVICE, baud=DEFAULT_BAUD,
+                                    rtscts=DEFAULT_RTSCTS, url=None):
     """
     Motive→ArduPilot 15Hzブリッジメイン関数
+
+    引数の既定は従来と同一（/dev/ttyAMA0 @1,000,000 rtscts=True）。
+    引数を省略して呼べば、これまでと同じ接続・同じ 15Hz 送信になる。
     """
     
     print("=" * 60)
@@ -255,7 +291,7 @@ def motive_to_ardupilot_bridge_15hz():
     print("=" * 60)
     
     # ArduPilot接続
-    ardupilot = ArduPilotConnector()
+    ardupilot = ArduPilotConnector(device=device, baud=baud, rtscts=rtscts, url=url)
     if not ardupilot.master:
         print("ERROR: ArduPilot接続に失敗しました")
         return
@@ -340,5 +376,44 @@ def motive_to_ardupilot_bridge_15hz():
         udp_receiver.close()
         print("リソースをクリーンアップしました")
 
+def build_parser():
+    """CLI を組み立てる（既定は従来と同じ ttyAMA0 / 1,000,000 / rtscts 有効）。"""
+    parser = argparse.ArgumentParser(
+        description="Motive→ArduPilot GPS_INPUT bridge (15Hz, "
+                    f"default: {DEFAULT_DEVICE} @{DEFAULT_BAUD} rtscts={DEFAULT_RTSCTS})")
+    parser.add_argument("--device", default=DEFAULT_DEVICE,
+                        help=f"シリアルデバイス（既定: {DEFAULT_DEVICE}）")
+    parser.add_argument("--baud", type=int, default=DEFAULT_BAUD,
+                        help=f"ボーレート（既定: {DEFAULT_BAUD}）")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--rtscts", dest="rtscts", action="store_true",
+                       help="RTS/CTS を有効にする（既定）")
+    group.add_argument("--no-rtscts", dest="rtscts", action="store_false",
+                       help="RTS/CTS を無効にする（USB シリアル等）")
+    parser.set_defaults(rtscts=DEFAULT_RTSCTS)
+    parser.add_argument("--url", default=None,
+                        help="pymavlink 接続文字列 (例: udpin:0.0.0.0:14560, "
+                             "udpout:127.0.0.1:14550)。指定時は --device/--baud/--rtscts を無視")
+    return parser
+
+
+def parse_args(argv=None):
+    """CLI 引数を解析する（import 時には接続しない。テストからも呼べる）。"""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.baud <= 0:
+        parser.error(f"--baud は正の整数で指定してください: {args.baud}")
+    if args.url is not None and not args.url.strip():
+        parser.error("--url が空です")
+    return args
+
+
+def main(argv=None):
+    """CLI エントリポイント。引数を解析して 15Hz ブリッジを開始する。"""
+    args = parse_args(argv)
+    motive_to_ardupilot_bridge_15hz(device=args.device, baud=args.baud,
+                                    rtscts=args.rtscts, url=args.url)
+
+
 if __name__ == "__main__":
-    motive_to_ardupilot_bridge_15hz()
+    main()
