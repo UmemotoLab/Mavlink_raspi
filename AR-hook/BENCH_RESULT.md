@@ -363,17 +363,36 @@ HEARTBEAT は **61 件すべて `sys=1` / `comp=1` / `base_mode=0x51` / `custom_
 再計測の記録欄は §7.6 です（**未記入 / NOT RUN**）。手順は
 [REAL_MACHINE_VERIFY.md](./REAL_MACHINE_VERIFY.md) を参照してください。
 
+2026-11-26 に、A（ベンチ再計測）・B（GUIDED 自動移動）・C（ArUco 互換）・D（yaw 撮像）を
+**1 回の実機セッションでまとめて実施するための記録欄**（§7.6.1〜§7.6.4）と、
+[実験手順書.md](./実験手順書.md) §6.1・[CAMERA_YAW_MATERIAL.md](./CAMERA_YAW_MATERIAL.md) を用意しました。
+ただし実機ログの提供が無いため、**A〜D はすべて `NOT RUN` のまま**です（本節の項目も未確認のまま）。
+
 ### 7.6 実機再計測の記録欄（NOT RUN / 人間が記入）
 
-**この欄は未記入（NOT RUN）です。** 本作業環境には実機（Raspberry Pi / Pixhawk）が無いため、
-7.5 の再計測は行っていません。実機での実施と記入は人間が行います。
+**この欄は未記入（NOT RUN）です。** 本作業環境には実機（Raspberry Pi / Pixhawk / カメラ / Motive）が
+無いため、7.5 の再計測は行っていません。実機での実施と記入は人間が行います。
 
+- 実施状態（2026-11-26 時点）: **NOT RUN**。判定対象の実測ログ（`~/arhook_verify_logs/run*.txt`）は
+  本作業環境に存在せず、提供も受けていません。したがって `bench_log_check.py` による**実測の判定は
+  未実施**です（本節に実測値・推測値は入れていません）。7.6.5 は判定ツールの動作確認であり、
+  実機再計測の結果ではありません。
+- 1 回の実機セッションで **A（ベンチ再計測）・B（GUIDED 自動移動）・C（ArUco 互換）・D（yaw 撮像）**
+  をまとめて実施し、A は 7.6.1、B は 7.6.2、C は 7.6.3、D は
+  [CAMERA_YAW_MATERIAL.md](./CAMERA_YAW_MATERIAL.md) に記入します。
+  実施しなかった項目は `NOT RUN` のまま残します（削除しない）。
 - 手順・安全条件・コマンド例: [REAL_MACHINE_VERIFY.md](./REAL_MACHINE_VERIFY.md)
   （§1 安全条件 / §3 手順 / §4 `tee` + `PIPESTATUS` の実行例 / §5 合格基準）
 - 合否の正: `bench_log_check.py` の 1 行サマリ（`[PASS]` / `[FAIL]` と `SUMMARY`）。
   `bench_check.py` の `[判定]` 表示と食い違った場合は `bench_log_check.py` を正とします。
 - 実測ログは `~/arhook_verify_logs/run*.txt` に置き、**リポジトリにはコミットしません**。
   この表には要約だけを記入します。
+
+#### 7.6.1 A. ベンチ再計測（偽 armed 対策の効果確認）
+
+コマンド: `python3 bench_check.py --device /dev/ttyAMA0 --duration 30 --warmup 3`（RTS-CTS 有効）を
+3 回以上（起動直後 1 回 + 落ち着いた状態 2 回以上）、任意で `--no-rtscts` を 1 回。
+**実施しない場合は `NOT RUN` のまま残します。**
 
 | # | 実行 | 日時 (JST) | BAD_DATA | ATTITUDE Hz | GPI Hz | HB Hz | 例外/失敗/TO/競合 | 確定 armed | 偽 armed | exit | 判定 |
 |---|---|---|---:|---:|---:|---:|---|---:|---:|---:|---|
@@ -393,6 +412,105 @@ HEARTBEAT は **61 件すべて `sys=1` / `comp=1` / `base_mode=0x51` / `custom_
 - 合格は 7.4 の基準（BAD_DATA ≤ 10 件 / 30 秒、ATTITUDE ≥ 30 Hz、GPI 4〜6 Hz、HB ≥ 1 Hz、
   例外・競合 0、確定 armed 遷移 0、偽 armed 候補 1 件以下）を **3 回以上すべて**満たしたときだけ。
   7.5 の項目は、この欄が埋まるまで **NOT RUN のまま**とする。
+
+#### 7.6.2 B. GUIDED 自動移動（`AR_HOOK_AUTO_START`、3bb4b）の実機確認
+
+手順と記入欄: [実験手順書.md](./実験手順書.md) §6.1、
+[REAL_MACHINE_VERIFY.md](./REAL_MACHINE_VERIFY.md) 付録2。
+**アームと離陸を伴うため、実施可否は人間が判断します。実施しない場合は `NOT RUN` のまま残します。**
+
+| # | 確認項目 | 実測 / 結果 |
+|---|---|---|
+| B1 | `AR_HOOK_AUTO_START=1` で起動し、`Auto_Start_Phase` が `DISABLED` でない | NOT RUN |
+| B2 | 離陸 → `TAKEOFF_WAIT` → `AUTO_TO_START` の遷移ログ | NOT RUN |
+| B3 | 到着ログ `✓ 自動移動 到着: 水平距離 ... / 高さ差 ... / 経過 ...s` の回数（**1 回**であること） | NOT RUN |
+| B4 | 到着までの時間（到着時点の `Auto_Start_Elapsed_s`） | NOT RUN |
+| B5 | 到着時の水平誤差（Pixhawk 由来 `Auto_Start_Dist_m`、しきい値 0.15 m） | NOT RUN |
+| B6 | 到着時の高さ誤差（到着ログの `高さ差`、しきい値 0.10 m） | NOT RUN |
+| B7 | Motive 真値での水平誤差 / 高度誤差（下記の測り方） | NOT RUN |
+| B8 | 到着後に `TRACK` へ遷移し追従が始まった（`Auto_Start_Phase=TRACK`、`Target_Update_Source=camera`） | NOT RUN |
+| B9 | タイムアウト（30 s）・中断（GUIDED 解除 / disarm / リンク断）が発生していない | NOT RUN |
+| B10 | CSV の `Auto_Start_Phase` / `Auto_Start_Elapsed_s` / `Auto_Start_Dist_m` が記録されている | NOT RUN |
+
+Motive 真値の測り方（推測で埋めないための定義）:
+
+- 到着時点の `Motive_Drone_X/Y/Z_m`（RB1）と「**開始位置を Motive 座標で測った点**」の差を取ります。
+  開始位置は Motive 上にマーカー等で印を付けるか、**離陸前に機体を開始位置へ置いて撮った Motive 記録**を使います。
+- Motive と REF（Pixhawk ローカル NED）は原点が異なるため、**同じ座標系で測った 2 点の差**だけを記録します
+  （REF の値と Motive の値を直接引き算しない）。
+- 高度は `Motive_Drone_Z_m` の差（Down 方向、+ が下降）で評価します。
+
+#### 7.6.3 C. OpenCV 4.6 / ArUco 互換（2f83c）
+
+| # | 確認項目 | 実測 / 結果 |
+|---|---|---|
+| C1 | 起動ログの `ArUco: ArucoDetector (OpenCV 4.7+)` または `ArUco: detectMarkers (OpenCV 4.6 互換)` の実出力 | NOT RUN |
+| C2 | `cv2.__version__` | NOT RUN |
+| C3 | マーカー検出が例外なく継続（`AttributeError` 等で停止しない） | NOT RUN |
+| C4 | `[Tracker]` 行の `IDs=` に 1〜5 が出る（`AR=` が 40 Hz 付近） | NOT RUN |
+| C5 | CSV の `Cargo_Detected` / `ID1_Detected` に 1 の行がある | NOT RUN |
+
+C1 の行は [AR-hook1.py](./AR-hook1.py) の `print(f"ArUco: {aruco_api_label}")`（マーカー追跡ループ開始の直前）が出力します。
+
+#### 7.6.4 D. yaw 実測データの取得（8ac8f の手法A）
+
+撮像データの索引（日時・方位・ファイルパス）は [CAMERA_YAW_MATERIAL.md](./CAMERA_YAW_MATERIAL.md) に列挙します。
+**解析と結論は 8ac8f で行います**（本節では解析しません）。
+
+| # | 確認項目 | 実測 / 結果 |
+|---|---|---|
+| D1 | 機体を既知方位（北/東/南/西など）に固定して床マーカーを撮像した | NOT RUN |
+| D2 | 画像の保存先パス | NOT RUN |
+| D3 | CSV の保存先パス | NOT RUN |
+| D4 | 各撮像の方位（deg、0=北）と機体の向きの与え方 | NOT RUN |
+| D5 | 索引を [CAMERA_YAW_MATERIAL.md](./CAMERA_YAW_MATERIAL.md) に記入した | NOT RUN |
+
+#### 7.6.5 判定ツールの動作確認（実機再計測ではない・参考）
+
+実測ログが無いため合否の判定はできませんが、`bench_log_check.py` が**実機ログを読んで判定できること**は
+対策前のログ（`~/arhook_hw_logs/2026-11-24`, `2026-11-25`）で確認しました。**下記は §7.1〜§7.3 で既報の
+対策前データであり、今回の再計測結果ではありません。合否にも使いません。**
+
+```text
+$ cd AR-hook && python3 bench_log_check.py ~/arhook_hw_logs/2026-11-24/bench_f1.out ; echo exit=$?
+[FAIL] /Users/taitai0123/arhook_hw_logs/2026-11-24/bench_f1.out: exit=2 bad_data=0/4(12s) att=39.86Hz gpi=4.99Hz hb=1.00Hz errors=0/0/0/0 hb_lines=0/0 armed_true=0 fake_armed=0/1
+結果: 不合格（1 ログ）
+exit=1
+
+$ python3 bench_log_check.py --verbose ~/arhook_hw_logs/2026-11-24/bench_f2.out ~/arhook_hw_logs/2026-11-25/bench_locked.out ; echo exit=$?
+[PASS] .../2026-11-24/bench_f2.out: exit=3 bad_data=0/10(30s) att=40.00Hz gpi=5.00Hz hb=1.00Hz errors=0/0/0/0 hb_lines=0/0 armed_true=0 fake_armed=0/1
+[PASS] .../2026-11-25/bench_locked.out: exit=0 bad_data=0/10(30s) att=40.00Hz gpi=5.00Hz hb=1.00Hz errors=0/0/0/0 hb_lines=0/0 armed_true=0 fake_armed=0/1
+SUMMARY: PASS 2 / FAIL 0 / ERROR 0
+結果: 合格（2 ログ）
+exit=0
+```
+
+確認できたこと:
+
+- `exit=2`（安全停止）のログを **FAIL** と判定する（意図どおり）。
+- `ATTITUDE` / `GPI` / `HEARTBEAT` の Hz、`BAD_DATA` の件数と実測ウィンドウ、`errors=a/b/c/d` を
+  ログから読み取れる（例: `bad_data=0/10(30s)`）。
+- `exit=3` は「SKIP が `setpoint 送信レート` だけ」なら合格、`--strict-exit` で厳格判定に切り替わる。
+
+**確認できていないこと**: 対策前のログには `HB遷移:` / `HB生値:` 行が無いため `hb_lines=0/0` となり、
+**偽 armed の判定材料がありません**。偽 armed の判定は、対策後の `bench_check.py` が出力する
+`HB遷移:` / `HB生値:` 行を含む実測ログで行います（§7.6.1）。
+
+#### 7.6.6 不合格時の原因候補と次アクション（コード修正はしない）
+
+実測が不合格だった場合、**コードは修正せず**、次の候補を切り分けて結果と次アクションを
+§7.6.1 の備考に記録します（詳細は
+[REAL_MACHINE_VERIFY.md](./REAL_MACHINE_VERIFY.md) §6.1）。
+
+- **配線**: GND 共通・ケーブル長・コネクタ半挿し。`dmesg | grep -i tty` の overrun / frame error。
+- **終端**: RTS/CTS の実配線と `BRD_SERx_RTSCTS` の不一致。`run4_no_rtscts` との比較。
+- **多重起動**: `pgrep -af` / `sudo lsof /dev/ttyAMA0` が 0 件か。`kill -9` 直後は計測しない。
+- **RTS-CTS**: RTS-CTS 有効 3 回と無効 1 回の差を記録（合否は有効側で判定）。
+- **許容 component**: `HB生値:` の `comp` を確認し、`ARHOOK_HB_ALLOWED_COMPONENTS` を変えるか人間が判断
+  （既定 `{1, 0}` は変更しない）。
+- **REF と離陸地点の差**: `✓ 離陸地点のREF座標` と Motive 原点・開始位置の関係を確認。
+  Motive との比較は同じ座標系の 2 点で行う（[実験手順書.md](./実験手順書.md) §6.1.4）。
+- 解消しない場合はログ（`run*.txt` / `exit_codes.txt`）を保存し、時刻・件数・該当行を添えて報告する。
 
 ### 7.7 自己テスト（ハードウェア不要 / 実行済み）
 
@@ -415,3 +533,7 @@ HEARTBEAT は **61 件すべて `sys=1` / `comp=1` / `base_mode=0x51` / `custom_
   `cd AR-hook && python3 -m pytest -q -p no:cacheprovider --ignore=archive` → **156 passed**
   （既存 128 + 新規 28）。シリアル・ネットワーク・pymavlink を使わない文字列判定のみ。
   実機ログに対する判定結果は §7.6（NOT RUN）。
+- **2026-11-26 実測**: `cd AR-hook && python3 -m pytest -q -p no:cacheprovider --ignore=archive`
+  → **200 passed / 0 failed（33.93 s）**。3bb4b（`AR_HOOK_AUTO_START`、`test_auto_start.py` 24 件）と
+  2f83c（`test_aruco_compat.py`）を含む現行ブランチ全体の結果で、**失敗 0**です。
+  **この数はハードウェア不要のオフライン試験のみ**で、実機の判定（§7.6）は `NOT RUN` のままです。

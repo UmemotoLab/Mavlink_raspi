@@ -24,6 +24,7 @@
 | 既存テストの回帰 | `test_attitude_freshness` 12/12、`test_target_limiter` 12/12、`test_mavlink_comm` 13/13、`test_local_frame` 8/8、`test_mav_send_lock` 成功 |
 | ベンチ再現 | `bench_failsafe_check.py` を追加（送信しない受信モニタ / Motive UDP 停止注入 / 手順表示） |
 | 未確認 | 実機 Pixhawk の GUID_TIMEOUT・RC オーバーライド、実画像でのマーカーロスト、実 Motive 停止、アームを伴う離陸・ディスアーム |
+| 未確認（偽 armed 対策の実機確認） | **NOT RUN**。対策後の実機ベンチでの武装判定（偽 armed の有無・誤停止の有無・遷移ログの実出力）は未実施。記入欄は §1.3.2 |
 
 ### 本確認で行った最小修正（重要）
 
@@ -145,6 +146,44 @@ HB遷移: armed False->True mode UNKNOWN(None)->GUIDED(4) sys=1 comp=1 base_mode
 送信元 comp 1 / comp 0 / comp 2（許容外）/ srcSystem 2（許容外）、単発 armed スパイク、
 2 連続 armed、disarmed 方向の 2 連続、破損（BAD_DATA）と正常の混在、遷移ログの項目、
 `bench_check.SafetyMonitor` の同一フィルタ、`AR-hook1.monitor_vehicle` の偽 armed 非離陸。
+
+#### 1.3.2 実機結果（NOT RUN / 人間が記入）
+
+**状態: NOT RUN。** 本作業環境に実機（Raspberry Pi / Pixhawk）が無いため、対策後の実機ベンチでの
+武装判定は未確認です。判定対象の実測ログ（`~/arhook_verify_logs/run*.txt`）は存在せず、提供も
+受けていません。**「偽 armed 対策済み」と断定できるのは、下表が実測で埋まったときだけ**です。
+
+| # | 確認項目 | 期待 | 実測 / 結果 |
+|---|---|---|---|
+| 1 | 偽 armed の有無（`HB生値:` の `armed_raw=True` が確定 armed に至らない行） | 1 件以下（2 件以上で不合格） | NOT RUN |
+| 2 | 確定 armed への遷移（`HB遷移:` の `armed False->True` / `True->True`） | 0 件 | NOT RUN |
+| 3 | 誤停止（`bench_check.py` が exit 2 で安全停止）の有無 | 0 回（偽 armed 対策後に単発スパイクで止まらない） | NOT RUN |
+| 4 | 遷移ログの実出力（`HB遷移:` / `HB生値:` の行をそのまま貼る） | 下記コードブロックに実出力を貼る | NOT RUN |
+| 5 | 上記 1〜3 を満たした実行回数 | 3 回以上（RTS-CTS 有効） | NOT RUN |
+| 6 | 実測ログに対する `bench_log_check.py` の 1 行サマリ | `fake_armed=N/1`（N≤1）・`armed_true=0` | NOT RUN |
+
+遷移ログの実出力（`tee` で保存したログから `HB遷移:` / `HB生値:` の行を**そのまま**貼る）:
+
+```text
+NOT RUN
+```
+
+判定コマンド（合否の正はこの出力）:
+
+```bash
+cd AR-hook
+python3 bench_log_check.py --verbose "$HOME"/arhook_verify_logs/run*.txt
+echo "bench_log_check.py の終了コード: $?"
+```
+
+記入ルール:
+
+- 実測していない欄は `NOT RUN` のまま残す（空欄にしない・推測で埋めない）。
+- 「偽 armed」は `bench_log_check.py` の `fake_armed=N/1` をそのまま転記する（手計算しない）。
+- 誤停止は `bench_check.py` の終了コード 2 と `⚠ 安全停止: ...` 行の有無で判断する。
+- 不合格だった場合は**コードを直さず**、原因候補（配線・終端・多重起動・RTS-CTS・
+  `ARHOOK_HB_ALLOWED_COMPONENTS` の許容 component・REF と離陸地点の差）と次の処置を
+  [REAL_MACHINE_VERIFY.md](./REAL_MACHINE_VERIFY.md) §6・§8.1 の備考に残す。
 
 ### 1.4 姿勢 stale で自動追従が止まり、目標保持、警告は毎秒 1 回
 

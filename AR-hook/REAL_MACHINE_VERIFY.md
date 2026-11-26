@@ -2,10 +2,14 @@
 
 - 対象: `AR-hook/bench_check.py`（計測ツール）と `AR-hook/bench_log_check.py`（判定ツール）
 - 対象ブランチ: `feature/arhook-fixes`（`main` は `1c6aca1` 固定。本手順は `main` を変更しません）
-- 実施状態: **NOT RUN（未実施）**
+- 実施状態: **NOT RUN（未実施 / 2026-11-26 時点）**
   この手順書を作成した作業環境には Raspberry Pi / Pixhawk / カメラ / Motive が無いため、
   実機への接続・計測・判定は行っていません。**実機の実行と記入は人間が行います。**
-  本文・記入欄（§8・付録1.4）の実測値はすべて `NOT RUN` のままで、推測値は入れていません。
+  本文・記入欄（§8・付録1.4・付録2.2）の実測値はすべて `NOT RUN` のままで、推測値は入れていません。
+  判定対象の実測ログ（`~/arhook_verify_logs/run*.txt`）も提供を受けていません。
+- 1 回の実機セッションで **A（ベンチ再計測 = §1〜§8）**、**B（GUIDED 自動移動 = 付録2 / 実験手順書 §6.1）**、
+  **C（OpenCV 4.6 / ArUco 互換）**、**D（yaw 撮像の索引 = [CAMERA_YAW_MATERIAL.md](./CAMERA_YAW_MATERIAL.md)）**
+  をまとめて実施できます。A の合否判定に B〜D は含めません。
 - 関連文書:
   [BENCH_RESULT.md](./BENCH_RESULT.md)（§7 実機観測の記録 / §7.6 実機再計測の記録欄）、
   [FAILSAFE_CHECKLIST.md](./FAILSAFE_CHECKLIST.md)（偽 armed 対策の根拠）、
@@ -26,9 +30,11 @@
 ### 0.2 確認しないこと（本手順の対象外）
 
 - 飛行・離陸・GUIDED へのモード変更・アーム（**本手順では一切行いません**）
-- カメラ・ArUco 検出精度・Motive 座標精度
+- カメラ・ArUco 検出精度・Motive 座標精度（ただし付録2 の GUIDED 自動移動では、カメラ追従開始の確認だけを行います）
 - 長時間（30 分以上）の連続計測、EMI・ケーブル揺動の評価
-- 付録2 の GUIDED 自動移動（`AR_HOOK_AUTO_START`）は **未実装のため NOT RUN**
+- 付録2 の GUIDED 自動移動（`AR_HOOK_AUTO_START`）は **実装済み（3bb4b）だが実機では未実施（NOT RUN）**。
+  アームと離陸を伴うため、**本手順（§1〜§8）の対象外**です。実施する場合は付録2 と
+  [実験手順書.md](./実験手順書.md) §6.1 の手順に従い、実施可否を人間が判断してください
 
 ### 0.3 ツールの役割
 
@@ -287,12 +293,38 @@ SUMMARY: PASS 4 / FAIL 0 / ERROR 0
 **この手順で「合格」と書けるのは、§5 を満たし §8 を人間が記入したときだけ**です。
 実測していない項目は `NOT RUN` のまま残してください。
 
+### 6.1 原因候補と次アクション（不合格時 / コードは直さない）
+
+実機で不合格になった場合、**このタスクではコードを修正しません**。まず次の候補を切り分け、
+結果と次の処置を本書 §8.1 の備考・[BENCH_RESULT.md](./BENCH_RESULT.md) §7.6.1 に残します。
+
+- **配線（GND 共通・信号線の長さ・コネクタ半挿し）**: GND の共通化、ケーブル長短縮、
+  コネクタの再挿入。`dmesg | grep -i tty` の overrun / frame error を確認。
+- **終端（RTS/CTS 配線・`BRD_SERx_RTSCTS` の不一致）**: 実配線と `BRD_SERx_RTSCTS` の設定を一致させる。
+  `run4_no_rtscts` の結果と比べ、差が出るなら RTS/CTS 側を疑う（合否は RTS-CTS 有効の 3 回で判定）。
+- **多重起動（ポート占有）**: `pgrep -af` / `sudo lsof /dev/ttyAMA0` で 0 件を確認。
+  `kill -9` の直後は計測しない。`mavlink-bridge.service` 等の停止。
+- **RTS-CTS（フロー制御の有効/無効）**: RTS-CTS 有効で 3 回、無効で 1 回を比較し、
+  どちらで BAD_DATA・レート不足が出るかを記録する。
+- **許容 component（`ARHOOK_HB_ALLOWED_COMPONENTS`）**: `HB生値:` の `comp` が `{1, 0}` 以外なら、
+  その値を確認して**設定を変えるかどうかを人間が判断**する（既定 `{1, 0}` は変更しない）。
+  `srcSystem` が 1 以外の HEARTBEAT は状態に使わない仕様（[FAILSAFE_CHECKLIST.md](./FAILSAFE_CHECKLIST.md) §1.3.1）。
+- **REF と離陸地点の差**: `✓ 離陸地点のREF座標: X=/Y=/Down=` と Motive 原点・開始位置の関係を確認。
+  REF（`local_frame.REF_LAT/LON/ALT`）と離陸地点が離れていると、自動移動の目標 N/E・誤差評価が
+  ずれる。Motive との比較は**同じ座標系の 2 点**で行う（[実験手順書.md](./実験手順書.md) §6.1.4）。
+- 切り分けても解消しない場合は、**コードを変更せず**ログ（`run*.txt` と `exit_codes.txt`）を保存し、
+  事象（時刻・件数・`HB遷移:` / `HB生値:` 行）を添えて報告する。
+
 ## 7. 結果の記入先
 
 1. **本書 §8**（詳細。1 実行 1 行）
    - §8.1 実行結果、§8.2 環境、§8.3 `bench_log_check.py` の出力、§8.4 付録1 の記入欄
 2. **[BENCH_RESULT.md](./BENCH_RESULT.md) §7.6「実機再計測の記録欄」**（要約。1 実行 1 行）
-3. ログ実体は `~/arhook_verify_logs/`（`run*.txt` / `exit_codes.txt`）。**リポジトリにはコミットしない**
+   - §7.6.1 = A（ベンチ再計測）、§7.6.2 = B（GUIDED 自動移動）、§7.6.3 = C（ArUco 互換）、
+     §7.6.4 = D（yaw 撮像。索引は [CAMERA_YAW_MATERIAL.md](./CAMERA_YAW_MATERIAL.md)）
+3. **B・C の実測ログ（起動ログ）** も `~/arhook_verify_logs/` に `tee` で保存する
+   （例: `run5_arhook_auto_start.txt` / `run6_aruco.txt`）。**リポジトリにはコミットしない**
+4. ログ実体は `~/arhook_verify_logs/`（`run*.txt` / `exit_codes.txt`）。**リポジトリにはコミットしない**
 
 記入ルール:
 
@@ -316,6 +348,9 @@ SUMMARY: PASS 4 / FAIL 0 / ERROR 0
 
 - 追加で計測した場合は行を足してください（3 回以上あれば合格判定できます）。
 - 「例外/送信失敗/タイムアウト/競合」は `bench_log_check.py` の `errors=a/b/c/d` をそのまま転記します。
+- **§8.1 は A（ベンチ再計測）専用**です。B（GUIDED 自動移動）は
+  [BENCH_RESULT.md](./BENCH_RESULT.md) §7.6.2 / [実験手順書.md](./実験手順書.md) §6.1.3、
+  C（ArUco 互換）は同 §7.6.3 に記入します。
 
 ### 8.2 環境
 
@@ -325,6 +360,7 @@ SUMMARY: PASS 4 / FAIL 0 / ERROR 0
 | Raspberry Pi の機種 | NOT RUN |
 | OS / カーネル | NOT RUN |
 | Python / pymavlink | NOT RUN |
+| OpenCV（`python3 -c 'import cv2; print(cv2.__version__)'`） | NOT RUN |
 | Pixhawk のファームウェア | NOT RUN |
 | `SERIALx_BAUD` / `SERIALx_PROTOCOL` | NOT RUN |
 | `BRD_SERx_RTSCTS` | NOT RUN |
@@ -361,7 +397,9 @@ NOT RUN
 - 実機ログに対する `bench_log_check.py` の判定
 - 付録1 の実機確認（離陸地点 REF 座標ログ、REF_ALT との整合、yaw 表示）
 - 付録1.2 の TAKEOFF 高度（home 相対）の**送信値**の実機確認（アーム + GUIDED が必要）
-- 付録2 の GUIDED 自動移動（`AR_HOOK_AUTO_START` は**未実装**）
+- 付録2 の GUIDED 自動移動（`AR_HOOK_AUTO_START` は**実装済み（3bb4b）だが実機では未実施**）
+- OpenCV 4.6 / ArUco 互換の実機ログ（起動ログの `ArUco:` 行と検出継続。`BENCH_RESULT.md` §7.6.3）
+- yaw 実測データの撮像（`CAMERA_YAW_MATERIAL.md` の索引。解析は 8ac8f）
 - 長時間（30 分以上）の連続計測・EMI 評価
 
 ## 付録1. アームせずに確認できる座標系・高度・yaw
@@ -464,35 +502,48 @@ AR_HOOK_TARGET_YAW_DEG=180.0 python3 AR-hook1.py --device /dev/ttyAMA0
 
 §8.4 の表に記入してください（初期値は `NOT RUN`）。
 
-## 付録2. GUIDED 自動移動（`AR_HOOK_AUTO_START`）— NOT RUN（未実装）
+## 付録2. GUIDED 自動移動（`AR_HOOK_AUTO_START`）— 実装済み / 実機では NOT RUN
 
 ### 付録2.1 状態
 
-- **NOT RUN（未実装）**。`AR_HOOK_AUTO_START` は後続タスク **3bb4b** で実装予定です。
-- 現時点のリポジトリには `AR_HOOK_AUTO_START` の実装も、それを読むコードもありません
-  （`grep -rn AR_HOOK_AUTO_START` で 0 件）。
-- したがって本節は**手順の下書き**です。実装が入るまで実行せず、**本書の合格判定にも含めません**。
-- 実装後は、実装された引数名・既定値・安全条件に合わせて本節を更新し、
-  `NOT RUN` を実測結果で置き換えてください。
+- **実装済み（3bb4b）**。`AR_HOOK_AUTO_START=1` で、離陸高度到達後に開始位置へ自動移動し、
+  到着してからカメラ追従（TRACK）を開始します。既定は `0`（無効 = 従来どおり離陸後すぐ追従）。
+- **実機では NOT RUN（未実施）**。本作業環境には機体・Pixhawk・カメラ・Motive が無く、
+  アームと離陸を伴うため実施していません。実測ログの提供も受けていません。
+- **本書（§1〜§8）の合格判定には含めません。** 実施する場合は付録2.3 の前提と
+  [実験手順書.md](./実験手順書.md) §6.1 の手順に従い、実施可否を人間が判断してください。
+- 実装の確認（ハード不要）は `test_auto_start.py` で行っています。実装の説明は
+  [実験手順書.md](./実験手順書.md) §4.2.1、CSV 列は `Auto_Start_Phase` / `Auto_Start_Elapsed_s` /
+  `Auto_Start_Dist_m`（[CSV_SCHEMA.md](./CSV_SCHEMA.md)）。
 
-### 付録2.2 実装後の確認項目（案）
+### 付録2.2 実機での確認項目（NOT RUN）
 
 | # | 確認項目 | 状態 |
 |---|---|---|
-| 1 | `AR_HOOK_AUTO_START` の既定値（未設定時に自動移動しないこと） | NOT RUN（未実装） |
-| 2 | 自動移動の前提条件（armed / GUIDED / 離陸高度到達 / 目標確定） | NOT RUN（未実装） |
-| 3 | 目標方位（`AR_HOOK_TARGET_YAW_DEG`）と移動方向が一致する | NOT RUN（未実装） |
-| 4 | 目標高度が home 相対（`TARGET_HEIGHT_ABOVE_TAKEOFF`）で送られる | NOT RUN（未実装） |
-| 5 | 目標座標（REF 基準 N/E）へ移動し、クランプ・レート制限が効く | NOT RUN（未実装） |
-| 6 | 中止手段（キー操作 / モード変更 / 送信機）で即座に停止できる | NOT RUN（未実装） |
-| 7 | 異常時（ATTITUDE 鮮度切れ・マーカーロスト・通信断）の挙動 | NOT RUN（未実装） |
+| 1 | `AR_HOOK_AUTO_START` の既定値（未設定時に自動移動しないこと） | NOT RUN |
+| 2 | 起動ログ `ℹ 離陸後の自動移動: 有効（...）` の実出力 | NOT RUN |
+| 3 | 自動移動の前提条件（armed / GUIDED / 離陸高度到達 / 離陸地点 Down 確定） | NOT RUN |
+| 4 | `TAKEOFF_WAIT` → `AUTO_TO_START` → `ARRIVED` → `TRACK` の遷移ログ | NOT RUN |
+| 5 | 到着ログ（`✓ 自動移動 到着`）が **1 回だけ**出る | NOT RUN |
+| 6 | 到着までの時間（`Auto_Start_Elapsed_s`） | NOT RUN |
+| 7 | 到着時の水平距離 / 高さ差（しきい値 0.15 m / 0.10 m）と Motive 真値との差 | NOT RUN |
+| 8 | 目標高度が home 相対（`TARGET_HEIGHT_ABOVE_TAKEOFF`）で送られる | NOT RUN |
+| 9 | クランプ・レート制限（0.50 m/s）が効いている | NOT RUN |
+| 10 | 中止手段（送信機の GUIDED 解除 / disarm / リンク断）で移動が止まる | NOT RUN |
+| 11 | タイムアウト（30 秒）時に移動だけ中止し、降下・着陸しない | NOT RUN |
 
-### 付録2.3 実装後の実施前提（案）
+記入欄・誤差の測り方（Motive 真値）は
+[実験手順書.md](./実験手順書.md) §6.1.3 / §6.1.4 と
+[BENCH_RESULT.md](./BENCH_RESULT.md) §7.6.2 にあります。**実施しない項目は `NOT RUN` のまま残します。**
+
+### 付録2.3 実施の前提
 
 - §1 の安全条件を**緩めない**こと。最初はプロペラ無し・機体固定のまま、GUIDED 遷移と
   コマンド列（`MAV_CMD_NAV_TAKEOFF` → `SET_POSITION_TARGET_GLOBAL_INT`）の確認だけを行う。
 - 実際に動かす段階では、テザー・退避距離・緊急停止（送信機のモード切替）を
   [実験手順書.md](./実験手順書.md) §2 のチェックリストに従って準備する。
 - アームは人間が行い、プログラムにはアームさせない（現行実装もアームは送りません）。
+- 開始位置（`AR_HOOK_START_LAT` / `AR_HOOK_START_LON` / `AR_HOOK_START_HEIGHT_M`）と
+  移動経路の障害物を、離陸前に必ず確認する。
 
-**本節の内容は実機で確認していません（NOT RUN）。**
+**本節の実機結果は未取得です（NOT RUN）。**
