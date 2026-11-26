@@ -126,26 +126,44 @@ ls -ld "$HOME/arhook_verify_logs"
 | 9 | **判定**（§4.2）。`bench_log_check.py` で `run*.txt` をまとめて判定する | §8.3 に 1 行サマリを貼る |
 | 10 | **記入**。本書 §8 と [BENCH_RESULT.md](./BENCH_RESULT.md) §7.6 に要約を記入する | NOT RUN は消さない |
 
-### 3.1 多重起動の確認（`pgrep -af`）
+### 3.1 多重起動・ポート占有の確認（`pgrep -af` / `fuser`）
 
 ```bash
-pgrep -af 'bench_check\.py'
-pgrep -af 'AR-hook1\.py'
-pgrep -af 'mavlink'
+pgrep -af "[b]ench_check\.py|[A]R-hook1\.py"
+pgrep -af "[m]avlink"
 ```
 
-- 期待: **すべて出力 0 行**（`pgrep` の終了コード 1 は「該当なし」で正常）。
-- 1 行でも出た場合は、その PID を確認し、**Ctrl+C（SIGINT）で正常終了**させてから計測を始めます。
-  `kill -9` は使わないでください（[BENCH_RESULT.md](./BENCH_RESULT.md) §7.2 / §7.3 の
-  BAD_DATA 7 件・偽 armed は SIGKILL された多重起動の直後に観測されています）。
-- シリアルポートを掴んでいるプロセスの確認（要 root。`mavlink-bridge.service` 等）:
+- 期待: **2 コマンドとも出力 0 行**（`pgrep` の終了コード 1 は「該当なし」で正常）。
+- **ブラケット記法（`[b]ench_check`）を崩さないでください。** `bash -c` 経由で実行すると、
+  実行中のシェル自身のコマンドライン（例: `/bin/bash -c ...`）にパターン文字列そのものが
+  含まれる場合があり、そのとき `pgrep -af` は**自分自身にマッチ**します（実機では
+  PID 1490 = `/bin/bash -c ...` が検出され、この手順では合格判定が成立しませんでした。
+  例: `pgrep -af "bench_check.py"`、`pgrep -af "mavlink"` と同じ `bash -c` に
+  `mavlink-bridge` がある場合）。`[b]ench_check\.py` はコマンドライン上の文字列
+  `[b]ench_check\.py` と一致しないため、自己マッチしません。
+- **ゲートは単独の `bash -c` で実行してください。** 同じ `bash -c` の中に `bench_check.py` の
+  実行行や `mavlink-bridge` のような文字列があると、その文字列で自己マッチします。
+- 1 行でも出た場合（多重起動・残骸プロセス）は、次の順で停止してから計測します。
+  1. 対象 PID を特定する（`pgrep -af` の出力、`ps -fp <PID>`、`sudo fuser -v /dev/ttyAMA0`）。
+  2. `kill <PID>`（**SIGTERM**）で終了させ、プロセスが消えたことを確認する。
+  3. `sudo fuser -v /dev/ttyAMA0` が空（0 件）であることを確認する。
+  4. 計測を開始する。
+  - `mavlink-bridge.service` が持っている場合は `sudo systemctl stop mavlink-bridge` で停止します。
+  - **`send_GPS3.py` がポートを掴んでいる場合は必ず停止してください。** 15 Hz の GPS_INPUT が
+    Pixhawk に混入し、EKF の状態（BAD_DATA・ATTITUDE レート等）が変わるため、
+    **計測条件が汚染**されます。
+  - `kill -9`（SIGKILL）は使わないでください（[BENCH_RESULT.md](./BENCH_RESULT.md) §7.2 / §7.3 の
+    BAD_DATA 7 件・偽 armed は SIGKILL された多重起動の直後に観測されています）。
+- **ポート占有の確認（要 root。0 件＝出力なしが正常）**:
 
 ```bash
 sudo fuser -v /dev/ttyAMA0
 sudo lsof /dev/ttyAMA0
 ```
 
-`/dev/ttyAMA0` を他プロセスが開いていると `bench_check.py` は接続できません
+`/dev/ttyAMA0` を他プロセスが開いていると `bench_check.py` は接続できません。
+`send_GPS3.py` / `mavlink-bridge.service` / 残骸の `AR-hook1.py` が出た場合は、
+上の 1〜4 の順で停止してから計測してください
 （[実験手順書.md](./実験手順書.md) の「多重起動・ポート占有」も参照）。
 
 ## 4. 実行コマンド例（`tee` で保存し `PIPESTATUS` で終了コードを記録）
@@ -303,8 +321,13 @@ SUMMARY: PASS 4 / FAIL 0 / ERROR 0
   コネクタの再挿入。`dmesg | grep -i tty` の overrun / frame error を確認。
 - **終端（RTS/CTS 配線・`BRD_SERx_RTSCTS` の不一致）**: 実配線と `BRD_SERx_RTSCTS` の設定を一致させる。
   `run4_no_rtscts` の結果と比べ、差が出るなら RTS/CTS 側を疑う（合否は RTS-CTS 有効の 3 回で判定）。
-- **多重起動（ポート占有）**: `pgrep -af` / `sudo lsof /dev/ttyAMA0` で 0 件を確認。
-  `kill -9` の直後は計測しない。`mavlink-bridge.service` 等の停止。
+- **多重起動（ポート占有）**: `pgrep -af "[b]ench_check\.py|[A]R-hook1\.py"` と
+  `pgrep -af "[m]avlink"`、`sudo fuser -v /dev/ttyAMA0` / `sudo lsof /dev/ttyAMA0` で 0 件を確認
+  （§3.1。ブラケット記法を崩すと `bash -c` の自分自身にマッチする）。
+  占有していた場合は対象 PID を特定 → `kill <PID>`（SIGTERM）→ `sudo fuser -v /dev/ttyAMA0` が
+  空を確認 → 計測開始。`kill -9` の直後は計測しない。
+  `send_GPS3.py` は GPS_INPUT が Pixhawk に混入して計測条件を汚染するため必ず停止する。
+  `mavlink-bridge.service` は `sudo systemctl stop mavlink-bridge` で停止する。
 - **RTS-CTS（フロー制御の有効/無効）**: RTS-CTS 有効で 3 回、無効で 1 回を比較し、
   どちらで BAD_DATA・レート不足が出るかを記録する。
 - **許容 component（`ARHOOK_HB_ALLOWED_COMPONENTS`）**: `HB生値:` の `comp` が `{1, 0}` 以外なら、
@@ -371,7 +394,8 @@ SUMMARY: PASS 4 / FAIL 0 / ERROR 0
 **行 1（電源投入直後の run1）の再取得手順（未実施 / `NOT RUN`）**:
 
 1. Pixhawk の電源を完全に切る（バッテリ・USB とも外す）。多重起動が無いことを
-   `pgrep -af 'bench_check|AR-hook1'` と `sudo lsof /dev/ttyAMA0` で確認する（§3.1）。
+   `pgrep -af "[b]ench_check\.py|[A]R-hook1\.py|[m]avlink"` と
+   `sudo fuser -v /dev/ttyAMA0` / `sudo lsof /dev/ttyAMA0`（いずれも 0 件）で確認する（§3.1）。
 2. 電源投入後 **1 分以内**に `run1_boot` を開始する（§4.1 の `tee` + `PIPESTATUS` の例）。
 3. `run1_boot` 終了後 **60 秒あけて** `run2_settled` / `run3_settled` を同じ条件で実行する。
 4. `python3 bench_log_check.py --verbose ~/arhook_verify_logs/run1_boot.txt ~/arhook_verify_logs/run2_settled.txt ~/arhook_verify_logs/run3_settled.txt`
@@ -397,7 +421,7 @@ SUMMARY: PASS 4 / FAIL 0 / ERROR 0
 | `BRD_SERx_RTSCTS` | NOT RUN（パラメータ値は未取得） |
 | `SRx_EXTRA1` / `SRx_POSITION` | NOT RUN（パラメータ値は未取得。実測レートは ATTITUDE 40.00 Hz / GPI 5.00 Hz） |
 | 配線（ケーブル長・GND・終端） | NOT RUN（未記録） |
-| 多重起動の確認結果（§3.1） | NOT RUN（`pgrep -af` / `sudo lsof` の記録なし）。参考: 計測前に `send_GPS3.py`（PID 1084、pts/0 の別端末で手動起動）を SIGINT で停止（18:53 起動 → 19:35 停止） |
+| 多重起動の確認結果（§3.1） | NOT RUN（当時の `pgrep -af` は自己マッチする版で、`sudo fuser -v` / `sudo lsof` の記録なし）。参考: 計測前に `send_GPS3.py`（PID 1084、pts/0 の別端末で手動起動）を SIGINT で停止（18:53 起動 → 19:35 停止） |
 | その他（気象・電源・特記事項） | プロペラ無し・機体固定・armed にしない・GUIDED にしない・setpoint 送信なし（`--send-setpoints` 未指定）。run 間 60 秒。**Pixhawk の電源再投入は未実施（uptime 46 分）＝「電源投入直後」の条件は未達**。リポジトリ HEAD=`524ca84`（feature/arhook-fixes, clean） |
 
 ### 8.3 `bench_log_check.py` の出力（1 行サマリを貼る）

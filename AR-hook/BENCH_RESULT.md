@@ -445,8 +445,14 @@ HEARTBEAT は **61 件すべて `sys=1` / `comp=1` / `base_mode=0x51` / `custom_
 
 **行 1（電源投入直後の run1）の再取得手順（未実施 / `NOT RUN`）**:
 
-1. Pixhawk の電源を完全に切る（バッテリ・USB とも外す）。多重起動が無いことを
-   `pgrep -af 'bench_check|AR-hook1'` と `sudo lsof /dev/ttyAMA0` で確認する。
+1. Pixhawk の電源を完全に切る（バッテリ・USB とも外す）。多重起動・ポート占有が無いことを
+   `pgrep -af "[b]ench_check\.py|[A]R-hook1\.py|[m]avlink"` と
+   `sudo fuser -v /dev/ttyAMA0` / `sudo lsof /dev/ttyAMA0`（いずれも 0 件）で確認する
+   （ブラケット記法を崩すと `bash -c` の自分自身にマッチする。手順の詳細は
+   [REAL_MACHINE_VERIFY.md](./REAL_MACHINE_VERIFY.md) §3.1）。
+   占有していた場合は対象 PID を特定 → `kill <PID>`（SIGTERM）→ `sudo fuser -v /dev/ttyAMA0` が
+   空を確認してから計測する。**`send_GPS3.py` は GPS_INPUT が Pixhawk に混入して計測条件を
+   汚染するため必ず停止する。** `mavlink-bridge.service` は `sudo systemctl stop mavlink-bridge`。
 2. 電源投入後 **1 分以内**に `run1_boot` を開始する
    （`python3 bench_check.py --device /dev/ttyAMA0 --duration 30 --warmup 3`、RTS-CTS 有効）。
    ログは `tee` で `~/arhook_verify_logs/run1_boot.txt` に保存し、`PIPESTATUS` で終了コードを
@@ -561,7 +567,12 @@ exit=0
 
 - **配線**: GND 共通・ケーブル長・コネクタ半挿し。`dmesg | grep -i tty` の overrun / frame error。
 - **終端**: RTS/CTS の実配線と `BRD_SERx_RTSCTS` の不一致。`run4_no_rtscts` との比較。
-- **多重起動**: `pgrep -af` / `sudo lsof /dev/ttyAMA0` が 0 件か。`kill -9` 直後は計測しない。
+- **多重起動（ポート占有）**: `pgrep -af "[b]ench_check\.py|[A]R-hook1\.py"` と
+  `pgrep -af "[m]avlink"`、`sudo fuser -v /dev/ttyAMA0` / `sudo lsof /dev/ttyAMA0` が 0 件か
+  （ブラケット記法を崩すと `bash -c` の自分自身にマッチする）。
+  占有していた場合は対象 PID を特定 → `kill <PID>`（SIGTERM）→ `sudo fuser -v /dev/ttyAMA0` が
+  空を確認 → 計測開始。`send_GPS3.py` は GPS_INPUT 混入で計測条件を汚染するため必ず停止。
+  `mavlink-bridge.service` は `sudo systemctl stop mavlink-bridge`。`kill -9` 直後は計測しない。
 - **RTS-CTS**: RTS-CTS 有効 3 回と無効 1 回の差を記録（合否は有効側で判定）。
 - **許容 component**: `HB生値:` の `comp` を確認し、`ARHOOK_HB_ALLOWED_COMPONENTS` を変えるか人間が判断
   （既定 `{1, 0}` は変更しない）。
