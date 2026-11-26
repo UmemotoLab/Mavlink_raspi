@@ -133,6 +133,10 @@ cd /home/taki/Mavlink_raspi/RTK
 bash run_rover_bridge.sh
 ```
 
+systemd で常駐させる場合の unit 定義（`mavlink-bridge.service`）と導入手順は
+[`../AR-hook/systemd/README.md`](../AR-hook/systemd/README.md) にあります
+（AR-hook を同時に使う実験では bridge は使わず `mask` します）。
+
 または直接:
 
 ```bash

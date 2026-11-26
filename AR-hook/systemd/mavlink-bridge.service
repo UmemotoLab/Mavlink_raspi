@@ -1,0 +1,54 @@
+# mavlink-bridge.service — RTK rover 側 MAVLink ブリッジ + RTCM 注入の unit 定義（正典）
+#
+# 実体  : RTK/mavlink_bridge.py（起動ラッパー: RTK/run_rover_bridge.sh）
+# 経路  : Windows 基地局 TCP 192.168.137.1:2101 -> GPS_RTCM_DATA -> Pixhawk /dev/ttyAMA0
+# 配置先: /etc/systemd/system/mavlink-bridge.service
+#
+# 重要（2026-11-26 / タスク 6f183 の決定。AR-hook/統合メモ.md §11・§13）:
+#   AR-hook を使う実験ではこの bridge は「使わない」。AR-hook 自身が GPS_INPUT を
+#   15Hz 送る C 案を採用したため、/dev/ttyAMA0 の所有者は AR-hook 1 つにする。
+#   使わない機体では `sudo systemctl mask mavlink-bridge` で起動経路を塞ぐこと
+#   （壊れた unit の退避を含む手順: AR-hook/systemd/README.md）。
+#
+# 確認（実機）:
+#   systemd-analyze verify /etc/systemd/system/mavlink-bridge.service
+#   systemctl cat mavlink-bridge
+
+[Unit]
+Description=MAVLink bridge + RTCM injector (RTK rover, /dev/ttyAMA0)
+Documentation=file:///home/taki/Mavlink_raspi/AR-hook/systemd/README.md
+Documentation=file:///home/taki/Mavlink_raspi/RTK/README_RTK_ROVER.md
+# 基地局は LAN（Windows 192.168.137.1:2101）。ネットワーク確立後に起動する。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# /dev/ttyAMA0（TELEM1）を開くため dialout グループで動かす。
+# ユーザー名・パスは実機の配置に合わせて書き換える（既定 /home/taki/...）。
+User=taki
+Group=dialout
+WorkingDirectory=/home/taki/Mavlink_raspi/RTK
+Environment=PYTHONUNBUFFERED=1
+
+# 実体: RTK/mavlink_bridge.py（ラッパー: RTK/run_rover_bridge.sh）
+#   引数は rover_config.json と同値（serial_port / baudrate / rtscts=false）。
+#   --serial /dev/ttyAMA0 --baud 1000000 --no-rtscts
+#   変更するときは rover_config.json と両方を揃えること。
+ExecStart=/home/taki/Mavlink_venv/bin/python3 \
+    /home/taki/Mavlink_raspi/RTK/mavlink_bridge.py \
+    --config /home/taki/Mavlink_raspi/RTK/rover_config.json \
+    --serial /dev/ttyAMA0 \
+    --baud 1000000 \
+    --no-rtscts
+
+# mavlink_bridge.py は KeyboardInterrupt で CSV/RTCM ログを閉じる（main の finally）。
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+# 失敗時のみ再起動する（`systemctl stop` では再起動しない）。
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
