@@ -51,11 +51,11 @@
 | # | 条件 | 理由 |
 |---|---|---|
 | 1 | **プロペラを外す** | 誤送信・誤操作があっても機体が飛ばない状態にする |
-| 2 | **アームしない**（送信機・GCS から手を離す） | アームされると自動離陸の条件に近づく。実行中に誰かがアームしないようにする |
+| 2 | **アームしない**（送信機・GCS から手を離す） | アームされるとスペースキー離陸の前提条件に近づく（`AR_HOOK_AUTO_TAKEOFF=1` のときは 3 秒後の自動離陸もある）。実行中に誰かがアームしないようにする |
 | 3 | **GUIDED へ変更しない** | GUIDED は setpoint が機体に効くモード。本手順ではモード変更を一切行わない |
 | 4 | **機体を固定する** | 送信や機体の自己テストで動いても危険が無いようにする |
 | 5 | **`bench_check.py` は既定（setpoint 送信なし）で使う** | `--send-setpoints` を付けない。既定で送るのは `MAV_CMD_SET_MESSAGE_INTERVAL`（受信周期の要求）のみ |
-| 6 | **`AR-hook1.py` を同時に起動しない** | `AR-hook1.py` は `/dev/ttyAMA0` を占有し、GUIDED + armed を検出すると 3 秒後に `MAV_CMD_NAV_TAKEOFF` を送る |
+| 6 | **`AR-hook1.py` を同時に起動しない** | `AR-hook1.py` は `/dev/ttyAMA0` を占有する。既定では自動離陸しないが、GUIDED + armed のときスペースキーで `MAV_CMD_NAV_TAKEOFF`（既定 1.50 m）を送る（`AR_HOOK_AUTO_TAKEOFF=1` なら 3 秒後の自動送信） |
 | 7 | 実行中に armed を検出したら中止 | `bench_check.py` は確定 armed を検出すると自動で中止する（終了コード 2）。人間も直ちにアームを解除する |
 | 8 | プロセスは常に 1 つ。終了は Ctrl+C（SIGINT） | `kill -9`（SIGKILL）で殺した直後に BAD_DATA と偽 armed が観測されている（[BENCH_RESULT.md](./BENCH_RESULT.md) §7.2 / §7.3） |
 | 9 | 異音・発熱・焦げ臭・配線外れがあれば即中止 | ベンチでも配線異常は危険 |
@@ -385,7 +385,7 @@ NOT RUN
 | `ℹ 目標ヨー: ...deg（設定ソース: ...）`（既定 0.0） | NOT RUN |
 | `AR_HOOK_TARGET_YAW_DEG=180.0` で起動したときの表示 | NOT RUN |
 | 範囲外の値を指定したときの起動停止 | NOT RUN |
-| `TAKEOFF 高度 0.50 m（home 相対）` の確認 | NOT RUN（アームが必要。付録1.2 参照） |
+| `TAKEOFF 高度 1.50 m（home 相対）` の確認 | NOT RUN（アームが必要。付録1.2 参照） |
 
 ## 9. 未実施（NOT RUN）の一覧
 
@@ -444,7 +444,8 @@ python3 AR-hook1.py --device /dev/ttyAMA0     # 引数なしなら対話プロ�
 
 ### 付録1.2 TAKEOFF 高度が home 相対であること
 
-`TAKEOFF_ALT = 0.50 m` は「離陸地点（EKF home）からの高さ」で、
+`TAKEOFF_ALT = 1.50 m`（既定。`AR_HOOK_TAKEOFF_ALT_M` で 0.30〜5.00 に変更可）は
+「離陸地点（EKF home）からの高さ」で、
 `MAV_CMD_NAV_TAKEOFF` / `SET_POSITION_TARGET_GLOBAL_INT` には
 `local_down_to_home_relative_alt()` で変換した **home 相対高度**を送ります。
 
@@ -461,9 +462,9 @@ python3 AR-hook1.py --device /dev/ttyAMA0     # 引数なしなら対話プロ�
 期待値の計算例（SITL と同じ条件の考え方）:
 
 - `REF_ALT = 0`、離陸地点が REF より 3.0 m 上（`Down = -3.0 m`）のとき
-- `alt_above_home_to_local_down(0.50, -3.0) = -3.5 m` → 送信 alt は `0.50 m`
-- 到達判定は `relative_alt >= TAKEOFF_ALT * 0.9 = 0.45 m`（home 相対）
-- `✓ 離陸高度到達: home相対 0.50m (target Down=-3.50m)` は**離陸後にしか出ません**
+- `alt_above_home_to_local_down(1.50, -3.0) = -4.5 m` → 送信 alt は `1.50 m`
+- 到達判定は `relative_alt >= TAKEOFF_ALT * 0.9 = 1.35 m`（home 相対）
+- `✓ 離陸高度到達: home相対 1.50m (target Down=-4.50m)` は**離陸後にしか出ません**
 
 参考: SITL（実 ArduPilot Copter）では同じ変換で 6/6 PASS、送信 alt 1.100000 m /
 到達 1.051 m を確認済みです（[SITL_RESULT.md](./SITL_RESULT.md)）。**実機の送信値は NOT RUN**。

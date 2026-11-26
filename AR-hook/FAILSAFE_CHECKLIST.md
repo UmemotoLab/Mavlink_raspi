@@ -19,6 +19,7 @@
 
 | 区分 | 結果 |
 |---|---|
+| **安全側の変更（離陸）** | 自動離陸（GUIDED+armed 3 秒）は**既定で無効**（`AR_HOOK_AUTO_TAKEOFF=0`）。離陸は**スペースキー**（確定 GUIDED かつ確定 armed が前提、1 回だけ）。離陸目標高度は既定 **1.50 m**（`AR_HOOK_TAKEOFF_ALT_M` で 0.30〜5.00）。詳細は §1.2 |
 | 机上確認（コード根拠） | 5 項目すべて確認。GUIDED 以外の setpoint 送信経路は 3 経路とも遮断 |
 | 注入試験（自動テスト） | 10/10 PASS（`test_failsafe_injection.py`） |
 | 既存テストの回帰 | `test_attitude_freshness` 12/12、`test_target_limiter` 12/12、`test_mavlink_comm` 13/13、`test_local_frame` 8/8、`test_mav_send_lock` 成功 |
@@ -59,31 +60,53 @@ GUIDED 以外で setpoint を送らない要件に対し、**キーボード操�
 - 備考: 修正前はキーボード経路に GUIDED 判定が無かった（非 GUIDED でも `comm.setpoint` を呼んでいた）。
   本確認で 3 経路を統一した。カメラ・ロスト経路は修正前から GUIDED を見ていた。
 
-### 1.2 離陸指令は GUIDED かつ armed かつ検出から 3 秒後のみ
+### 1.2 離陸指令は「スペースキー」で 1 回だけ（自動離陸は既定で無効）
 
-**期待**: `GUIDED` かつ `armed` の同時成立を検出してから 3 秒を超えた最初の HEARTBEAT で、
-`MAV_CMD_NAV_TAKEOFF`（高度 0.50 m）を 1 回だけ送る。
+**期待（既定 = 安全側）**: GUIDED+armed を検出しても**自動では離陸しない**。
+オペレータがスペースキーを押したときに限り、確定 GUIDED かつ確定 armed を条件に
+`MAV_CMD_NAV_TAKEOFF`（`TAKEOFF_ALT`、既定 1.50 m）を **1 回だけ**送る。
 
 | 根拠 | 内容 |
 |---|---|
-| `AR-hook1.py` L1393-1395 | `is_guided and new_armed and not guided` のときだけ `start_time` を記録し guided=True |
-| L1400-1402 | `guided and not takeoff_sent and time.time() - start_time > 3` のときだけ離陸指令 |
-| L1403 | `takeoff_sent = True` で 1 回だけにラッチ |
-| L1404-1405 | 非 GUIDED になったら `guided/takeoff_sent/takeoff_reached/initial_target_set` をリセット |
-| L1014-1016 | 離陸指令は `comm.takeoff()`（通信部 API）経由 |
-| L59 | `TAKEOFF_ALT = 0.50` |
+| `AR-hook1.py` `request_space_takeoff()` | `space_takeoff_sent` が True なら送らない（押し続け・キーリピートでも 1 回だけ） |
+| 同上 | `guided_mode_active` が False → `⚠ スペース離陸: GUIDED モードではないため送信しません` を 1 行表示して送らない |
+| 同上 | `vehicle_armed_confirmed` が False → `⚠ スペース離陸: 未 armed のため送信しません（先に arm してください）` を 1 行表示して送らない |
+| `control_loop()` | キー `" "`（`SPACE_TAKEOFF_KEY`）で `request_space_takeoff(comm)` を呼ぶ。キーが無い待機（`get_key()` → None）でもスレッドを落とさない |
+| `monitor_vehicle()` | `vehicle_armed_confirmed = state.armed`（通信部の 2 連続確定値）を毎 HEARTBEAT 更新 |
+| 同上 | 到達判定は `(takeoff_sent or space_takeoff_sent) and alt_rel >= TAKEOFF_ALT * 0.9` |
+| `send_takeoff_command()` | 離陸指令は `comm.takeoff()`（通信部 API）経由。追加のモード変更・arm/disarm・着陸指令は送らない |
+
+**自動離陸（従来動作）は既定で無効**: `AUTO_TAKEOFF_ENABLED = False`（`AR_HOOK_AUTO_TAKEOFF=0`）。
+`AR_HOOK_AUTO_TAKEOFF=1` を指定したときだけ、`GUIDED` かつ `armed` の同時成立を検出してから
+3 秒を超えた最初の HEARTBEAT で 1 回だけ送る（SITL 検証・旧手順の再現用）。
+
+| 根拠（自動離陸） | 内容 |
+|---|---|
+| `AR-hook1.py` `monitor_vehicle()` | `is_guided and new_armed and not guided` のときだけ `start_time` を記録し guided=True |
+| 同上 | `AUTO_TAKEOFF_ENABLED and guided and not takeoff_sent and time.time() - start_time > 3` のときだけ離陸指令 |
+| 同上 | 送信後 `takeoff_sent = True` で 1 回だけにラッチ |
+| 同上 | 非 GUIDED になったら `guided/takeoff_sent/takeoff_reached/initial_target_set` をリセット |
+| `_env_flag_param()` | `AR_HOOK_AUTO_TAKEOFF` は 0/1（true/false も可）。不正値は起動時にエラー終了 |
+| `_env_float_param()` | `AR_HOOK_TAKEOFF_ALT_M` は 0.30〜5.00。範囲外・数値でない値は起動時にエラー終了 |
+| `TAKEOFF_ALT` | 既定 `1.50` m（旧既定 `0.50` m から変更）。床＝EKF home 相対 |
 
 **判定: OK（机上 + 自動試験）**
 
-- 自動試験: `test_takeoff_requires_guided_armed_and_3_seconds`
+- 自動試験: `test_space_takeoff.py`
+  - スペース 4 連打 → `NAV_TAKEOFF` は 1 回だけ（`test_space_key_sends_nav_takeoff_once_and_ignores_key_repeat`）
+  - 未 GUIDED / 未 armed → 送らず、理由を 1 行だけ表示（`test_space_key_requires_confirmed_guided_and_armed`）
+  - キー入力なし（None）の待機でスレッドが落ちない（`test_keyboard_thread_survives_idle_polls_then_accepts_space`）
+  - 既定では GUIDED+armed でも自動離陸しない（`test_auto_takeoff_is_disabled_by_default`）
+  - `AR_HOOK_AUTO_TAKEOFF=1` で 3 秒後に 1 回だけ送る（`test_auto_takeoff_can_be_enabled_by_env`）
+- 自動試験（従来動作の回帰）: `test_takeoff_requires_guided_armed_and_3_seconds`
+  （`AR_HOOK_AUTO_TAKEOFF=1` を前提に読み込む）
   - armed のみ 4 秒 → 離陸 0 回
   - GUIDED のみ 4 秒 → 離陸 0 回
   - GUIDED + armed → 3.0 秒超の最初の HEARTBEAT で 1 回だけ（3.0 < t ≤ 3.2）
-  - 途中から GUIDED + armed → その検出時刻から 3 秒後に 1 回だけ
 - **armed / guided は確定値（既定 2 連続フレーム）を使う**（1.3.1）。単発の偽 armed では
-  離陸カウントを開始しない（`test_armed_hardening.py`）。
-- 注意: 判定は HEARTBEAT の `seq` 変化時だけ行うため、離陸指令は最大 1 HEARTBEAT 周期だけ遅れる。
-  `set_msg_rate()`（L1001-1011）は 24/33/30 のみ要求し、HEARTBEAT 周期は要求していない。
+  スペース離陸の前提条件を満たさない（`test_armed_hardening.py`）。
+- 注意: 自動離陸の判定は HEARTBEAT の `seq` 変化時だけ行うため、最大 1 HEARTBEAT 周期だけ遅れる。
+  `set_msg_rate()` は 24/33/30 のみ要求し、HEARTBEAT 周期は要求していない。
 
 ### 1.3 ディスアームで停止し CSV が保存される
 
@@ -314,7 +337,8 @@ NaN などの異常計測では前回目標を維持する。
 | # | 確認項目 | 期待挙動 | 机上結果 | 実測・根拠 |
 |---|---|---|---|---|
 | 1 | GUIDED 以外の setpoint | 送らない | OK | 3 経路のゲート + `test_guided_gating...`（setpoint 0 回） |
-| 2 | 離陸指令 | GUIDED + armed + 3 秒後のみ 1 回 | OK | `test_takeoff...`（armed のみ / GUIDED のみは 0 回、同時成立で 3.1 s） |
+| 2 | 離陸指令（既定） | スペースキーで 1 回だけ。確定 GUIDED かつ確定 armed が前提 | OK | `test_space_takeoff.py`（4 連打で 1 回、非 GUIDED / 未 armed は 0 回、理由を 1 行表示） |
+| 2b | 自動離陸（`AR_HOOK_AUTO_TAKEOFF=1`） | GUIDED + armed + 3 秒後のみ 1 回。既定は無効 | OK | `test_auto_takeoff_is_disabled_by_default` / `test_auto_takeoff_can_be_enabled_by_env` / `test_takeoff...` |
 | 3 | ディスアーム | 停止 + CSV 保存 | OK | `test_disarm...`（running=False、CSV 2 行・列一致） |
 | 4 | ATTITUDE stale | 追従停止・目標保持・警告 1 Hz | OK | `test_stale...`（警告 3 回 / 2.5 s、目標移動 0 m） |
 | 5 | 検出ロスト | 1.0 s 保持 → 0.15 m/s 減衰・高度保持・復帰 | OK | ダミー CSV 再生試験（1.025 s 保持、1.1 s 減衰、2.0 s 復帰） |
@@ -334,7 +358,7 @@ NaN などの異常計測では前回目標を維持する。
 | 項目 | 内容 |
 |---|---|
 | 開始条件 | GUIDED + 確定 armed を検出（`TAKEOFF_WAIT`）、離陸高度到達（`AUTO_TO_START`） |
-| 目標 | `EXPERIMENT_START_LAT/LON`（既定 `36.0757693, 136.2132945`）と、離陸地点から `EXPERIMENT_START_HEIGHT_ABOVE_TAKEOFF`（既定 1.10 m） |
+| 目標 | `EXPERIMENT_START_LAT/LON`（既定 `36.0757693, 136.2132945`）と、離陸地点から `EXPERIMENT_START_HEIGHT_ABOVE_TAKEOFF`（既定 **1.50 m**。離陸高度 `TAKEOFF_ALT` と整合するよう 1.10 から変更） |
 | 更新経路 | `auto_start_update()` → `commit_target_command(source="auto_start")` → `send_local_target()`。クランプ（水平 1.20 m / 上 0.30 m / 下 0.20 m）とレート制限（0.50 m/s）を必ず通す |
 | カメラ抑止 | `TAKEOFF_WAIT` 〜 `ARRIVED` はカメラ経路の `target` 更新と setpoint 送信を抑止（理由は CSV の `Auto_Start_Phase`） |
 | 到着判定 | 水平距離 ≤ `AR_HOOK_AUTO_START_ARRIVE_XY_M`（0.15 m）**かつ** 高さ差 ≤ `AR_HOOK_AUTO_START_ARRIVE_Z_M`（0.10 m）を `AR_HOOK_AUTO_START_ARRIVE_FRAMES`（2）フレーム連続。到着ログは 1 回だけ |
@@ -429,8 +453,10 @@ python3 bench_failsafe_check.py --offline        # 既存テストを含めて�
 
 ### 3.2 GUIDED 再進入時の注意（未確認・要検討）
 
-非 GUIDED で `takeoff_sent` がリセットされるため、**空中で GUIDED を抜けて再度 GUIDED + armed に戻すと、
-3 秒後に再び `MAV_CMD_NAV_TAKEOFF(0.50 m)` が送られる**（L1404-1405, L1400-1402）。
+非 GUIDED で `takeoff_sent` がリセットされるため、**`AR_HOOK_AUTO_TAKEOFF=1` のときは、
+空中で GUIDED を抜けて再度 GUIDED + armed に戻すと、3 秒後に再び
+`MAV_CMD_NAV_TAKEOFF(1.50 m)` が送られる**（L1404-1405, L1400-1402）。
+既定（`AR_HOOK_AUTO_TAKEOFF=0`）では自動離陸自体を行わないため、この再送は起きません。
 本確認では仕様として記録し、実機での影響（降下指令になるか）は未確認（5.2）。
 
 ---
@@ -520,19 +546,21 @@ python3 bench_failsafe_check.py --fake-motive --duration 10
 本リポジトリの過去資料（`archive/2026-11-16-unused/setup_ELRS_5.py`）には `GUID_TIMEOUT=3.0` の設定例がありますが、
 現在の機体設定値は確認していません。空中で q / Ctrl+C を使う前に、必ず GUID_TIMEOUT の値を確認してください。
 
-### 5.2 GUIDED 再進入時の再離陸指令
+### 5.2 GUIDED 再進入時の再離陸指令（自動離陸を有効にした場合のみ）
 
-3.2 のとおり、非 GUIDED で `takeoff_sent` がリセットされるため、空中で GUIDED を再進入すると
-3 秒後に `MAV_CMD_NAV_TAKEOFF(0.50 m)` が再送されます。実機で高度が下がるかは未確認です。
-必要なら「離陸高度到達後は再離陸しない」ガード（例: `takeoff_reached` を非 GUIDED でリセットしない、
-または現在高度が home 相対 0.45 m 以上のときは送らない）を追加してください。
-本確認では要件（GUIDED + armed + 検出から 3 秒）を満たす現状仕様を記録するに留めました。
+**既定（`AR_HOOK_AUTO_TAKEOFF=0`）では再離陸指令は出ません**（自動離陸自体を行わないため）。
+スペースキー離陸も 1 セッション 1 回（`space_takeoff_sent`）なので、GUIDED を再進入しても
+スペースキーでは再送しません（必要ならプログラムを再起動する運用）。
 
-### 5.3 離陸 3 秒判定の粒度
+`AR_HOOK_AUTO_TAKEOFF=1` のときだけ、非 GUIDED で `takeoff_sent` がリセットされるため、
+空中で GUIDED を再進入すると 3 秒後に `MAV_CMD_NAV_TAKEOFF(TAKEOFF_ALT = 1.50 m)` が再送されます。
+実機で高度が下がるかは未確認です（SITL でも未計測）。この挙動が危険なので既定は無効にしています。
+
+### 5.3 離陸 3 秒判定の粒度（自動離陸を有効にした場合のみ）
 
 判定は HEARTBEAT の `seq` 変化時だけ行うため、離陸指令は最大 1 HEARTBEAT 周期遅れます
-（`set_msg_rate()` は HEARTBEAT 周期を要求していない: L1001-1011）。
-実機の HEARTBEAT レートは未確認です。
+（`set_msg_rate()` は HEARTBEAT 周期を要求していない）。実機の HEARTBEAT レートは未確認です。
+スペースキー離陸はオペレータのキー入力（`control_loop` 50 ms 周期）が契機で、この待ちはありません。
 
 ### 5.4 ATTITUDE のみ停止させる実機試験
 

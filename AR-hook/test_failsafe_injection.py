@@ -77,17 +77,29 @@ def _install_mock_modules():
         sys.modules["pytz"] = pytz_mock
 
 
-def _load_module():
-    """AR-hook1.py をモジュールとして読み込む（main() は実行しない）。"""
+def _load_module(env=None):
+    """AR-hook1.py をモジュールとして読み込む（main() は実行しない）。
+
+    Args:
+        env: 読み込み時だけ設定する環境変数。既定では AR_HOOK_AUTO_TAKEOFF=1 を
+             設定し、従来の「GUIDED+armed 3 秒後の自動離陸」を前提にした試験を
+             そのまま維持します（本番の既定は 0 = 無効。既定の確認は
+             test_space_takeoff.py で明示的に行います）。
+    """
     _install_mock_modules()
     env_keys = (
         "AR_HOOK_TARGET_YAW_DEG",
         "AR_HOOK_MASK",
+        "AR_HOOK_AUTO_TAKEOFF",
+        "AR_HOOK_TAKEOFF_ALT_M",
         af.ENV_ATTITUDE_STALE_TIMEOUT_MS,
     )
     saved_env = {key: os.environ.get(key) for key in env_keys}
     for key in env_keys:
         os.environ.pop(key, None)
+    os.environ["AR_HOOK_AUTO_TAKEOFF"] = "1"
+    for key, value in (env or {}).items():
+        os.environ[key] = str(value)
     original_home = Path.__dict__["home"]
     try:
         with tempfile.TemporaryDirectory(prefix="arhook_failsafe_") as tmp_home:

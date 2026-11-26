@@ -8,8 +8,12 @@
   7f03b : クランプ。段差目標に対する 1 フレーム移動量と目標偏差の上限。
   9c2a5 : yaw。yaw=0 / yaw=180 の指令と機首方位。
   12794 : ATTITUDE 周期。40Hz 要求と実測レート。
-  takeoff : 自動離陸。GUIDED+ARM 検出 → 3 秒後に NAV_TAKEOFF(0.5m) → 0.5m へ上昇。
+  takeoff : 自動離陸（従来動作）。AR_HOOK_AUTO_TAKEOFF=1 で GUIDED+ARM 検出 → 3 秒後に
+            NAV_TAKEOFF(1.5m) → 1.5m へ上昇。既定（無効）では送らない。
   disarm  : ディスアーム終了。disarm を検出して停止し、CSV が保存されるか。
+  auto_start : 離陸後の自動移動（AR_HOOK_AUTO_START=1 のときだけ）。
+  space_takeoff : スペースキー離陸。キー入力を注入し、1 回だけ NAV_TAKEOFF(1.5m) →
+            上昇するか。既定では自動離陸が送られないことも同時に確認する。
 
 実行方法（ハードウェア不要）:
     cd AR-hook
@@ -73,8 +77,19 @@ F6152_HOME_UP_M = 3.0
 # GUIDED + armed を検出してから NAV_TAKEOFF を送るまでの待ち（AR-hook1.py は 3 秒）。
 TAKEOFF_CMD_DELAY_S = 3.0
 TAKEOFF_CMD_DELAY_TOL_S = 2.0     # 実測の許容幅（HEARTBEAT 1Hz の量子化を含む）
-TAKEOFF_REACH_TIMEOUT_S = 30.0    # 0.5m 到達までの待ち（実 SITL はホバリングまで数秒）
+TAKEOFF_REACH_TIMEOUT_S = 30.0    # 離陸高度到達までの待ち（実 SITL はホバリングまで数秒）
 TAKEOFF_REACH_RATIO = 0.9         # AR-hook1.py の離陸到達判定と同じ 90%
+# 到達判定（90%）は「上昇を開始した」ことしか見ない。実 SITL は 90% を横切った
+# 直後はまだ目標高度より低い（例: 1.5m 指令で 1.36m）ため、その瞬間に目標高度との
+# 差を判定すると必ず FAIL になる。目標高度に収束するまで追加で待つ。
+TAKEOFF_SETTLE_TIMEOUT_S = 12.0   # 90% 到達後、目標高度 ± 許容に収束するまでの待ち
+TAKEOFF_SETTLE_FRAMES = 2         # 連続で許容範囲に入った回数（一瞬の通過を除く）
+
+# ── space_takeoff（スペースキー離陸）──
+SPACE_TAKEOFF_ALT_M = 1.5         # AR-hook1.py の TAKEOFF_ALT 既定値（床＝EKF home 相対）
+SPACE_TAKEOFF_KEY_COUNT = 5       # 押し続け・キーリピートを模して注入する回数
+SPACE_TAKEOFF_PRE_WAIT_S = 4.0    # 既定で自動離陸が送られないことの確認（3 秒 + 余裕）
+SPACE_TAKEOFF_EXTRA_WAIT_S = 1.0  # 追加キー投入後、再送が無いことを確認する待ち
 
 # ── disarm（終了と CSV 保存）──
 DISARM_TRIGGER_DELAY_S = 4.0      # 記録を数秒取ってから disarm する
@@ -337,6 +352,33 @@ def _relative_alt_m(comm):
     if position is None:
         return None
     return position.relative_alt / 1000.0
+
+
+def wait_altitude_within(comm, target_alt, tolerance, timeout,
+                         frames=TAKEOFF_SETTLE_FRAMES, poll=0.02):
+    """home 相対高度が target_alt ± tolerance に収束するまで待つ。
+
+    到達判定（TAKEOFF_REACH_RATIO = 90%）は上昇開始の検出であり、その瞬間の
+    高度は目標より低い。実 SITL のホバリング目標高度で判定するため、
+    ここで「連続 frames 回」許容範囲に入るまで待ちます。
+
+    Returns:
+        (収束したか, 最後の home 相対高度 [m], 経過秒)
+    """
+    started = time.monotonic()
+    deadline = started + float(timeout)
+    good = 0
+    last = _relative_alt_m(comm)
+    while time.monotonic() < deadline:
+        last = _relative_alt_m(comm)
+        if last is not None and abs(last - float(target_alt)) <= float(tolerance):
+            good += 1
+            if good >= int(frames):
+                return True, last, time.monotonic() - started
+        else:
+            good = 0
+        time.sleep(poll)
+    return False, last, time.monotonic() - started
 
 
 def ensure_airborne(module, comm, alt_m, timeout=EXTERNAL_HOVER_TIMEOUT_S):
@@ -973,10 +1015,17 @@ def _write_timeline(path, rows):
 
 
 # ──────────────────────────────────────────────
-#  takeoff: 自動離陸（GUIDED + armed → 3 秒後 NAV_TAKEOFF → 0.5m）
+#  takeoff: 自動離陸（AR_HOOK_AUTO_TAKEOFF=1 の従来動作）
+#           GUIDED + armed → 3 秒後 NAV_TAKEOFF → TAKEOFF_ALT（1.5m）
 # ──────────────────────────────────────────────
 def scenario_takeoff(module, args):
-    """AR-hook1.monitor_vehicle() の自動離陸シーケンスをそのまま動かして測る。"""
+    """AR-hook1.monitor_vehicle() の自動離陸シーケンスをそのまま動かして測る。
+
+    自動離陸は既定で無効（AR_HOOK_AUTO_TAKEOFF=0）なので、このシナリオだけは
+    AR_HOOK_AUTO_TAKEOFF=1 でモジュールを読み込み、従来動作を再現します。
+    """
+    auto_module = load_ar_hook1_module(env={"AR_HOOK_AUTO_TAKEOFF": "1"})
+    module = auto_module
     with vehicle_session(module, args, "takeoff", port_offset=4) as (
         comm, records, _port, out_dir
     ):
@@ -1033,6 +1082,7 @@ def scenario_takeoff(module, args):
             )
 
             target_alt = float(module.TAKEOFF_ALT)
+            alt_tol = 0.10 if args.external_connection else ARRIVAL_TOL_M
             reached, reach_s = wait_for(
                 lambda: (
                     None if _relative_alt_m(comm) is None
@@ -1041,12 +1091,27 @@ def scenario_takeoff(module, args):
                 timeout=TAKEOFF_REACH_TIMEOUT_S,
                 poll=0.02,
             )
-            final_alt = _relative_alt_m(comm)
             mark(
                 "altitude_reached" if reached else "altitude_timeout",
-                f"rel_alt={final_alt:.3f} m after {reach_s:.2f} s"
-                if final_alt is not None else "no position",
+                f"rel_alt={_relative_alt_m(comm):.3f} m after {reach_s:.2f} s"
+                if _relative_alt_m(comm) is not None else "no position",
             )
+            # 90% 到達は「上昇開始」の検出。実 SITL はここから目標高度まで登るため、
+            # 目標 ± 許容に収束するまで待ってから最終高度を判定する。
+            settle_s = 0.0
+            settled = False
+            if reached:
+                settled, final_alt, settle_s = wait_altitude_within(
+                    comm, target_alt, alt_tol, TAKEOFF_SETTLE_TIMEOUT_S
+                )
+                mark(
+                    "altitude_settled" if settled else "altitude_settle_timeout",
+                    f"rel_alt={final_alt:.3f} m after {settle_s:.2f} s "
+                    f"(target {target_alt:.2f} ± {alt_tol:.2f} m)"
+                    if final_alt is not None else "no position",
+                )
+            else:
+                final_alt = _relative_alt_m(comm)
         finally:
             comm.takeoff = original_takeoff
             alive = _stop_threads(module, threads)
@@ -1058,13 +1123,13 @@ def scenario_takeoff(module, args):
             None if command is None or detection["t_s"] is None
             else round(command["t_s"] - detection["t_s"], 3)
         )
-        alt_tol = 0.10 if args.external_connection else ARRIVAL_TOL_M
         checks = {
+            "auto_takeoff_enabled_by_env": bool(module.AUTO_TAKEOFF_ENABLED),
             "takeoff_command_sent_once": len(takeoff_calls) == 1,
             "takeoff_alt_matches_hook_constant": (
                 command is not None
                 and abs(command["alt_m"] - float(module.TAKEOFF_ALT)) <= 1e-6
-                and abs(float(module.TAKEOFF_ALT) - 0.5) <= 1e-9
+                and abs(float(module.TAKEOFF_ALT) - SPACE_TAKEOFF_ALT_M) <= 1e-9
             ),
             "command_delay_is_about_3s": (
                 delay_s is not None
@@ -1094,6 +1159,8 @@ def scenario_takeoff(module, args):
                 None if final_alt is None else round(final_alt, 3)
             ),
             "alt_tolerance_m": alt_tol,
+            "altitude_settled": bool(settled),
+            "altitude_settle_s": round(settle_s, 3),
             "timeline": timeline,
         }
         write_observations(out_dir / "observations.csv", [
@@ -1107,8 +1174,12 @@ def scenario_takeoff(module, args):
 
     return {
         "id": "takeoff",
-        "name": "自動離陸（GUIDED+ARM 検出 → 3 秒後 NAV_TAKEOFF → 0.5m）",
+        "name": (
+            "自動離陸（AR_HOOK_AUTO_TAKEOFF=1: GUIDED+ARM 検出 → "
+            f"3 秒後 NAV_TAKEOFF → {float(module.TAKEOFF_ALT):.1f}m）"
+        ),
         "conditions": {
+            "enabled_by": "AR_HOOK_AUTO_TAKEOFF=1",
             "takeoff_alt_m": float(module.TAKEOFF_ALT),
             "delay_s": TAKEOFF_CMD_DELAY_S,
             "command_path": "AR-hook1.monitor_vehicle() -> send_takeoff_command()",
@@ -1329,7 +1400,10 @@ def scenario_auto_start(module, args):
     auto_start_update() の呼び出しで模擬する（実カメラは使わない）。
     TRACK 後に疑似カメラ更新を送り、setpoint が開始位置近傍かを測る。
     """
-    auto_module = load_ar_hook1_module(env={"AR_HOOK_AUTO_START": "1"})
+    # 自動移動は「離陸高度到達」を起点にするため、離陸は従来動作（自動離陸）で行う。
+    auto_module = load_ar_hook1_module(
+        env={"AR_HOOK_AUTO_START": "1", "AR_HOOK_AUTO_TAKEOFF": "1"}
+    )
     timeline = []
     with vehicle_session(
         auto_module, args, "auto_start", port_offset=5
@@ -1540,6 +1614,296 @@ def scenario_auto_start(module, args):
     }
 
 
+# ──────────────────────────────────────────────
+#  space_takeoff: スペースキー離陸（1 回だけ NAV_TAKEOFF → 上昇）
+# ──────────────────────────────────────────────
+class _FakeTermios:
+    """termios の差し替え（実端末を cbreak にしない）。
+
+    実 termios の tcgetattr() は 7 要素のリストを返す。1 要素のリストを返すと
+    実装側の tcsetattr() 復元が TypeError になる（SITL 実行 20261126_192949 で
+    キーボード制御スレッドが落ちた原因）ため、同じ形にしておく。
+    """
+
+    error = OSError
+    TCSADRAIN = 0
+
+    @staticmethod
+    def tcgetattr(fd):
+        return [0, 0, 0, 0, 0, 0, []]  # [iflag, oflag, cflag, lflag, ispeed, ospeed, cc]
+
+    @staticmethod
+    def tcsetattr(fd, when, old):
+        if not isinstance(old, list) or len(old) != 7:
+            raise TypeError("tcsetattr, arg 3: must be 7 element list")
+        return None
+
+
+class _FakeTty:
+    """tty の差し替え（入力を cbreak にしない）。"""
+
+    @staticmethod
+    def setcbreak(fd):
+        return None
+
+
+class _FakeStdin:
+    """fileno() だけを持つ stdin の差し替え（TTY でなくても control_loop を動かす）。"""
+
+    @staticmethod
+    def fileno():
+        return 0
+
+
+@contextlib.contextmanager
+def keyboard_injection(module, keys):
+    """control_loop() にキー入力列を注入する（実 TTY・実キー入力を使わない）。
+
+    Args:
+        module: 読み込んだ AR-hook1 モジュール（get_key / termios / tty を差し替える）
+        keys: 1 回の get_key() で返す文字。尽きたら None（入力なし）を返す。
+    """
+    queue = list(keys)
+    original_get_key = module.get_key
+    original_termios = module.termios
+    original_tty = module.tty
+    original_stdin = sys.stdin
+
+    def fake_get_key():
+        return queue.pop(0) if queue else None
+
+    module.get_key = fake_get_key
+    module.termios = _FakeTermios
+    module.tty = _FakeTty
+    sys.stdin = _FakeStdin()
+    try:
+        yield queue
+    finally:
+        module.get_key = original_get_key
+        module.termios = original_termios
+        module.tty = original_tty
+        sys.stdin = original_stdin
+
+
+def scenario_space_takeoff(module, args):
+    """スペースキー離陸を検証する（キー入力を注入する）。
+
+    1. 既定（AR_HOOK_AUTO_TAKEOFF=0）では GUIDED+armed でも自動離陸しない
+    2. スペースキーを連続で注入 → NAV_TAKEOFF は 1 回だけ（押し続けで再送しない）
+    3. 送信高度は TAKEOFF_ALT（既定 1.5 m、床＝EKF home 相対）
+    4. 上昇して到達判定（alt_rel >= 0.9 × 1.5 m）と初期 target z が設定される
+    """
+    timeline = []
+    with vehicle_session(module, args, "space_takeoff", port_offset=6) as (
+        comm, records, _port, out_dir
+    ):
+        wait_position(comm, timeout=10.0)
+        started = time.monotonic()
+
+        def mark(event, detail=""):
+            timeline.append([
+                len(timeline) + 1, round(time.monotonic() - started, 6),
+                event, detail,
+            ])
+
+        takeoff_calls = []
+        original_takeoff = comm.takeoff
+
+        def takeoff(alt_m):
+            takeoff_calls.append({
+                "t_s": time.monotonic(),
+                "alt_m": float(alt_m),
+            })
+            mark("nav_takeoff_sent", f"alt={float(alt_m):.3f} m via space key")
+            return original_takeoff(alt_m)
+
+        comm.takeoff = takeoff
+        module.running = True
+        target_alt = float(module.TAKEOFF_ALT)
+        mark("monitor_start", "mode=AR-hook1.monitor_vehicle")
+        threads = [
+            _start_thread(module.monitor_vehicle, comm, name="verify_monitor_space")
+        ]
+        key_thread = None
+        auto_takeoff_absent = False
+        count_after_repeat = 0
+        ready = None
+        wait_ready_s = 0.0
+        final_alt = None
+        reached = False
+        try:
+            # 1) 確定 GUIDED + 確定 armed になるまで待つ（自動離陸は既定で無効）
+            ready, wait_ready_s = wait_for(
+                lambda: (
+                    module.guided_mode_active
+                    and module.vehicle_armed_confirmed
+                ) or None,
+                timeout=20.0,
+            )
+            mark(
+                "guided_armed_confirmed",
+                f"ready={bool(ready)} after {wait_ready_s:.2f} s",
+            )
+            auto_takeoff_absent = not takeoff_calls
+            if ready:
+                deadline = time.monotonic() + SPACE_TAKEOFF_PRE_WAIT_S
+                while time.monotonic() < deadline:
+                    if takeoff_calls:
+                        auto_takeoff_absent = False
+                        break
+                    time.sleep(0.02)
+            mark(
+                "auto_takeoff_check",
+                f"absent={auto_takeoff_absent} "
+                f"(AUTO_TAKEOFF_ENABLED={module.AUTO_TAKEOFF_ENABLED})",
+            )
+
+            # 2) スペースキーを連続で注入（押し続け・キーリピート相当）
+            #    キーボードスレッドは端末の差し替え（termios/tty/stdin）が有効な間に
+            #    止めます。差し替えを先に解除すると、control_loop() の終了処理が
+            #    実端末へ偽の termios 属性を書き込もうとするためです。
+            with keyboard_injection(
+                module, [module.SPACE_TAKEOFF_KEY] * SPACE_TAKEOFF_KEY_COUNT
+            ):
+                try:
+                    key_thread = _start_thread(
+                        module.control_loop, comm, name="verify_keyboard_space"
+                    )
+                    sent, wait_sent_s = wait_for(
+                        lambda: list(takeoff_calls) or None, timeout=15.0
+                    )
+                    mark(
+                        "wait_result",
+                        f"takeoff_seen={bool(sent)} ({wait_sent_s:.2f} s)",
+                    )
+                    # 残りのキー（押し続け相当）が処理されても再送しないことを確認する
+                    time.sleep(SPACE_TAKEOFF_EXTRA_WAIT_S)
+                    count_after_repeat = len(takeoff_calls)
+                    mark("key_repeat_check", f"count={count_after_repeat}")
+
+                    # 3) 上昇と到達判定（90%）→ 目標高度への収束待ち
+                    alt_tol = 0.10 if args.external_connection else ARRIVAL_TOL_M
+                    reached, reach_s = wait_for(
+                        lambda: (
+                            None if _relative_alt_m(comm) is None
+                            else _relative_alt_m(comm)
+                            >= target_alt * TAKEOFF_REACH_RATIO
+                        ),
+                        timeout=TAKEOFF_REACH_TIMEOUT_S,
+                        poll=0.02,
+                    )
+                    mark(
+                        "altitude_reached" if reached else "altitude_timeout",
+                        f"rel_alt={_relative_alt_m(comm):.3f} m after {reach_s:.2f} s"
+                        if _relative_alt_m(comm) is not None else "no position",
+                    )
+                    settle_s = 0.0
+                    settled = False
+                    if reached:
+                        settled, final_alt, settle_s = wait_altitude_within(
+                            comm, target_alt, alt_tol, TAKEOFF_SETTLE_TIMEOUT_S
+                        )
+                        mark(
+                            "altitude_settled" if settled
+                            else "altitude_settle_timeout",
+                            f"rel_alt={final_alt:.3f} m after {settle_s:.2f} s "
+                            f"(target {target_alt:.2f} ± {alt_tol:.2f} m)"
+                            if final_alt is not None else "no position",
+                        )
+                    else:
+                        final_alt = _relative_alt_m(comm)
+                finally:
+                    # 差し替えが有効なうちにキーボードスレッドを止める
+                    module.running = False
+                    if key_thread is not None:
+                        key_thread.join(timeout=5.0)
+        finally:
+            comm.takeoff = original_takeoff
+            alive = _stop_threads(
+                module, threads + ([key_thread] if key_thread else [])
+            )
+
+        _write_timeline(out_dir / "timeline.csv", timeline)
+
+        command = takeoff_calls[0] if takeoff_calls else None
+        home_down_m = module.gps_origin["z"]
+        expected_target_down = module.alt_above_home_to_local_down(
+            target_alt, home_down_m
+        )
+        checks = {
+            "auto_takeoff_disabled_by_default": (
+                not bool(module.AUTO_TAKEOFF_ENABLED) and auto_takeoff_absent
+            ),
+            "guided_armed_confirmed": bool(ready),
+            "takeoff_command_sent_once": len(takeoff_calls) == 1,
+            "takeoff_alt_is_1_5m": (
+                command is not None
+                and abs(command["alt_m"] - SPACE_TAKEOFF_ALT_M) <= 1e-6
+                and abs(target_alt - SPACE_TAKEOFF_ALT_M) <= 1e-9
+            ),
+            "space_takeoff_flagged": (
+                bool(module.space_takeoff_sent)
+                and math.isfinite(float(module.space_takeoff_alt))
+                and abs(float(module.space_takeoff_alt) - target_alt) <= 1e-9
+            ),
+            "key_repeat_not_resent": count_after_repeat == 1,
+            "climbed_to_takeoff_alt": bool(reached),
+            "altitude_within_tolerance": (
+                final_alt is not None
+                and abs(final_alt - target_alt) <= alt_tol
+            ),
+            "initial_target_at_takeoff_alt": (
+                bool(module.initial_target_set)
+                and abs(float(module.target["z"]) - expected_target_down) <= 0.05
+            ),
+            "threads_stopped": not alive,
+        }
+        measurements = {
+            "takeoff_alt_constant_m": target_alt,
+            "takeoff_command_count": len(takeoff_calls),
+            "takeoff_command_alt_m": (
+                None if command is None else round(command["alt_m"], 6)
+            ),
+            "key_repeat_count": count_after_repeat,
+            "space_key_count": SPACE_TAKEOFF_KEY_COUNT,
+            "auto_takeoff_absent_before_space": auto_takeoff_absent,
+            "relative_alt_after_wait_m": (
+                None if final_alt is None else round(final_alt, 3)
+            ),
+            "initial_target_down_m": round(float(module.target["z"]), 3),
+            "expected_target_down_m": round(float(expected_target_down), 3),
+            "alt_tolerance_m": alt_tol,
+            "altitude_settled": bool(settled),
+            "altitude_settle_s": round(settle_s, 3),
+            "timeline": timeline,
+        }
+        write_observations(out_dir / "observations.csv", [
+            ("space_takeoff", "measurement", "takeoff_command_alt_m",
+             measurements["takeoff_command_alt_m"], "m"),
+            ("space_takeoff", "measurement", "takeoff_command_count",
+             measurements["takeoff_command_count"], ""),
+            ("space_takeoff", "measurement", "relative_alt_after_wait_m",
+             measurements["relative_alt_after_wait_m"], "m"),
+        ])
+
+    return {
+        "id": "space_takeoff",
+        "name": "スペースキー離陸（1 回だけ NAV_TAKEOFF → 1.5m まで上昇）",
+        "conditions": {
+            "enabled_by": "キーボードのスペースキー（既定。自動離陸は無効）",
+            "takeoff_alt_m": target_alt,
+            "key_repeat_count": SPACE_TAKEOFF_KEY_COUNT,
+            "command_path": (
+                "control_loop() -> request_space_takeoff() -> "
+                "send_takeoff_command()"
+            ),
+        },
+        "measurements": measurements,
+        "checks": checks,
+        "pass": all(checks.values()),
+    }
+
+
 SCENARIOS = [
     ("f6152", scenario_f6152),
     ("7f03b", scenario_7f03b),
@@ -1547,6 +1911,7 @@ SCENARIOS = [
     ("12794", scenario_12794),
     ("takeoff", scenario_takeoff),
     ("disarm", scenario_disarm),
+    ("space_takeoff", scenario_space_takeoff),
     ("auto_start", scenario_auto_start),
 ]
 

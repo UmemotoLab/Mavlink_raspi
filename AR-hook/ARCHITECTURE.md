@@ -147,8 +147,9 @@ def main() -> None
 def connect_mavlink() -> MavlinkComm          # 接続方法の対話選択 + connect()
 def set_msg_rate(comm: MavlinkComm) -> None   # 受信周期の要求（薄いラッパー）
 def send_takeoff_command(comm: MavlinkComm, alt: float) -> None
+def request_space_takeoff(comm: MavlinkComm) -> bool  # スペースキー離陸（1 回だけ）
 def send_setpoint(comm: MavlinkComm, lat_i: int, lon_i: int, alt: float) -> None
-def monitor_vehicle(comm: MavlinkComm) -> None   # 状態監視スレッド（10Hz）
+def monitor_vehicle(comm: MavlinkComm) -> None   # 状態監視スレッド（200Hz ポーリング）
 def control_loop(comm: MavlinkComm) -> None      # キーボード操作スレッド（20Hz）
 def camera_tracker_loop(comm: MavlinkComm, show_window=False, stream_enabled=False) -> None
 def record_data() -> None                        # CSV 記録（40Hz）
@@ -165,6 +166,19 @@ def auto_start_update(comm: MavlinkComm, now_s=None) -> bool
 
 `send_setpoint` は `TARGET_YAW_DEG` と `MASK` を通信部へ渡すだけのラッパーです
 （設定値は統合プログラム側に残す）。
+
+`request_space_takeoff()` はスペースキー離陸の唯一の入口です。`control_loop()` が
+`SPACE_TAKEOFF_KEY`（半角スペース）で呼び、`monitor_vehicle()` が確定した
+`guided_mode_active` と `vehicle_armed_confirmed` の両方が True のときだけ
+`send_takeoff_command(comm, TAKEOFF_ALT)` を 1 回送ります（`space_takeoff_sent` でラッチ）。
+前提未達・送信済みは理由を 1 行表示して送りません。
+
+| 定数 / 環境変数 | 既定 | 役割 |
+|---|---|---|
+| `TAKEOFF_ALT` / `AR_HOOK_TAKEOFF_ALT_M` | `1.50` m（0.30〜5.00） | 離陸目標高度（床＝EKF home 相対）。到達判定は `TAKEOFF_ALT * 0.9`、初期 target z は `alt_above_home_to_local_down(TAKEOFF_ALT, gps_origin['z'])` |
+| `AUTO_TAKEOFF_ENABLED` / `AR_HOOK_AUTO_TAKEOFF` | `0`（無効） | `1` で従来動作（GUIDED+armed 3 秒後に NAV_TAKEOFF）。既定は無効 |
+| `TARGET_HEIGHT_ABOVE_TAKEOFF` | `1.50` m | カメラ追従の基準高さ・キーボード `t`・自動移動（`AR_HOOK_AUTO_START`）の高さ |
+| `SPACE_TAKEOFF_KEY` / `space_takeoff_sent` / `space_takeoff_alt` / `vehicle_armed_confirmed` | `" "` / `False` / `nan` / `False` | スペース離陸の状態（キー定義・1 回だけ送るフラグ・送信高度・確定 armed） |
 
 `auto_start_*` は離陸後の自動移動（`AR_HOOK_AUTO_START=1`）の状態機械です。
 実験開始位置は `EXPERIMENT_START_LAT/LON/HEIGHT_ABOVE_TAKEOFF` の 1 箇所で定義し、
@@ -386,18 +400,26 @@ Motive (UDP 15770 / 15769)
 
 ```
 stdin (control_loop 20Hz)
-   │ u/m/h/l/w/z/t/q
+   │ SPACE / u/m/h/l/w/z/t/q
    ▼
-┌──────────────────────────────┐
-│ 機体制御部                   │
-│  - 目標 NED を STEP=0.10m 変更│
-│  - 't' は基準点へリセット     │
-│  - 'q' は running=False      │
-└──────────────┬───────────────┘
-               │ comm.setpoint()（`io_lock` 非保持区間で呼ぶ）
+┌────────────────────────────────────────────┐
+│ 機体制御部                                 │
+│  - SPACE は request_space_takeoff()        │
+│    （確定 GUIDED + 確定 armed のとき 1 回）│
+│  - u=南(-N) m=北(+N) h=東(+E) l=西(-W)      │
+│    目標 NED を STEP=0.10m 変更              │
+│  - w=上 z=下（離陸到達後のみ）              │
+│  - 't' は基準点へリセット                   │
+│  - 'q' は running=False                    │
+└──────────────┬─────────────────────────────┘
+               │ comm.takeoff() / comm.setpoint()（`io_lock` 非保持区間で呼ぶ）
                ▼
      MAVLink 通信部 → Pixhawk
 ```
+
+- 移動キーの送信は `commit_target_command()` → `can_send_guided_setpoint()` →
+  `send_local_target()` の 1 経路だけで、クランプ（0.5 m/s・水平 1.20 m・上 0.30 m / 下 0.20 m）を必ず通ります。
+- 機首は `TARGET_YAW_SEND_DEG` で固定（既定 0.0° = 北）。180° 固定では `m`（北）が「後退」になります。
 
 ### 4.4 受信（Pixhawk → 統合プログラム）
 
@@ -432,7 +454,9 @@ monitor_vehicle record_data 機体制御部(予定) CSV 保存（終了時）
 | `gps_now`, `gps_origin`, `origin` | `monitor_vehicle` | `record_data`、カメラスレッド | `io_lock` |
 | `current_roll/pitch/yaw_rad`, `current_yaw_deg` | `monitor_vehicle` | カメラスレッド、`record_data` | `io_lock` |
 | `target`, `initial_target_set` | カメラスレッド・`control_loop`・`monitor_vehicle` | `record_data`、カメラスレッド | `io_lock`（`initial_target_set` の一部は現状ロック外。下記 5.4） |
-| `guided_mode_active` | `monitor_vehicle` | カメラスレッド | 現状ロックなし（bool の単一代入。下記 5.4） |
+| `guided_mode_active` | `monitor_vehicle` | カメラスレッド、`request_space_takeoff` | 現状ロックなし（bool の単一代入。下記 5.4） |
+| `vehicle_armed_confirmed` | `monitor_vehicle` | `request_space_takeoff`（`control_loop`） | 現状ロックなし（bool の単一代入） |
+| `space_takeoff_sent` / `space_takeoff_alt` | `request_space_takeoff`（`control_loop`） | `monitor_vehicle`（到達判定）、ログ | 現状ロックなし（bool / float の単一代入。1 回だけ送るラッチ） |
 | Motive 剛体姿勢・履歴・時計オフセット | `motive_rigid_body_pose_udp_listener` | カメラスレッド、`record_data` | `io_lock` |
 | `cargo_*`, `hand_*`, `ar_marker_pose_log` | カメラスレッド | `record_data` | `io_lock` |
 | `_coord_source_log` | カメラスレッド | `record_data` | `io_lock` |

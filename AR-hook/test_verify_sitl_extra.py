@@ -10,8 +10,10 @@
 
 確認内容:
 1. CSV の列数（173）と注目列（Attitude_* / Target_Limit_* / Auto_Start_*）の充足判定
-2. takeoff シナリオ: GUIDED+ARM 検出 → NAV_TAKEOFF(0.5m) → 0.5m 到達
+2. takeoff シナリオ: AR_HOOK_AUTO_TAKEOFF=1 → GUIDED+ARM 検出 → NAV_TAKEOFF(1.5m) → 1.5m 到達
 3. disarm シナリオ: disarm 検出 → 停止 → CSV 保存（列数 173）
+4. space_takeoff シナリオ: スペースキーを注入 → NAV_TAKEOFF が 1 回だけ（1.5m）→ 上昇
+   （既定では自動離陸が送られないことも同時に確認）
 
 実 ArduPilot SITL での値は run_sitl_verify.sh で取得します（このテストは
 スタブ相手なので、機体の空力・EKF は対象外です）。
@@ -124,18 +126,23 @@ def _load_result(out_dir):
 
 
 def test_takeoff_scenario_sends_nav_takeoff_and_climbs(tmp_path):
-    """スタブ相手に GUIDED+ARM 検出 → 3 秒後 NAV_TAKEOFF(0.5m) → 0.5m を確認。"""
+    """スタブ相手に GUIDED+ARM 検出 → 3 秒後 NAV_TAKEOFF(1.5m) → 1.5m を確認。
+
+    自動離陸は既定で無効なので、シナリオ側が AR_HOOK_AUTO_TAKEOFF=1 を設定して
+    従来動作を再現します（既定の無効は space_takeoff 側で確認）。
+    """
     result = _run_verify(tmp_path, "--only", "takeoff")
     assert result.returncode == 0, result.stdout + result.stderr
 
     data = _load_result(tmp_path)
     scenario = data["scenarios"]["takeoff"]
     assert scenario["pass"] is True
+    assert scenario["checks"]["auto_takeoff_enabled_by_env"] is True
     assert scenario["measurements"]["takeoff_command_count"] == 1
-    assert scenario["measurements"]["takeoff_command_alt_m"] == pytest.approx(0.5)
+    assert scenario["measurements"]["takeoff_command_alt_m"] == pytest.approx(1.5)
     assert (
         scenario["measurements"]["relative_alt_after_wait_m"]
-        == pytest.approx(0.5, abs=0.05)
+        == pytest.approx(1.5, abs=0.05)
     )
     timeline = scenario["measurements"]["timeline"]
     events = [row[2] for row in timeline]
@@ -174,3 +181,32 @@ def test_disarm_scenario_stops_and_saves_csv(tmp_path):
     assert len(rows) >= 2
     index = rows[0].index("Attitude_Age_ms")
     assert rows[1][index] not in ("", "nan")
+
+
+def test_space_takeoff_scenario_injects_key_once_and_climbs(tmp_path):
+    """スペースキー離陸: キー注入で 1 回だけ NAV_TAKEOFF(1.5m) → 上昇を確認。"""
+    result = _run_verify(tmp_path, "--only", "space_takeoff")
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    data = _load_result(tmp_path)
+    scenario = data["scenarios"]["space_takeoff"]
+    assert scenario["pass"] is True
+    checks = scenario["checks"]
+    assert checks["auto_takeoff_disabled_by_default"] is True
+    assert checks["guided_armed_confirmed"] is True
+    assert checks["takeoff_command_sent_once"] is True
+    assert checks["takeoff_alt_is_1_5m"] is True
+    assert checks["key_repeat_not_resent"] is True
+    assert checks["climbed_to_takeoff_alt"] is True
+    assert checks["initial_target_at_takeoff_alt"] is True
+
+    measurements = scenario["measurements"]
+    assert measurements["takeoff_command_count"] == 1
+    assert measurements["takeoff_command_alt_m"] == pytest.approx(1.5)
+    assert measurements["key_repeat_count"] == 1
+    assert measurements["relative_alt_after_wait_m"] == pytest.approx(1.5, abs=0.05)
+
+    events = [row[2] for row in measurements["timeline"]]
+    assert events.index("auto_takeoff_check") < events.index("nav_takeoff_sent")
+    assert "altitude_reached" in events
+    assert (tmp_path / "space_takeoff" / "timeline.csv").exists()

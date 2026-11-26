@@ -51,7 +51,7 @@ fail() {
 }
 
 if [ ! -f "$SIM_VEHICLE" ]; then
-    fail "sim_vehicle.py が見つかりません: $SIM_VEHICLE（SITL_SETUP.md の手順で導入してください）"
+    fail "sim_vehicle.py が見つかりません: ${SIM_VEHICLE}（SITL_SETUP.md の手順で導入してください）"
 fi
 if [ ! -x "$SITL_DIR/build/sitl/bin/arducopter" ]; then
     fail "arducopter が未ビルドです: $SITL_DIR/build/sitl/bin/arducopter（./waf copter を実行してください）"
@@ -110,13 +110,22 @@ fi
 cmd --timeout 20 param DISARM_DELAY 0 >/dev/null || log "⚠ DISARM_DELAY=0 を設定できませんでした"
 
 FAILED=0
-run_scenario() {  # run_scenario <name> <out subdir> [verify_sitl の引数...]
+run_scenario() {  # run_scenario <name> <out subdir> [--env KEY=VALUE]... [verify_sitl の引数...]
     local name=$1
     local subdir=$2
     shift 2
+    local scenario_env=""
+    if [ "${1:-}" = "--env" ]; then
+        scenario_env=$2
+        shift 2
+    fi
     log ""
     log "--- $name ---"
-    if "$PYTHON" "$SCRIPT_DIR/verify_sitl.py" \
+    if [ -n "$scenario_env" ]; then
+        log "（環境変数: ${scenario_env}）"
+    fi
+    # 「--env なし」のときも env は透過的に動く（引数なしの env は現在の環境を継承）。
+    if env $scenario_env "$PYTHON" "$SCRIPT_DIR/verify_sitl.py" \
             --external-connection "$AR_HOOK_CONN" \
             --out-dir "$OUT_DIR/$subdir" "$@" >> "$LOG" 2>&1; then
         log "✅ $name: PASS"
@@ -149,9 +158,13 @@ arm_guided() {
 }
 
 # ── 1) 自動離陸（地上から）──
+# 自動離陸は既定で無効（AR_HOOK_AUTO_TAKEOFF=0）なので、このシナリオだけは
+# 明示的に AR_HOOK_AUTO_TAKEOFF=1 を与えて従来動作（GUIDED+armed 3 秒後）を検証する。
+# （スペースキー離陸が既定であることは 6) の space_takeoff で確認する）
 wait_gps || true
 arm_guided
-run_scenario "takeoff（自動離陸）" 1_takeoff --only takeoff
+run_scenario "takeoff（自動離陸 / AR_HOOK_AUTO_TAKEOFF=1）" 1_takeoff \
+    --env AR_HOOK_AUTO_TAKEOFF=1 --only takeoff
 
 # ── 2) 原点・高度基準とクランプ ──
 cmd --timeout 40 land >/dev/null || log "⚠ 着陸できませんでした"
@@ -170,12 +183,19 @@ cmd --timeout 40 land >/dev/null || log "⚠ 着陸できませんでした"
 arm_guided
 run_scenario "disarm（終了・CSV 保存）" 5_disarm --only disarm
 
-# ── 6) 離陸後の自動移動（AR_HOOK_AUTO_START=1）──
+# ── 6) スペースキー離陸（既定の運用。自動離陸は無効のまま）──
 # disarm シナリオでディスアーム済みなので、着陸を確認してから再度 GUIDED+ARM する。
+# verify_sitl.py がキー入力を注入し、NAV_TAKEOFF が 1 回だけ送られることを測る。
 cmd --timeout 40 land >/dev/null || log "⚠ 着陸できませんでした"
 sleep 3
 arm_guided
-run_scenario "auto_start（離陸→開始位置→TRACK）" 6_auto_start --only auto_start
+run_scenario "space_takeoff（スペースキー離陸 1.5m）" 6_space_takeoff --only space_takeoff
+
+# ── 7) 離陸後の自動移動（AR_HOOK_AUTO_START=1 / 本運用では使わない）──
+cmd --timeout 40 land >/dev/null || log "⚠ 着陸できませんでした"
+sleep 3
+arm_guided
+run_scenario "auto_start（離陸→開始位置→TRACK）" 7_auto_start --only auto_start
 
 log ""
 log "================================================================"

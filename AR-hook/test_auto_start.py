@@ -52,16 +52,24 @@ AUTO_ENV_KEYS = (
     "AR_HOOK_AUTO_START_ARRIVE_Z_M",
     "AR_HOOK_AUTO_START_ARRIVE_FRAMES",
     "AR_HOOK_AUTO_START_TIMEOUT_S",
+    "AR_HOOK_AUTO_TAKEOFF",
+    "AR_HOOK_TAKEOFF_ALT_M",
 )
 _MODULE_COUNTER = itertools.count()
 
 
 def _load_module(env=None, clock=None):
-    """環境変数を一時的に設定して AR-hook1.py を読み込む。"""
+    """環境変数を一時的に設定して AR-hook1.py を読み込む。
+
+    このファイルは「離陸後の自動移動」の試験なので、離陸は従来動作
+    （AR_HOOK_AUTO_TAKEOFF=1）を既定にします。自動離陸の既定が無効であることと、
+    スペースキー離陸は test_space_takeoff.py で確認します。
+    """
     _install_mock_modules()
     saved_env = {key: os.environ.get(key) for key in AUTO_ENV_KEYS}
     for key in AUTO_ENV_KEYS:
         os.environ.pop(key, None)
+    os.environ["AR_HOOK_AUTO_TAKEOFF"] = "1"
     for key, value in (env or {}).items():
         os.environ[key] = str(value)
     original_home = Path.__dict__["home"]
@@ -504,7 +512,8 @@ class _MonitorComm:
             self.module.running = False
         heartbeat_seq = int(now / 0.1) + 1
         position_seq = int(now / 0.02) + 1
-        rel_alt = 0.5 if now >= 1.0 else 0.0
+        # 離陸到達判定（TAKEOFF_ALT × 0.9）を満たす高さまで上がった状態を模す
+        rel_alt = float(self.module.TAKEOFF_ALT) if now >= 1.0 else 0.0
         lat, lon, alt = self.module.local_xyz_to_gps(0.0, 0.0, -rel_alt)
         return types.SimpleNamespace(
             heartbeat_seq=heartbeat_seq,

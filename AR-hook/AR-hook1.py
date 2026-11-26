@@ -85,7 +85,16 @@ except ImportError:
     HAS_PICAMERA2 = False
 # ───── ユーザー設定 ─────
 STEP = 0.10
-TAKEOFF_ALT = 0.50
+# 離陸目標高度 [m]（床＝EKF home 相対）。既定 1.50 m。
+# 実験運用は「スペースキーで離陸 → 床から 1.5 m まで自動上昇 → 手動キーで移動」。
+# 環境変数 AR_HOOK_TAKEOFF_ALT_M（0.3〜5.0）で起動時に上書きできます。
+TAKEOFF_ALT = 1.50
+TAKEOFF_ALT_ENV_VAR = "AR_HOOK_TAKEOFF_ALT_M"
+TAKEOFF_ALT_MIN_M = 0.30
+TAKEOFF_ALT_MAX_M = 5.00
+# GUIDED+armed を検出して 3 秒後に自動で NAV_TAKEOFF を送る従来動作。
+# スペースキー離陸を既定の運用にするため、既定は無効（0）。AR_HOOK_AUTO_TAKEOFF=1 で復活。
+AUTO_TAKEOFF_ENV_VAR = "AR_HOOK_AUTO_TAKEOFF"
 SEND_HZ = 10  # 従来の状態監視周期（10Hz）。現在は MAVLINK_POLL_INTERVAL_S（5ms）を使用。
 AR_MEASUREMENT_FPS = 40
 AR_LOG_HZ = 40
@@ -205,6 +214,21 @@ TARGET_YAW_DEG, TARGET_YAW_SOURCE = _env_float_param(
     TARGET_YAW_ENV_VAR, TARGET_YAW_DEG, "目標ヨー角 [deg]", 0.0, 360.0
 )
 MASK, MASK_SOURCE = _env_mask_param(MASK_ENV_VAR, MASK)
+# ───── 離陸高度・自動離陸の環境変数上書き ─────
+# AR_HOOK_TAKEOFF_ALT_M: 離陸目標高度 [m]（床＝EKF home 相対、0.3〜5.0）。
+#   既定 1.50 m。範囲外・数値でない値は起動時にエラー終了する（明示的に止める）。
+# AR_HOOK_AUTO_TAKEOFF: GUIDED+armed 3 秒後の自動離陸（従来動作）。既定 0（無効）。
+#   実験運用はスペースキー離陸のみを使うため、既定では自動離陸を送らない。
+TAKEOFF_ALT, TAKEOFF_ALT_SOURCE = _env_float_param(
+    TAKEOFF_ALT_ENV_VAR,
+    TAKEOFF_ALT,
+    "離陸目標高度（床＝EKF home から）[m]",
+    TAKEOFF_ALT_MIN_M,
+    TAKEOFF_ALT_MAX_M,
+)
+AUTO_TAKEOFF_ENABLED, AUTO_TAKEOFF_SOURCE = _env_flag_param(
+    AUTO_TAKEOFF_ENV_VAR, 0
+)
 # ───── ArUco・カメラ追跡設定 ─────
 MARKER_SIZE = 0.04  # マーカーの一辺の長さ（メートル、4cm）
 ID_CENTER_MARKER = 1  # 正方形の中心に配置されるマーカーID（ID 1）
@@ -315,7 +339,9 @@ else:
 # ✅ TARGET_HEIGHT_ABOVE_TAKEOFF は「離陸地点（EKF home）からの高さ」[m] です。
 #    target['z']（REF基準のDown）へ設定するときは
 #    alt_above_home_to_local_down() で変換します。
-TARGET_HEIGHT_ABOVE_TAKEOFF = 1.10
+# ✅ 既定値を 1.10 m から 1.50 m へ変更しました（離陸目標 TAKEOFF_ALT = 1.50 m と整合）。
+#    カメラ追従の基準高さ・キーボード t（基準点復帰）・自動移動の高さが同じ値を使います。
+TARGET_HEIGHT_ABOVE_TAKEOFF = 1.50
 # ───── 実験開始位置（単一定義） ─────
 # 離陸後に自動で移動する開始位置、およびキーボード t（基準点復帰）が使う座標です。
 # 既定値は従来の t キーと同じ座標・同じ高さ（離陸地点から TARGET_HEIGHT_ABOVE_TAKEOFF）
@@ -442,6 +468,17 @@ io_lock = threading.Lock()
 # ・送信は必ず「MAVLink 送受信ラッパー」セクションの関数経由で行います。
 initial_target_set = False
 guided_mode_active = False  # Guidedモード判定用
+# ───── スペースキー離陸（手動離陸）の状態 ─────
+# 「スペースキーで離陸 → 床から TAKEOFF_ALT まで自動上昇 → キーで手動移動」の運用で使います。
+#   * SPACE_TAKEOFF_KEY: キーボードスレッドが離陸指令として扱うキー（半角スペース）。
+#   * space_takeoff_sent: 送信済みフラグ。押し続け・キーリピートでも 1 回だけ送ります。
+#   * space_takeoff_alt: 実際に送った高度 [m]（ログ・テスト用。未送信は nan）。
+#   * vehicle_armed_confirmed: monitor_vehicle() が HEARTBEAT から確定した armed
+#     （通信部の 2 連続フレーム確定値）。スペース離陸の前提条件に使います。
+SPACE_TAKEOFF_KEY = " "
+space_takeoff_sent = False
+space_takeoff_alt = float('nan')
+vehicle_armed_confirmed = False
 # 最後に確定した荷物中心と回転ベクトル（カメラ座標系）を保持
 last_center_cam = None
 last_rvec_cargo = None
@@ -1240,6 +1277,48 @@ def send_takeoff_command(comm, alt):
     comm.takeoff(alt)
 
 
+def request_space_takeoff(comm):
+    """スペースキーによる離陸指令（TAKEOFF_ALT、既定 1.50 m）を 1 回だけ送る。
+
+    実験運用は次の手順です（自動離陸は既定で無効）。
+        GCS で GUIDED → arm → スペースキーで離陸 → キーで手動移動
+
+    前提条件（どちらも monitor_vehicle() が HEARTBEAT から確定した値）:
+        * ``guided_mode_active``: 確定 GUIDED（通信部の 2 連続フレーム確定値）
+        * ``vehicle_armed_confirmed``: 確定 armed（同上）
+    満たさない場合は送信せず、理由を 1 行だけ表示します。
+
+    押し続け・キーリピートで再送しないよう、送信後は ``space_takeoff_sent`` を
+    立てます（1 セッションで 1 回だけ。GUIDED を解除して入り直しても再送しません）。
+
+    Args:
+        comm: MAVLink 通信部（MavlinkComm）
+
+    Returns:
+        bool: 離陸指令を送ったら True、送らなかったら False。
+    """
+    global space_takeoff_sent, space_takeoff_alt
+    if space_takeoff_sent:
+        print(
+            f"ℹ スペース離陸: 送信済みです（{space_takeoff_alt:.1f}m、再送しません）"
+        )
+        return False
+    if not guided_mode_active:
+        print("⚠ スペース離陸: GUIDED モードではないため送信しません")
+        return False
+    if not vehicle_armed_confirmed:
+        print("⚠ スペース離陸: 未 armed のため送信しません（先に arm してください）")
+        return False
+    send_takeoff_command(comm, TAKEOFF_ALT)
+    space_takeoff_sent = True
+    space_takeoff_alt = float(TAKEOFF_ALT)
+    print(
+        f"✓ スペースキーで離陸指令（{TAKEOFF_ALT:.1f}m）"
+        f" — 床（EKF home）から {TAKEOFF_ALT:.1f}m まで自動上昇します"
+    )
+    return True
+
+
 def send_setpoint(comm, lat_i, lon_i, alt, yaw_deg=None):
     """Guided 目標（SET_POSITION_TARGET_GLOBAL_INT）を送信する。
 
@@ -1745,6 +1824,7 @@ def monitor_vehicle(comm):
     """
     global running, gps_now, gps_origin, origin, initial_target_set, guided_mode_active, current_yaw_deg
     global current_roll_rad, current_pitch_rad, current_yaw_rad
+    global vehicle_armed_confirmed
     guided, armed, takeoff_sent, takeoff_reached = False, False, False, False
     start_time = 0
     gps_origin_set = False
@@ -1769,6 +1849,8 @@ def monitor_vehicle(comm):
                 is_guided = state.guided
                 new_armed = state.armed
                 guided_mode_active = is_guided  # ← 状態を記録用に更新
+                # スペース離陸の前提条件に使う「確定 armed」（通信部の 2 連続確定値）
+                vehicle_armed_confirmed = new_armed
                 if is_guided and new_armed and not guided:
                     print("✓ Guidedモード検出 → 離陸準備")
                     start_time, guided = time.time(), True
@@ -1778,7 +1860,18 @@ def monitor_vehicle(comm):
                     )
                     # 自動移動が有効なときだけ IDLE/ABORTED/TRACK → TAKEOFF_WAIT。
                     auto_start_on_guided_armed()
-                if guided and not takeoff_sent and time.time() - start_time > 3:
+                    if not AUTO_TAKEOFF_ENABLED:
+                        # 既定（無効）は自動離陸を送らない。オペレータのスペースキーで離陸する。
+                        print(
+                            "ℹ 自動離陸は無効です"
+                            f"（{AUTO_TAKEOFF_ENV_VAR}={AUTO_TAKEOFF_SOURCE}）。"
+                            "スペースキーで離陸してください"
+                            f"（目標 {TAKEOFF_ALT:.1f}m）"
+                        )
+                # 従来動作（GUIDED+armed の 3 秒後に自動離陸）。
+                # 既定は無効で、AR_HOOK_AUTO_TAKEOFF=1 を指定したときだけ送ります。
+                if (AUTO_TAKEOFF_ENABLED and guided and not takeoff_sent
+                        and time.time() - start_time > 3):
                     send_takeoff_command(comm, TAKEOFF_ALT)
                     print(f"✓ 離陸指令（{TAKEOFF_ALT:.1f}m）")
                     takeoff_sent = True
@@ -1837,7 +1930,10 @@ def monitor_vehicle(comm):
                         origin_log = (north, east, gps_origin['z'])
                     gps_now.update({'x': north, 'y': east, 'z': down})
                     # ✅ 離陸判定は home 相対高度（上正）で行います（高度基準の統一）
-                    if takeoff_sent and not takeoff_reached and alt_rel >= TAKEOFF_ALT * 0.9:
+                    #    自動離陸（takeoff_sent）とスペースキー離陸（space_takeoff_sent）の
+                    #    どちらでも、到達判定のしきい値は TAKEOFF_ALT × 0.9 です。
+                    if (takeoff_sent or space_takeoff_sent) and not takeoff_reached \
+                            and alt_rel >= TAKEOFF_ALT * 0.9:
                         takeoff_reached = True
                         # ✅ TAKEOFF_ALT は「離陸地点からの高さ」なので Down へ変換して設定
                         #    離陸直後の初期高度は追従開始前の基準値なので、
@@ -3278,12 +3374,28 @@ def control_loop(comm):
         return
     try:
         print("\n" + "="*60)
-        print("キーボード制御モード（u/m/h/l:XY, w/z:Z, t:基準点）")
-        print("※ ArUco追跡動作中は、マーカー検出により目標が自動更新されます")
+        print("キーボード制御モード")
+        print("  SPACE : 離陸（NAV_TAKEOFF → 床から {:.1f}m まで自動上昇）".format(
+            TAKEOFF_ALT))
+        print("  u=南(-N) m=北(+N) h=東(+E) l=西(-W)  … 1 回 {:.2f}m（NED ローカル）".format(
+            STEP))
+        print("  w=上 z=下（離陸到達後のみ）  t=基準点復帰  q=終了")
+        print("  ※ 機首は目標 yaw で固定（既定 {:.1f}° = 北）。".format(
+            TARGET_YAW_SEND_DEG))
+        print("    機首を 180°（南）に固定している場合、m=北 は「後退」になります。")
+        print("  ※ ArUco追跡動作中は、マーカー検出により目標が自動更新されます")
         print("="*60)
         while running:
             key, moved, echo = get_key(), False, None
             if key == 'q': running = False; break
+            elif key is None:
+                # キー入力なし（通常の待機）。None を 'umhlwzt' の in 判定に渡すと
+                # TypeError でスレッドが落ちるため、明示的に何もしない。
+                pass
+            elif key == SPACE_TAKEOFF_KEY:
+                # スペースキー離陸（1 回だけ）。前提条件は確定 GUIDED かつ確定 armed。
+                # 押し続け・キーリピートでも space_takeoff_sent で再送しません。
+                request_space_takeoff(comm)
             elif key in 'umhlwzt':
                 # キーボード操作も commit_target_command() を通して偏差クランプを適用する。
                 # ただしレートリミッタは掛けない（apply_rate_limit=False）。
@@ -3291,11 +3403,12 @@ def control_loop(comm):
                 # 「押した分だけ動かす」という操作意図を壊すため。
                 # t（基準点復帰）も同じクランプを通るため、現在位置から上限を超える
                 # 場合は安全側で頭打ちになり、再度押すと残りへ段階的に近づく。
+                # NED の対応: u=南(-N) / m=北(+N) / h=東(+E) / l=西(-W)。
                 desired = dict(target)
-                if key == 'u': desired['x'] -= STEP; echo = "u South"
-                elif key == 'm': desired['x'] += STEP; echo = "m North"
-                elif key == 'h': desired['y'] += STEP; echo = "h East"
-                elif key == 'l': desired['y'] -= STEP; echo = "l West"
+                if key == 'u': desired['x'] -= STEP; echo = "u South (-N)"
+                elif key == 'm': desired['x'] += STEP; echo = "m North (+N)"
+                elif key == 'h': desired['y'] += STEP; echo = "h East (+E)"
+                elif key == 'l': desired['y'] -= STEP; echo = "l West (-W)"
                 elif key == 'w' and initial_target_set: desired['z'] -= STEP; echo = "w Up"
                 elif key == 'z' and initial_target_set:
                     # ✅ 降下の下限は「離陸地点からの高さ 0.05 m」で判定します（f6152 の高度基準統一）。
@@ -3354,10 +3467,14 @@ def control_loop(comm):
             time.sleep(0.05)  # 100% CPU使用率を防ぐためにスリープを追加
     finally:
         # 例外終了でも TTY 設定を必ず戻す（端末が raw/cbreak のまま残らないように）。
+        # 注意: 端末でない stdin（SITL のキー注入・パイプ）では tcgetattr が
+        #       本来と異なる型を返すことがあり、tcsetattr が TypeError を出す。
+        #       ここで例外を漏らすとキーボード制御スレッドごと落ちるため、
+        #       復元の失敗は握りつぶして記録（CSV 保存・メインループ）を守る。
         try:
             if fd is not None and old is not None:
                 termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        except (termios.error, OSError, ValueError):
+        except (termios.error, OSError, ValueError, TypeError):
             pass
 # ───── データ記録 ─────
 # カメラ座標変換ソースを記録するためのスレッドセーフ変数
@@ -3729,6 +3846,25 @@ def main(argv=None):
         f" (設定ソース: {TARGET_YAW_SOURCE}"
         f" / 取付ヨーオフセット: {CAMERA_MOUNT_YAW_OFFSET_DEG:.1f}deg)"
         f" | MASK: 0x{MASK:04X} (設定ソース: {MASK_SOURCE})"
+    )
+    # 離陸の運用（スペースキー離陸が既定 / 自動離陸は既定で無効）を 2 行で表示
+    print(
+        f"ℹ 離陸高度: {TAKEOFF_ALT:.2f}m（床＝EKF home 相対、"
+        f"設定ソース: {TAKEOFF_ALT_SOURCE} / 環境変数 {TAKEOFF_ALT_ENV_VAR}）"
+    )
+    print(
+        "ℹ 離陸の操作: "
+        + (
+            "スペースキー（既定。GUIDED+armed を確認して 1 回だけ送信）"
+            if not AUTO_TAKEOFF_ENABLED
+            else "スペースキー／自動離陸"
+        )
+        + " | 自動離陸（GUIDED+armed 3 秒後）: "
+        + (
+            f"有効（{AUTO_TAKEOFF_ENV_VAR}={AUTO_TAKEOFF_SOURCE}）"
+            if AUTO_TAKEOFF_ENABLED
+            else f"無効（{AUTO_TAKEOFF_ENV_VAR}=0、既定）"
+        )
     )
     print(
         "ℹ 離陸後の自動移動: "
